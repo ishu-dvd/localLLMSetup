@@ -240,16 +240,73 @@ Verify at startup: `n_slots = 3, n_ctx_slot = 32768`.
 |---|---|---|
 | KV @32K | 0.33 GB | 0.98 GB |
 | `-cram` needed | ~1024 MiB | 2048 MiB |
-| Freed budget | **~1.5–2 GB** | — |
-| ⇒ affordable quant | **IQ3_XXS (safer)** | Q2_K_L (risky) |
-| Decode per user | ~3× faster | ~9–13 tok/s |
-| Prefill contention | none | 3 × 8K cold ≈ 107 s for the last user |
+| Freed budget | **~1.7 GB** — but split **~0.65 GB VRAM + ~1.0 GB RAM** (different pools) | — |
+| Decode | **~21 tok/s** | ~8–13 tok/s each |
+| Warm TTFT | **~1–3 s** (single stable client hits cache nearly every turn) | — |
+| Prefill contention | **none** | 3 × 8K cold ≈ 107 s for the last user |
 
-**Single-client mode buys the thing that most reduces risk: a better quantisation.** Because
-low-bit damage hits structured output first, 2-bit → 3-bit directly protects tool-call and
-diff-format reliability — the failure mode that actually breaks coding agents.
+### 🥇 Single-client verdict: **`gpt-oss-20b` MXFP4 — decisively**
 
-**Recommended posture: run `-np 1` by default; raise it when a second laptop is actually in use.**
+The freed budget was supposed to buy an escape from 2-bit damage. The better answer is that
+**gpt-oss-20b never had quantisation damage to escape.**
+
+| | KAT-Coder IQ3_XXS | **gpt-oss-20b MXFP4** |
+|---|---|---|
+| Size | 14.87 GB | **12.11 GB** |
+| Quantisation loss | 3.06 bpw, **unbenchmarked** | **≈ none — MXFP4 is its native format** |
+| RAM | ~10.1 GB — **at the edge** | **~7.3 GB — comfortable** |
+| Margin | **~0.4 GB** | **~3 GB** |
+| Max context | 32K (64K very tight) | **128K fits** |
+| Known-good on Vulkan | unknown | ✅ in Phoronix's llama.cpp Vulkan set |
+
+**0.4 GB of margin on a 16 GB machine is not real margin** — one Windows update service waking
+up eats it.
+
+> ⚠️ **Honest nuance on the "2-bit → 3-bit" argument.** `Q2_K_L` is ~2.7 bpw and `IQ3_XXS` is
+> ~3.06 bpw — so this is *not* the full 2→3 bit step that the steep part of the quantisation
+> curve refers to. And **no benchmark exists for any 2-bit or 3-bit quant of a ~3B-active
+> MoE**; MoEs are known to degrade *worse* than dense at low bit-width, since each expert has
+> fewer parameters to absorb the error. The gain is real but smaller than the framing suggests,
+> and it costs the entire memory margin. **Bad trade.**
+
+### Context is the real single-client win
+
+gpt-oss-20b's sliding-window attention makes KV absurdly cheap (~13 KB/token at q8_0):
+
+| Context | KV | VRAM total | RAM | Verdict |
+|---|---|---|---|---|
+| 32K | 0.40 GB | ~6.7 GB | ~7.3 GB | ✅ FITS |
+| **64K** | **0.81 GB** | **~6.8 GB** | **~7.7 GB** | ✅ **FITS — recommended** |
+| 128K | 1.63 GB | ~6.9 GB | ~8.5 GB | ✅ FITS |
+
+**128K costs ~2 expert layers (≈2–3 tok/s) and nothing else.** For a coding agent, whole-repo
+context beats 3 tok/s. `-c 65536` is the sweet spot — 128K leaves less room for compute buffers.
+
+**Recommended posture: run `-np 1` with `gpt-oss-20b` by default; raise `-np` only when a
+second laptop is actually in use.** Revisit KAT-Coder only if Phase 2.1 shows its coding
+advantage survives quantisation.
+
+### 🚨 Why "provision for peak" is the wrong instinct
+
+**KV cache is allocated up front, proportional to `n_ctx × n_seq_max`** — llama.cpp reserves
+*"enough space for the full possible workload… even if not immediately used."*
+
+**So `-np 3` permanently taxes the solo user even when the other two laptops are asleep.**
+For KAT-Coder that is ~0.77 GB burned continuously — *exactly* the margin that decides whether
+a better quant fits.
+
+**And the downside of `-np 1` is mild:** a second client is **not rejected**. `llama-server`
+**queues** it behind the active request. The failure mode is graceful degradation (waiting),
+not an error.
+
+| Posture | When |
+|---|---|
+| **`-np 1`** ⭐ | **Default.** Best quant, biggest context, ~2–3× decode |
+| `-np 2 -c 131072` | Middle ground — 65K each with gpt-oss-20b (~14.9 GB) |
+| `-np 3 -c 98304` | Only when three laptops are genuinely active |
+
+Keep a second NSSM service definition and switch profiles; a restart costs ~10–30 s because
+the model reloads from OS page cache.
 
 > ⚠️ **3 users × 32K fully commits the slot budget.** There is no headroom for a fourth
 > session — a developer opening a second terminal evicts someone's cache, and on 16 GB you
@@ -318,17 +375,45 @@ natively, so Claude-compatible tooling works — and the clients above are bette
 
 ## 7. Settled configuration facts
 
+### ⭐ Start here — the recommended single-client configuration
+
+```powershell
+llama-server.exe `
+  -m C:\models\gpt-oss-20b-MXFP4.gguf `
+  -a claude-local-coder `      # clients hide model IDs lacking "claude"/"anthropic"
+  --host 0.0.0.0 --port 8080 `
+  --device Vulkan0 -ngl 99 -ncmoe 30 `
+  -np 1 -c 65536 `             # -np 1 => total == per-slot. 128K also fits.
+  -t 8 -fa on `
+  -ctk q8_0 -ctv q8_0 `        # NEVER q4_0 - degrades tool calling
+  -b 4096 -ub 1024 `           # 8K prefill 181 -> 223 tok/s; avoids Vulkan bug #27237
+  -lm mmap+mlock `             # needs SeLockMemoryPrivilege - verify, don't assume
+  -cram 1024 `                 # NOT the 8192 MiB default
+  --jinja --metrics --sse-ping-interval 30 `
+  --api-key-file C:\ai\keys.txt
+```
+
+**Why `gpt-oss-20b` first:** it is the only candidate with **zero quantisation loss** (MXFP4
+is its native release format), leaving ~3 GB of margin and its full 128K context. That makes it
+the right thing to prove the hardware with — it tests the machine without confounding the result
+with quantisation risk. Swap to a coding specialist only once Phase 2.1 measures that its
+advantage survives quantisation.
+
+### Flag reference
+
 | Flag | Value | Why |
 |---|---|---|
-| `-fa on` | always | Flash attention |
+| `-fa on` | always | Flash attention; without it KV grows linearly with prompt |
 | `-ctk q8_0 -ctv q8_0` | always | **Never `q4_0`** — llama.cpp: *"can substantially degrade tool calling"* |
-| `-c` | `32768 × n_slots` | `-c` is the **total** pool |
-| `-sps` | **0.5** (not 0.10) | At 0.10 a laptop can steal another's slot on shared *boilerplate* similarity and evict its cache |
-| `-cram` | **2048** (3 clients) / **1024** (1 client) | 8192 default eats the budget; 1024 with 3 clients holds only 2 of 3 states → silent full-prefill stalls |
-| `-lm` | **`mmap+mlock`** | `--no-mmap`/`--mlock` deprecated. ⚠️ mlock needs `SeLockMemoryPrivilege`, **not granted by default** |
-| `-b` | ≥ 1024 | [#27237](https://github.com/ggml-org/llama.cpp/issues/27237): Vulkan garbage output at batch 512 on Gated-DeltaNet |
+| `-c` | `32768 × n_slots` | `-c` is the **total** pool (identical to per-slot only at `-np 1`) |
+| `-t` | **8** | Measured optimal on this GPU class — `-t 10` was *worse* |
+| `-b 4096 -ub 1024` | — | Lifts 8K prefill 181 → 223 tok/s; also clears Vulkan batch-512 bug [#27237](https://github.com/ggml-org/llama.cpp/issues/27237) |
+| `-sps` | **0.5** (3 clients) / omit (1 client) | At 0.10 a laptop can steal another's slot on shared *boilerplate* similarity and evict its cache. Moot at one slot |
+| `-cram` | **1024** (1 client) / **2048** (3 clients) | ✅ Verified: default is **8192 MiB** and would eat most of your budget |
+| `-lm` | **`mmap+mlock`** | ✅ Verified: `--no-mmap`/`--mlock` are **deprecated**. ⚠️ mlock needs `SeLockMemoryPrivilege`, **not granted by default** |
+| `--kv-unified` | omit at `-np 1` | Moot with one sequence — nothing to share |
 | `GGML_VK_ALLOW_GRAPHICS_QUEUE` | **do not set** | Polaris workaround; costs ~20% on RDNA2 |
-| `-a` | must contain `claude` | Claude-compatible clients hide model IDs lacking `claude`/`anthropic` |
+| `-a` | must contain `claude` | Claude-compatible clients filter model IDs on that substring |
 
 **Unattended-operation guard.** Neither mmap mode fails loudly on Windows — the page file
 absorbs the overflow — so monitor rather than assume:
@@ -368,11 +453,19 @@ llama.cpp + llama-swap + gguf-parser. Not a new inference stack, not a new hardw
 
 | # | Item | Why it must be measured |
 |---|---|---|
-| 1 | **Does `Q2_K_L` destroy KAT-Coder's tool-call reliability?** | **The single most decision-relevant unknown.** Unmeasured by anyone; determines which client applies |
-| 2 | Single-client quant ceiling — is `IQ3_XXS` reachable at `-np 1`? | Decides whether the 2-bit risk can be retired outright |
-| 3 | `--kv-unified` vs `--no-kv-unified` | ⚠️ `llama.h` contains **two adjacent comments that conflict** → benchmark, don't guess |
-| 4 | Does `-np 3` reserve KV while idle? | Decides *provision-for-peak* vs *provision-for-typical* |
+| 1 | **Does low-bit quantisation destroy KAT-Coder's tool-call reliability?** | **The single most decision-relevant unknown.** No measurement of KAT-Coder at *any* quant exists anywhere. Determines whether the coding specialist is usable at all |
+| 3 | `--kv-unified` vs `--no-kv-unified` (3 clients only) | ⚠️ `llama.h` contains **two adjacent comments that conflict** → benchmark, don't guess. Moot at `-np 1` |
 | 5 | Vulkan async-load caps | Affects load-time RAM peak (~256 MB vs largest single tensor) |
 | 6 | Octofriend autofix models CPU-only on a client laptop | Inferred from model size, not verified |
 
-**Nothing in this table is a guess in the plan — each is an experiment.** See `PLAN.md`.
+### ✅ Closed during research
+
+| Item | Resolution |
+|---|---|
+| Single-client quant ceiling | **`IQ3_XXS` is reachable but TIGHT (~0.4 GB margin).** Irrelevant in the end — **`gpt-oss-20b` MXFP4 wins on native precision**, ~3 GB margin and 128K context |
+| Does `-np 3` reserve KV while idle? | **Yes** — allocated up front ∝ `n_ctx × n_seq_max`. ⇒ **provision for typical, not peak** |
+| Do `-cram` / `-lm` exist? | **Yes**, verified in the server README: `-cram` defaults to **8192 MiB**; `-lm` supports `mmap+mlock`; `--mlock`/`--no-mmap` are **deprecated** |
+| Does a smaller coding specialist in VRAM win? | **No** — refuted by Aider's own paired data (§3) |
+| Is anything missed by only using Hugging Face? | **No** — HF is the de-facto registry; ModelScope/NGC are the only partial exceptions |
+
+**Nothing in the open table is a guess in the plan — each is an experiment.** See `PLAN.md`.
