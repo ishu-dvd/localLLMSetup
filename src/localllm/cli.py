@@ -16,8 +16,9 @@ import sys
 from pathlib import Path
 
 from .budget import Fit, Hardware, Plan, recommend, solve
-from .catalogue import CATALOGUE
+from .catalogue import CATALOGUE, model_from_gguf
 from .detect import detect
+from .gguf import GgufError, read_gguf_file
 from .join import SUPPORTED, build_client_config
 from .keys import DeviceExistsError, DeviceNotFoundError, KeyStore
 from .serve import (
@@ -102,8 +103,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return cmd_plan(args)
 
 
+def _model_from_args(args: argparse.Namespace) -> tuple[object | None, list[str]]:
+    """Load a model from a real GGUF when one is given. Returns (model, notes)."""
+    path = getattr(args, "gguf", None)
+    if not path:
+        return None, []
+    try:
+        md = read_gguf_file(str(path))
+        model = model_from_gguf(md, name=Path(path).stem, quant=md.kv.get("general.file_type", ""))
+    except (GgufError, ValueError, OSError) as exc:
+        return None, [f"could not read {path}: {exc}"]
+    return model, [f"model facts read from {Path(path).name} ({model.notes})"]
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     hw, notes = _hardware_from(args)
+    gguf_model, gguf_notes = _model_from_args(args)
+    notes.extend(gguf_notes)
     plan = Plan(
         context_per_slot=args.context,
         n_slots=args.slots,
@@ -132,18 +148,21 @@ def cmd_plan(args: argparse.Namespace) -> int:
             f"requires -c {plan.ctx_size_flag:,}, not -c {plan.context_per_slot:,}."
         )
     print()
-    print(_table(hw, plan))
-    print()
+    if gguf_model is not None:
+        best = solve(hw, gguf_model, plan)
+        print(best.explain())
+    else:
+        print(_table(hw, plan))
+        print()
+        best = recommend(hw, plan)
+        if best is None:
+            print("No model in the catalogue fits this plan. Reduce context or slots.")
+            return 1
+        print(best.explain())
 
-    best = recommend(hw, plan)
-    if best is None:
-        print("No model in the catalogue fits this plan. Reduce context or slots.")
-        return 1
-
-    print(best.explain())
     print("\nllama-server invocation:")
     print(f"  {best.llama_server_flags()}")
-    return 0
+    return 0 if best else 1
 
 
 def cmd_up(args: argparse.Namespace) -> int:
@@ -158,7 +177,10 @@ def cmd_up(args: argparse.Namespace) -> int:
     for n in notes:
         print(f"note     : {n}")
 
-    verdict = recommend(hw, plan)
+    gguf_model, gguf_notes = _model_from_args(args)
+    for n in gguf_notes:
+        print(f"note     : {n}")
+    verdict = solve(hw, gguf_model, plan) if gguf_model else recommend(hw, plan)
     if verdict is None:
         print("No model fits this plan. Reduce --context or --slots.", file=sys.stderr)
         return 1
@@ -295,6 +317,13 @@ def _add_plan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--slots", type=int, default=1, help="number of client laptops")
     p.add_argument("--kv-quant", default="q8_0", choices=["f16", "q8_0", "q4_0"])
     p.add_argument("--cram", type=int, default=None, help="prompt cache RAM in MiB")
+    p.add_argument(
+        "--gguf",
+        type=Path,
+        default=None,
+        help="path to a real .gguf - reads layers, KV heads, head dim and the "
+        "exact expert/dense split from the file instead of the catalogue",
+    )
     p.add_argument(
         "--llama-server",
         default=None,

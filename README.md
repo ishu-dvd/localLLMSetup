@@ -86,8 +86,23 @@ llama.cpp, llama-swap and gguf-parser. Not a new inference stack.
 git clone https://github.com/ishu-dvd/localLLMSetup
 cd localLLMSetup
 $env:PYTHONPATH="src"
-python -m pytest tests          # 118 tests
+python -m pytest tests          # 226 tests
 ```
+
+**Point it at a real model file** and it reads the facts from the file rather than
+trusting a hand-maintained catalogue:
+
+```powershell
+python -m localllm.cli plan --gguf C:\models\gpt-oss-20b-MXFP4.gguf
+```
+
+```
+note     : model facts read from gpt-oss-20b-MXFP4.gguf (dense split measured from tensor index)
+```
+
+Layer count, KV heads, head dimension, sliding-window layout and the **exact
+expert-vs-dense split** all come from the GGUF header — the last of which is what
+decides `-ncmoe N`.
 
 **See what your hardware can run** (auto-detects; refuses to invent numbers):
 
@@ -157,7 +172,7 @@ On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
 | 5 — client onboarding | ✅ done, 33 tests |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**157 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
+**226 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
 
 ---
 

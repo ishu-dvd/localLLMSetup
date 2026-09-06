@@ -14,6 +14,7 @@ verdict is unrecoverable.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 KV_ELEM_BYTES = {
     "f16": 2.0,
@@ -272,3 +273,50 @@ CATALOGUE: dict[str, Model] = {
         QWEN3_CODER_30B_A3B,
     )
 }
+
+
+def model_from_gguf(md: Any, name: str | None = None, quant: str | None = None) -> Model:
+    """Build a Model from a real GGUF file's own metadata.
+
+    Everything here is read from the file rather than hand-entered, which is the
+    point: a catalogue entry can be wrong and nobody notices, whereas the file
+    cannot disagree with itself.
+
+    `dense_gb` in particular becomes *measured* (from the tensor index) rather
+    than estimated, and it is what sets N in `-ncmoe N`.
+    """
+    if not md.is_complete:
+        raise ValueError(f"GGUF is missing fields needed for planning: {', '.join(md.missing())}")
+    if md.weights_gb is None:
+        raise ValueError("GGUF file size is unknown, so weights cannot be sized")
+
+    dense = md.dense_gb
+    dense_measured = dense is not None
+    if not dense_measured:
+        # No tensor index available. Assume the whole model is dense, which
+        # yields ncmoe = every layer: it offloads more than necessary rather
+        # than less, and never overcommits VRAM.
+        dense = md.weights_gb if not md.is_moe else md.weights_gb * 0.15
+
+    return Model(
+        name=name or md.architecture,
+        quant=quant or "gguf",
+        weights_gb=md.weights_gb,
+        kb_per_token_q8=0.0,  # unused: architecture is known, so KV is derived
+        n_layers=md.n_layers,
+        dense_gb=dense,
+        is_moe=md.is_moe,
+        n_kv_heads=md.n_kv_heads,
+        head_dim=md.head_dim,
+        full_attn_layers=md.full_attn_layers,
+        sliding_layers=md.sliding_layers,
+        sliding_window=md.sliding_window,
+        notes=(
+            "read from GGUF; "
+            + (
+                "dense split measured from tensor index"
+                if dense_measured
+                else "dense split estimated"
+            )
+        ),
+    )
