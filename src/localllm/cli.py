@@ -589,10 +589,10 @@ def cmd_up(args: argparse.Namespace) -> int:
     for name in ("01-powercfg.ps1", "02-install-service.ps1", "03-watchdog.ps1"):
         print(f"  .\\{name}")
     print(
-        f"\nThen, on each client laptop, point `localllm join` at "
-        f"{out / PLAN_FILENAME} so it pins the same "
-        f"{verdict.plan.context_per_slot:,}-token window this plan allocated."
+        f"\nThen invite each laptop - one token carries this "
+        f"{verdict.plan.context_per_slot:,}-token window, its key and the model id:"
     )
+    print("  localllm invite <laptop-name> --url http://<this-machine>:8080")
     return 0
 
 

@@ -226,6 +226,7 @@ per-slot context, none of it retyped:
 
 ```powershell
 python -m localllm join --invite llmi1_... --client cline
+python -m localllm check          # no arguments: it reads the config just written
 ```
 
 Writes ready-to-use config for **Cline**, **Aider** or **Octofriend**. The token is
