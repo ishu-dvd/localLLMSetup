@@ -298,3 +298,42 @@ class TestPreflightMatchesTheFlagsWeActuallyEmit:
         assert fits.weights_spilled_gb == 0
         pf = run(fits)
         assert any("no weights spill" in c.detail for c in pf.checks)
+
+
+class TestResidencySeverity:
+    """A PASS when comfortable, a WARN only when the margin is thin.
+
+    Warning on every plan whose weights spill would warn about the normal case -
+    which is how a user learns to ignore warnings. The distinction only appears
+    with fixtures on both sides of it, and the first attempt at these tests
+    silently failed to land, so the mutants survived while the behaviour was
+    already correct.
+    """
+
+    def test_a_comfortable_plan_passes(self) -> None:
+        assert GOOD.status is Fit.FITS
+        assert GOOD.weights_spilled_gb > 0
+        assert level_of(run(), "residency") is Level.PASS
+
+    def test_a_tight_plan_warns(self) -> None:
+        assert TIGHT.status is Fit.TIGHT
+        assert level_of(run(TIGHT), "residency") is Level.WARN
+
+    def test_a_tight_plan_still_starts(self) -> None:
+        """Thin margin is a caution, not a refusal - the budget already decides
+        what is impossible."""
+        assert run(TIGHT)
+
+    def test_the_warning_says_what_to_do(self) -> None:
+        remedy = next(c for c in run(TIGHT).checks if c.name == "residency").remedy
+        assert "Pages Input" in remedy or "context" in remedy
+
+    def test_the_pass_carries_no_remedy(self) -> None:
+        """A remedy on a PASS is noise, and a pre-existing test asserts the
+        report never prints one."""
+        assert next(c for c in run().checks if c.name == "residency").remedy == ""
+
+    def test_neither_level_mentions_mlock(self) -> None:
+        for pf in (run(), run(TIGHT)):
+            text = " ".join(c.detail + c.remedy for c in pf.checks)
+            assert "mlock" not in text and "secpol" not in text
