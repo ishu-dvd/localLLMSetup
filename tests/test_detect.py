@@ -7,6 +7,8 @@ Hyper-V VM is real output captured on 2026-09-06.
 
 from __future__ import annotations
 
+import pytest
+
 from localllm.detect import (
     adapter_ram_is_trustworthy,
     build_detection,
@@ -148,3 +150,27 @@ def test_registry_only_device_still_detected():
     det = build_detection(MSI_REGISTRY, "", MSI_RAM)
     assert det.primary_gpu is not None
     assert det.primary_gpu.name == "AMD Radeon RX 6600M"
+
+
+# --- Measured free RAM ------------------------------------------------------
+
+
+def test_available_ram_is_carried_into_hardware():
+    det = build_detection(MSI_REGISTRY, MSI_CIM, MSI_RAM, available_ram_bytes=9_000_000_000)
+    hw = det.to_hardware()
+    assert hw is not None
+    assert hw.measured_ram_available_gb == pytest.approx(9.0)
+    assert hw.budget_is_measured
+
+
+def test_absent_measurement_leaves_hardware_on_assumptions():
+    hw = build_detection(MSI_REGISTRY, MSI_CIM, MSI_RAM).to_hardware()
+    assert hw is not None
+    assert not hw.budget_is_measured
+
+
+def test_available_ram_is_never_greater_than_total_in_practice():
+    det = build_detection(MSI_REGISTRY, MSI_CIM, MSI_RAM, available_ram_bytes=9_000_000_000)
+    assert det.ram_available_gb is not None
+    assert det.ram_gb is not None
+    assert det.ram_available_gb < det.ram_gb

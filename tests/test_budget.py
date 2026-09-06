@@ -213,3 +213,114 @@ def test_flags_alias_contains_claude_substring():
     """Claude-compatible clients filter out model IDs lacking 'claude'."""
     flags = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1)).llama_server_flags()
     assert "-a claude-" in flags
+
+
+# --- The offload split must survive into the command ------------------------
+# The solver computes that N GB of weights cannot fit in VRAM. If that number
+# never reaches the command line, llama.cpp tries to load everything onto the
+# GPU and dies. These tests exist because it originally did exactly that.
+
+
+def test_moe_with_spill_emits_ncmoe():
+    v = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    assert v.weights_spilled_gb > 0, "fixture must actually spill"
+    assert "-ncmoe " in v.llama_server_flags()
+
+
+def test_never_claims_full_gpu_offload_while_weights_spill():
+    """`-ngl 99` with no offload directive is a guaranteed OOM."""
+    v = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    flags = v.llama_server_flags()
+    assert not (flags.count("-ngl 99") and "-ncmoe" not in flags and "-ncffn" not in flags)
+
+
+def test_ncmoe_grows_when_less_vram_is_available():
+    """Less VRAM -> more expert layers must move to system RAM."""
+    big = solve(Hardware(16.0, 16.0), GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    small = solve(Hardware(8.0, 16.0), GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    assert small.n_cpu_moe > big.n_cpu_moe
+
+
+def test_ncmoe_is_zero_when_everything_fits_in_vram():
+    v = solve(Hardware(48.0, 64.0), GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    assert v.weights_spilled_gb == 0
+    assert v.n_cpu_moe == 0
+    assert "-ncmoe" not in v.llama_server_flags()
+
+
+def test_ncmoe_never_exceeds_the_layer_count():
+    v = solve(Hardware(1.5, 16.0), GPT_OSS_20B, Plan(4096, 1, cram_mib=512))
+    assert v.n_cpu_moe <= GPT_OSS_20B.n_layers
+
+
+def test_ncmoe_matches_the_researched_value_for_gpt_oss():
+    """hw-runtime independently recommended -ncmoe 14 for this exact config."""
+    v = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    assert 12 <= v.n_cpu_moe <= 18
+
+
+def test_dense_model_uses_partial_ngl_not_ncmoe():
+    """-ncmoe only moves MoE expert weights; a dense model needs partial -ngl."""
+    v = solve(MSI_ALPHA, QWEN25_CODER_14B, Plan(8_192, 1, cram_mib=1024))
+    if v.status is not Fit.REFUSE and v.weights_spilled_gb > 0:
+        flags = v.llama_server_flags()
+        assert "-ncmoe" not in flags
+        assert "-ngl 99" not in flags
+
+
+def test_dense_ngl_is_fewer_than_all_layers_when_spilling():
+    v = solve(MSI_ALPHA, QWEN25_CODER_14B, Plan(8_192, 1, cram_mib=1024))
+    if v.status is not Fit.REFUSE and v.weights_spilled_gb > 0:
+        assert 0 <= v.n_gpu_layers < QWEN25_CODER_14B.n_layers
+
+
+def test_offload_is_reported_in_explain():
+    v = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    assert "ncmoe" in v.explain() or "offload" in v.explain().lower()
+
+
+# --- Measured reserves beat assumed ones ------------------------------------
+# The OS-idle reserve is the assumption this solver is most sensitive to.
+# When a real measurement exists, use it.
+
+
+def test_measured_ram_overrides_the_assumed_reserve():
+    assumed = Hardware(8.0, 16.0)
+    measured = Hardware(8.0, 16.0, measured_ram_available_gb=6.0)
+    assert measured.ram_usable_gb != assumed.ram_usable_gb
+    assert measured.ram_usable_gb == pytest.approx(5.0)  # 6.0 minus safety
+
+
+def test_a_busy_machine_is_correctly_seen_as_smaller():
+    """Something else eating RAM must shrink the budget, not be ignored."""
+    idle = Hardware(8.0, 16.0, measured_ram_available_gb=11.0)
+    busy = Hardware(8.0, 16.0, measured_ram_available_gb=4.0)
+    assert busy.ram_usable_gb < idle.ram_usable_gb
+
+
+def test_busy_machine_can_flip_a_verdict_to_refuse():
+    """The whole point: a plan that fits on an idle box may not fit on a busy one."""
+    idle = solve(Hardware(8.0, 16.0, measured_ram_available_gb=11.0), GPT_OSS_20B, Plan(32_768, 1))
+    busy = solve(Hardware(8.0, 16.0, measured_ram_available_gb=4.0), GPT_OSS_20B, Plan(32_768, 1))
+    assert idle.status is not Fit.REFUSE
+    assert busy.status is Fit.REFUSE
+
+
+def test_measured_vram_overrides_the_driver_reserve():
+    assert Hardware(8.0, 16.0, measured_vram_free_gb=5.5).vram_usable_gb == pytest.approx(5.5)
+
+
+def test_falls_back_to_assumptions_when_unmeasured():
+    hw = Hardware(8.0, 16.0)
+    assert not hw.budget_is_measured
+    assert hw.ram_usable_gb == pytest.approx(10.5)
+    assert hw.vram_usable_gb == pytest.approx(7.0)
+
+
+def test_measured_flag_reports_honestly():
+    assert Hardware(8.0, 16.0, measured_ram_available_gb=9.0).budget_is_measured
+    assert not Hardware(8.0, 16.0).budget_is_measured
+
+
+def test_measured_values_never_go_negative():
+    assert Hardware(8.0, 16.0, measured_ram_available_gb=0.2).ram_usable_gb == 0.0

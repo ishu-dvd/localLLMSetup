@@ -45,6 +45,9 @@ class GpuInfo:
 class Detection:
     gpus: list[GpuInfo] = field(default_factory=list)
     ram_gb: float | None = None
+    ram_available_gb: float | None = None
+    """Free RAM at probe time. Preferred over the assumed OS-idle reserve."""
+
     os: str = "unknown"
     warnings: list[str] = field(default_factory=list)
 
@@ -59,7 +62,12 @@ class Detection:
         gpu = self.primary_gpu
         if gpu is None or gpu.vram_gb is None or self.ram_gb is None:
             return None
-        return Hardware(vram_total_gb=gpu.vram_gb, ram_total_gb=self.ram_gb, os=self.os)
+        return Hardware(
+            vram_total_gb=gpu.vram_gb,
+            ram_total_gb=self.ram_gb,
+            os=self.os,
+            measured_ram_available_gb=self.ram_available_gb,
+        )
 
 
 # --- Pure parsers -----------------------------------------------------------
@@ -116,10 +124,12 @@ def build_detection(
     cim_text: str,
     total_ram_bytes: int | None,
     os_name: str = "windows",
+    available_ram_bytes: int | None = None,
 ) -> Detection:
     """Combine the probe outputs into a Detection. Pure - no IO."""
     det = Detection(os=os_name)
     det.ram_gb = total_ram_bytes / 1_000_000_000 if total_ram_bytes else None
+    det.ram_available_gb = available_ram_bytes / 1_000_000_000 if available_ram_bytes else None
 
     registry = dict(parse_registry_vram(registry_text))
     cim = parse_cim_video(cim_text)
@@ -186,6 +196,9 @@ _PS_CIM = (
 
 _PS_RAM = "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"
 
+_PS_RAM_FREE = "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"
+"""Returns KB, not bytes - Win32_OperatingSystem reports in kilobytes."""
+
 
 def _powershell(script: str) -> str:
     try:
@@ -205,11 +218,13 @@ def detect() -> Detection:
     """Probe the current machine."""
     if sys.platform == "win32":
         ram_raw = _powershell(_PS_RAM).strip()
+        free_kb = _powershell(_PS_RAM_FREE).strip()
         return build_detection(
             registry_text=_powershell(_PS_REGISTRY),
             cim_text=_powershell(_PS_CIM),
             total_ram_bytes=int(ram_raw) if ram_raw.isdigit() else None,
             os_name="windows",
+            available_ram_bytes=int(free_kb) * 1024 if free_kb.isdigit() else None,
         )
 
     ram = None

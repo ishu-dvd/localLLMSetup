@@ -16,6 +16,7 @@ deliberate — it makes the novel part of this project fully unit-testable.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import Enum
 
@@ -41,6 +42,9 @@ TIGHT_MARGIN_GB = 1.0
 """Below this much spare RAM, one background service waking up eats the margin.
 Not a comfortable place to leave an unattended 24/7 server."""
 
+MEASURED_RAM_SAFETY_GB = 1.0
+"""Held back from *measured* free RAM so the machine stays responsive."""
+
 KV_QUANT_SCALE = {"f16": 2.0, "q8_0": 1.0, "q4_0": 0.5}
 """Relative to the catalogue's q8_0 baseline."""
 
@@ -56,15 +60,37 @@ class Hardware:
     vram_total_gb: float
     ram_total_gb: float
     os: str = "windows"
+    measured_ram_available_gb: float | None = None
+    """Actual free RAM right now, if it could be measured.
+
+    The alternative is `ram_total - WINDOWS_IDLE_RAM_GB`, an assumption that this
+    solver is *more* sensitive to than almost anything else: the difference
+    between 4 GB and 7 GB of OS/background usage is the difference between a
+    model fitting and thrashing the page file. Prefer a measurement when there
+    is one.
+    """
+
+    measured_vram_free_gb: float | None = None
+    """Actual free VRAM right now, if it could be measured."""
 
     @property
     def vram_usable_gb(self) -> float:
+        if self.measured_vram_free_gb is not None:
+            return max(0.0, self.measured_vram_free_gb)
         return max(0.0, self.vram_total_gb - VRAM_DRIVER_RESERVE_GB)
 
     @property
     def ram_usable_gb(self) -> float:
+        if self.measured_ram_available_gb is not None:
+            # Leave a little room so the machine stays responsive rather than
+            # consuming literally every free byte.
+            return max(0.0, self.measured_ram_available_gb - MEASURED_RAM_SAFETY_GB)
         reserve = WINDOWS_IDLE_RAM_GB if self.os == "windows" else 2.0
         return max(0.0, self.ram_total_gb - reserve)
+
+    @property
+    def budget_is_measured(self) -> bool:
+        return self.measured_ram_available_gb is not None
 
 
 @dataclass(frozen=True)
@@ -107,6 +133,11 @@ class Verdict:
     headroom_gb: float
     reasons: tuple[str, ...]
     warnings: tuple[str, ...]
+    n_cpu_moe: int = 0
+    """Expert layers to keep in system RAM (`-ncmoe`). MoE models only."""
+
+    n_gpu_layers: int = 0
+    """Layers to place on the GPU (`-ngl`) for a dense model."""
 
     def __bool__(self) -> bool:
         """A REFUSE verdict is falsy, so `if verdict:` cannot silently proceed."""
@@ -116,13 +147,28 @@ class Verdict:
     def ctx_size_flag(self) -> int:
         return self.plan.ctx_size_flag
 
+    def _offload_flags(self) -> str:
+        """Turn the computed GB split into the flags that actually enforce it.
+
+        Getting this wrong is not a small error: `-ngl 99` on a model whose
+        weights exceed VRAM asks llama.cpp to load the whole thing onto the GPU.
+        """
+        if self.weights_spilled_gb <= 0:
+            return "-ngl 99"
+        if self.model.is_moe:
+            # Keep every layer's attention on the GPU; push expert weights to RAM.
+            return f"-ngl 99 -ncmoe {self.n_cpu_moe}"
+        # Dense models have no experts to separate, so offload whole layers.
+        return f"-ngl {self.n_gpu_layers}"
+
     def llama_server_flags(self) -> str:
         """The exact invocation. See docs/DECISIONS.md §7 for why each value."""
         parts = [
             f"-m <path-to>/{self.model.name}-{self.model.quant}.gguf",
             "-a claude-local-coder",  # clients filter IDs lacking "claude"
             "--host 0.0.0.0 --port 8080",
-            "--device Vulkan0 -ngl 99",
+            "--device Vulkan0",
+            self._offload_flags(),
             f"-np {self.plan.n_slots}",
             f"-c {self.ctx_size_flag}",
             "-t 8",
@@ -139,6 +185,13 @@ class Verdict:
         return " ".join(parts)
 
     def explain(self) -> str:
+        if self.weights_spilled_gb <= 0:
+            offload = "all layers on GPU"
+        elif self.model.is_moe:
+            offload = f"ncmoe {self.n_cpu_moe}/{self.model.n_layers} expert layers -> RAM"
+        else:
+            offload = f"ngl {self.n_gpu_layers}/{self.model.n_layers} layers on GPU"
+
         lines = [
             f"{self.status.value}: {self.model.id} "
             f"@ {self.plan.context_per_slot:,} ctx x {self.plan.n_slots} slot(s)",
@@ -146,6 +199,7 @@ class Verdict:
             f"(KV {self.kv_gb:.2f})",
             f"  RAM   {self.ram_used_gb:5.2f} / {self.hardware.ram_usable_gb:5.2f} GB usable "
             f"(spilled weights {self.weights_spilled_gb:.2f})",
+            f"  Split {offload}",
             f"  Headroom {self.headroom_gb:+.2f} GB",
         ]
         lines += [f"  ! {r}" for r in self.reasons]
@@ -181,6 +235,18 @@ def solve(hw: Hardware, model: Model, plan: Plan) -> Verdict:
 
     weights_in_vram = min(model.weights_gb, vram_for_weights)
     weights_spilled = model.weights_gb - weights_in_vram
+
+    # Convert the GB split into flags llama.cpp will actually honour.
+    n_cpu_moe = 0
+    n_gpu_layers = model.n_layers
+    if weights_spilled > 0:
+        if model.is_moe and model.expert_gb_per_layer > 0:
+            n_cpu_moe = min(
+                model.n_layers,
+                math.ceil(weights_spilled / model.expert_gb_per_layer),
+            )
+        elif model.gb_per_layer > 0:
+            n_gpu_layers = max(0, math.floor(weights_in_vram / model.gb_per_layer))
 
     cram_gb = plan.effective_cram_mib / 1024.0
     ram_used = weights_spilled + cram_gb + PROCESS_OVERHEAD_GB
@@ -218,6 +284,8 @@ def solve(hw: Hardware, model: Model, plan: Plan) -> Verdict:
         headroom_gb=headroom,
         reasons=tuple(reasons),
         warnings=tuple(warnings),
+        n_cpu_moe=n_cpu_moe,
+        n_gpu_layers=n_gpu_layers,
     )
 
 
@@ -238,12 +306,14 @@ def _refuse(
         hardware=hw,
         kv_gb=kv_gb,
         weights_in_vram_gb=0.0,
-        weights_spilled_gb=0.0,
+        weights_spilled_gb=model.weights_gb,
         vram_used_gb=0.0,
         ram_used_gb=ram_used,
         headroom_gb=headroom,
         reasons=tuple(reasons),
         warnings=tuple(warnings),
+        n_cpu_moe=model.n_layers if model.is_moe else 0,
+        n_gpu_layers=0,
     )
 
 

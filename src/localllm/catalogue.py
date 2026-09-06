@@ -30,6 +30,21 @@ class Model:
     kb_per_token_q8: float
     """KV cache cost, KB per token per slot, at q8_0 KV quantisation."""
 
+    n_layers: int
+    """Transformer block count - needed to convert a GB split into a layer count."""
+
+    dense_gb: float
+    """Non-expert weights: embeddings, attention, shared FFN, output head.
+
+    For an MoE this is what stays on the GPU regardless of expert offload, so it
+    sets the floor for VRAM use. Estimated from total size and architecture;
+    Phase 0 should calibrate it against the buffer sizes llama-server reports at
+    startup. Overestimating it is the safe direction - it shrinks the computed
+    per-layer expert size, which pushes *more* layers to CPU.
+
+    For a dense model this is simply the whole model.
+    """
+
     is_moe: bool
     active_params_b: float | None = None
     coding_specialist: bool = False
@@ -44,6 +59,18 @@ class Model:
     def id(self) -> str:
         return f"{self.name}:{self.quant}"
 
+    @property
+    def expert_gb_per_layer(self) -> float:
+        """GB of offloadable expert weight in one layer. Zero for dense models."""
+        if not self.is_moe or self.n_layers <= 0:
+            return 0.0
+        return max(0.0, self.weights_gb - self.dense_gb) / self.n_layers
+
+    @property
+    def gb_per_layer(self) -> float:
+        """GB per layer for a dense model, used for partial -ngl."""
+        return self.weights_gb / self.n_layers if self.n_layers > 0 else 0.0
+
 
 # --- MoE, ~3B active: the shape that works on this hardware -----------------
 
@@ -52,6 +79,8 @@ GPT_OSS_20B = Model(
     quant="MXFP4",
     weights_gb=12.11,
     kb_per_token_q8=12.0,
+    n_layers=24,
+    dense_gb=1.8,
     is_moe=True,
     active_params_b=3.6,
     native_quant=True,
@@ -64,6 +93,8 @@ KAT_CODER_Q2_K_L = Model(
     quant="Q2_K_L",
     weights_gb=13.11,
     kb_per_token_q8=10.0,
+    n_layers=40,
+    dense_gb=1.6,
     is_moe=True,
     active_params_b=3.0,
     coding_specialist=True,
@@ -76,6 +107,8 @@ KAT_CODER_IQ3_XXS = Model(
     quant="IQ3_XXS",
     weights_gb=14.87,
     kb_per_token_q8=10.0,
+    n_layers=40,
+    dense_gb=1.8,
     is_moe=True,
     active_params_b=3.0,
     coding_specialist=True,
@@ -88,6 +121,8 @@ QWEN36_35B_A3B_IQ3_XXS = Model(
     quant="UD-IQ3_XXS",
     weights_gb=12.30,
     kb_per_token_q8=10.0,
+    n_layers=40,
+    dense_gb=1.5,
     is_moe=True,
     active_params_b=3.0,
     swe_bench_verified=64.40,
@@ -99,6 +134,8 @@ GEMMA4_26B_A4B_Q3 = Model(
     quant="UD-Q3_K_XL",
     weights_gb=12.02,
     kb_per_token_q8=12.5,
+    n_layers=30,
+    dense_gb=1.5,
     is_moe=True,
     active_params_b=4.0,
     swe_bench_verified=57.40,
@@ -111,6 +148,8 @@ QWEN25_CODER_14B = Model(
     quant="Q4_K_M",
     weights_gb=8.99,
     kb_per_token_q8=96.0,
+    n_layers=48,
+    dense_gb=8.99,
     is_moe=False,
     coding_specialist=True,
     notes="48/48 full-attention layers - the worst KV cost in the field.",
@@ -121,6 +160,8 @@ QWEN25_CODER_7B = Model(
     quant="Q4_K_M",
     weights_gb=4.68,
     kb_per_token_q8=28.0,
+    n_layers=28,
+    dense_gb=4.68,
     is_moe=False,
     coding_specialist=True,
     notes="Fits in VRAM, but its 32B sibling scores 8.0% on Aider diff.",
@@ -131,6 +172,8 @@ QWEN3_CODER_30B_A3B = Model(
     quant="Q3_K_M",
     weights_gb=14.71,
     kb_per_token_q8=48.0,
+    n_layers=48,
+    dense_gb=2.0,
     is_moe=True,
     active_params_b=3.3,
     coding_specialist=True,

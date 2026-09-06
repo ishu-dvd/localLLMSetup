@@ -51,6 +51,7 @@ def _hardware_from(args: argparse.Namespace) -> tuple[Hardware, list[str]]:
             vram_total_gb=args.vram or probed.vram_total_gb,
             ram_total_gb=args.ram or probed.ram_total_gb,
             os=probed.os,
+            measured_ram_available_gb=probed.measured_ram_available_gb,
         ),
         notes,
     )
@@ -112,9 +113,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
     for n in notes:
         print(f"note     : {n}")
     print(f"Hardware : {hw.vram_total_gb:.1f} GB VRAM, {hw.ram_total_gb:.1f} GB RAM ({hw.os})")
+    basis = (
+        "measured free memory"
+        if hw.budget_is_measured
+        else "assumed driver/display and OS idle reserves"
+    )
     print(
-        f"Usable   : {hw.vram_usable_gb:.2f} GB VRAM, {hw.ram_usable_gb:.2f} GB RAM "
-        "(after driver/display and OS idle)"
+        f"Usable   : {hw.vram_usable_gb:.2f} GB VRAM, {hw.ram_usable_gb:.2f} GB RAM (from {basis})"
     )
     print(
         f"Plan     : {plan.context_per_slot:,} ctx x {plan.n_slots} slot(s) "
