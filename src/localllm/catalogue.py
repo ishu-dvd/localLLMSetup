@@ -14,6 +14,7 @@ verdict is unrecoverable.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 KV_ELEM_BYTES = {
     "f16": 2.0,
@@ -67,12 +68,30 @@ class Model:
 
     active_params_b: float | None = None
     coding_specialist: bool = False
+    expert_count: int = 0
+    expert_used_count: int = 0
+    """How many experts a token routes to. Only these are read per token, which
+    is why an MoE decodes far faster than its total weight suggests."""
     native_quant: bool = False
     """True when this quantisation IS the released format, so there is no
     quantisation loss at all. Only gpt-oss-20b's MXFP4 qualifies."""
 
     swe_bench_verified: float | None = None
     notes: str = ""
+    source_path: str | None = None
+    """Where this model actually lives, used verbatim in the -m flag."""
+
+    max_context: int | None = None
+    """The trained/extended context length, from the GGUF's own `context_length`.
+
+    Not a memory quantity: asking for more is simply invalid, and llama.cpp
+    refuses at startup. Tracked here so the solver can say so before the user
+    downloads 12 GB and finds out.
+    """
+
+    license: str | None = None
+    license_is_commercial: bool | None = None
+    """Three-state, where None means unknown rather than acceptable."""
 
     @property
     def id(self) -> str:
@@ -131,7 +150,7 @@ GPT_OSS_20B = Model(
     weights_gb=12.11,
     kb_per_token_q8=12.0,
     n_layers=24,
-    dense_gb=1.8,
+    dense_gb=1.918,
     is_moe=True,
     n_kv_heads=8,
     head_dim=64,
@@ -141,7 +160,16 @@ GPT_OSS_20B = Model(
     active_params_b=3.6,
     native_quant=True,
     swe_bench_verified=60.4,
-    notes="MXFP4 is the native release format - zero quantisation loss.",
+    max_context=131072,
+    license="apache-2.0",
+    license_is_commercial=True,
+    expert_count=32,
+    expert_used_count=4,
+    notes=(
+        "MXFP4 is the native release format - zero quantisation loss. "
+        "Architecture and dense_gb verified against the real GGUF "
+        "(ggml-org/gpt-oss-20b-GGUF, 12,109,566,624 bytes, 459 tensors)."
+    ),
 )
 
 KAT_CODER_Q2_K_L = Model(
@@ -272,3 +300,98 @@ CATALOGUE: dict[str, Model] = {
         QWEN3_CODER_30B_A3B,
     )
 }
+
+
+GGML_FILE_TYPES = {
+    0: "F32",
+    1: "F16",
+    2: "Q4_0",
+    3: "Q4_1",
+    7: "Q8_0",
+    8: "Q5_0",
+    9: "Q5_1",
+    10: "Q2_K",
+    11: "Q3_K_S",
+    12: "Q3_K_M",
+    13: "Q3_K_L",
+    14: "Q4_K_S",
+    15: "Q4_K_M",
+    16: "Q5_K_S",
+    17: "Q5_K_M",
+    18: "Q6_K",
+    19: "IQ2_XXS",
+    20: "IQ2_XS",
+    21: "Q2_K_S",
+    22: "IQ3_XS",
+    23: "IQ3_XXS",
+    24: "IQ1_S",
+    25: "IQ4_NL",
+    26: "IQ3_S",
+    27: "IQ3_M",
+    28: "IQ2_S",
+    29: "IQ2_M",
+    30: "IQ4_XS",
+    31: "IQ1_M",
+    32: "BF16",
+    38: "MXFP4",
+}
+"""ggml file-type tags, so `general.file_type` renders as a name rather than an
+integer nobody can read."""
+
+
+def model_from_gguf(
+    md: Any,
+    name: str | None = None,
+    quant: str | None = None,
+    source_path: str | None = None,
+) -> Model:
+    """Build a Model from a real GGUF file's own metadata.
+
+    Everything here is read from the file rather than hand-entered, which is the
+    point: a catalogue entry can be wrong and nobody notices, whereas the file
+    cannot disagree with itself.
+
+    `dense_gb` in particular becomes *measured* (from the tensor index) rather
+    than estimated, and it is what sets N in `-ncmoe N`.
+    """
+    if not md.is_complete:
+        raise ValueError(f"GGUF is missing fields needed for planning: {', '.join(md.missing())}")
+    if md.weights_gb is None:
+        raise ValueError("GGUF file size is unknown, so weights cannot be sized")
+
+    dense = md.dense_gb
+    dense_measured = dense is not None
+    if not dense_measured:
+        # No tensor index available. Assume the whole model is dense, which
+        # yields ncmoe = every layer: it offloads more than necessary rather
+        # than less, and never overcommits VRAM.
+        dense = md.weights_gb if not md.is_moe else md.weights_gb * 0.15
+
+    return Model(
+        name=name or md.architecture,
+        quant=quant or GGML_FILE_TYPES.get(md.kv.get("general.file_type"), "gguf"),
+        weights_gb=md.weights_gb,
+        kb_per_token_q8=0.0,  # unused: architecture is known, so KV is derived
+        n_layers=md.n_layers,
+        dense_gb=dense,
+        is_moe=md.is_moe,
+        n_kv_heads=md.n_kv_heads,
+        head_dim=md.head_dim,
+        full_attn_layers=md.full_attn_layers,
+        sliding_layers=md.sliding_layers,
+        sliding_window=md.sliding_window,
+        source_path=source_path,
+        max_context=md.max_context,
+        license=md.license,
+        license_is_commercial=md.license_is_commercial,
+        expert_count=md.expert_count,
+        expert_used_count=md.expert_used_count,
+        notes=(
+            "read from GGUF; "
+            + (
+                "dense split measured from tensor index"
+                if dense_measured
+                else "dense split estimated"
+            )
+        ),
+    )

@@ -16,8 +16,9 @@ import sys
 from pathlib import Path
 
 from .budget import Fit, Hardware, Plan, recommend, solve
-from .catalogue import CATALOGUE
+from .catalogue import CATALOGUE, model_from_gguf
 from .detect import detect
+from .gguf import GgufError, read_gguf_file, read_gguf_url
 from .join import SUPPORTED, build_client_config
 from .keys import DeviceExistsError, DeviceNotFoundError, KeyStore
 from .serve import (
@@ -29,6 +30,7 @@ from .serve import (
     render_powercfg_script,
     render_watchdog_script,
 )
+from .speed import context_speed_curve
 
 _MARK = {Fit.FITS: "OK  ", Fit.TIGHT: "TIGHT", Fit.REFUSE: "NO  "}
 DEFAULT_STORE = Path.home() / ".localllm" / "keys.json"
@@ -102,8 +104,48 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return cmd_plan(args)
 
 
+def _model_from_args(args: argparse.Namespace) -> tuple[object | None, list[str]]:
+    """Load a model from a real GGUF when one is given. Returns (model, notes).
+
+    Accepts a local path, a full URL, or a `owner/repo/file.gguf` Hugging Face
+    spec. The remote path reads only the header, so a 12 GB model can be sized
+    without downloading it.
+    """
+    spec = getattr(args, "gguf", None)
+    if not spec:
+        return None, []
+
+    text = str(spec)
+    is_remote = text.startswith(("http://", "https://", "hf:")) or (
+        "/" in text and not Path(text).exists()
+    )
+
+    try:
+        if is_remote:
+            md = read_gguf_url(text)
+            source = text
+            local_path = None
+        else:
+            md = read_gguf_file(text)
+            source = Path(text).name
+            local_path = str(Path(text).resolve())
+        model = model_from_gguf(md, name=Path(text).stem, source_path=local_path)
+    except (GgufError, ValueError, OSError) as exc:
+        return None, [f"could not read {spec}: {exc}"]
+
+    notes = [
+        f"model facts read from {source}",
+        f"  weights {md.weights_gb:.2f} GB, {md.n_layers} layers, "
+        f"{md.full_attn_layers} global-attention ({md.full_attn_layers_source})",
+        f"  {model.notes}",
+    ]
+    return model, notes
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     hw, notes = _hardware_from(args)
+    gguf_model, gguf_notes = _model_from_args(args)
+    notes.extend(gguf_notes)
     plan = Plan(
         context_per_slot=args.context,
         n_slots=args.slots,
@@ -132,17 +174,81 @@ def cmd_plan(args: argparse.Namespace) -> int:
             f"requires -c {plan.ctx_size_flag:,}, not -c {plan.context_per_slot:,}."
         )
     print()
-    print(_table(hw, plan))
-    print()
+    if gguf_model is not None:
+        best = solve(hw, gguf_model, plan)
+        print(best.explain())
+    else:
+        print(_table(hw, plan))
+        print()
+        best = recommend(hw, plan)
+        if best is None:
+            print("No model in the catalogue fits this plan. Reduce context or slots.")
+            return 1
+        print(best.explain())
 
-    best = recommend(hw, plan)
-    if best is None:
-        print("No model in the catalogue fits this plan. Reduce context or slots.")
-        return 1
-
-    print(best.explain())
     print("\nllama-server invocation:")
     print(f"  {best.llama_server_flags()}")
+    return 0 if best else 1
+
+
+def cmd_speed(args: argparse.Namespace) -> int:
+    """Show what each context length costs in throughput.
+
+    The budget answers *"does it fit?"*. This answers *"what did fitting cost?"*
+    — which on a machine where the model does not fit in VRAM is the question
+    that actually decides the configuration, and the one no tool answers.
+    """
+    hw, notes = _hardware_from(args)
+    gguf_model, gguf_notes = _model_from_args(args)
+    notes.extend(gguf_notes)
+    for n in notes:
+        print(f"note     : {n}")
+
+    model = gguf_model
+    if model is None:
+        best = recommend(hw, Plan(args.context, n_slots=args.slots, kv_quant=args.kv_quant))
+        if best is None:
+            print("No model in the catalogue fits. Reduce context or slots.")
+            return 1
+        model = best.model
+
+    contexts = args.contexts or [4096, 8192, 16384, 32768, 65536, 131072]
+    curve = context_speed_curve(hw, model, contexts, n_slots=args.slots, kv_quant=args.kv_quant)
+    if not curve:
+        print(f"{model.id} does not fit at any of the requested context lengths.")
+        return 1
+
+    print(
+        f"\n{model.id} on {hw.vram_total_gb:.0f} GB VRAM / {hw.ram_total_gb:.0f} GB RAM, "
+        f"{args.slots} slot(s)."
+    )
+    print("Every GB of KV is a GB not holding expert weights.\n")
+    print(
+        f"{'ctx/slot':>10} {'-ncmoe':>7} {'GB/tok VRAM':>12} {'GB/tok RAM':>11} {'est tok/s':>12}"
+    )
+    print("-" * 58)
+    for ctx, est in curve:
+        print(
+            f"{ctx:>10,} {est.n_cpu_moe:>7} {est.gb_from_vram:>12.2f} {est.gb_from_ram:>11.2f} "
+            f"{est.low_tokens_per_second:>5.0f}-{est.high_tokens_per_second:<6.0f}"
+        )
+
+    fastest, slowest = curve[0][1], curve[-1][1]
+    if len(curve) > 1 and fastest.tokens_per_second > 0:
+        cost = (1 - slowest.tokens_per_second / fastest.tokens_per_second) * 100
+        print(
+            f"\n{curve[0][0]:,} -> {curve[-1][0]:,} context costs about "
+            f"{cost:.0f}% of decode speed."
+        )
+        if cost < 20:
+            print(
+                "  That is cheap: this model's sliding-window attention keeps KV small, so "
+                "context\n  barely displaces expert weights. Take the context."
+            )
+        else:
+            print("  Worth weighing against how much context the agent actually uses.")
+    print(f"\n{fastest.caveat}.")
+    print("Replaced by real figures once Phase 0 in docs/PLAN.md runs on the machine.")
     return 0
 
 
@@ -158,7 +264,10 @@ def cmd_up(args: argparse.Namespace) -> int:
     for n in notes:
         print(f"note     : {n}")
 
-    verdict = recommend(hw, plan)
+    gguf_model, gguf_notes = _model_from_args(args)
+    for n in gguf_notes:
+        print(f"note     : {n}")
+    verdict = solve(hw, gguf_model, plan) if gguf_model else recommend(hw, plan)
     if verdict is None:
         print("No model fits this plan. Reduce --context or --slots.", file=sys.stderr)
         return 1
@@ -296,6 +405,14 @@ def _add_plan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--kv-quant", default="q8_0", choices=["f16", "q8_0", "q4_0"])
     p.add_argument("--cram", type=int, default=None, help="prompt cache RAM in MiB")
     p.add_argument(
+        "--gguf",
+        type=str,
+        default=None,
+        help="a .gguf path, URL, or owner/repo/file.gguf spec - reads layers, KV "
+        "heads, head dim and the exact expert/dense split from the file itself. "
+        "Remote specs read only the header, so a 12GB model is sized without downloading it.",
+    )
+    p.add_argument(
         "--llama-server",
         default=None,
         help="path to llama-server.exe - lets us read VRAM from llama.cpp's own "
@@ -317,6 +434,17 @@ def main(argv: list[str] | None = None) -> int:
     plan = sub.add_parser("plan", help="show which models fit and how to run the best one")
     _add_plan_args(plan)
     plan.set_defaults(func=cmd_plan)
+
+    speed = sub.add_parser("speed", help="show what each context length costs in decode throughput")
+    _add_plan_args(speed)
+    speed.add_argument(
+        "--contexts",
+        type=int,
+        nargs="+",
+        default=None,
+        help="context lengths to compare (default: 4K..128K)",
+    )
+    speed.set_defaults(func=cmd_speed)
 
     up = sub.add_parser("up", help="preflight, then generate the 24/7 service definition")
     _add_plan_args(up)

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .catalogue import CATALOGUE, Model
+from .speed import DecodeEstimate, estimate_decode
 
 # --- Reserves, derived from the research -----------------------------------
 # See docs/DECISIONS.md §0. These are the difference between the headline
@@ -47,6 +48,28 @@ MEASURED_RAM_SAFETY_GB = 1.0
 
 KV_QUANT_SCALE = {"f16": 2.0, "q8_0": 1.0, "q4_0": 0.5}
 """Relative to the catalogue's q8_0 baseline."""
+
+
+SPEC_NGRAM_RAM_GB = 0.016
+"""ngram-mod's hash pool. ~16 MB, constant, shared across all slots.
+
+The author's own note on PR #19164: *"a single hash pool is shared across all
+server slots, so different requests can benefit from each other"* — which is
+exactly the three-laptop case, and why this is on by default.
+"""
+
+SPEC_EAGLE3_WEIGHTS_GB = 0.336
+"""The published EAGLE3 head for gpt-oss-20b."""
+
+SPEC_EAGLE3_KV_BYTES_PER_TOKEN = 8192.0
+"""Draft KV per token. **Unverified** — the head's architecture has not been read.
+
+Deliberately generous, because the failure mode is asymmetric: understating this
+lets a plan through that dies at decode entry, which is the exact symptom in open
+issue #28433.
+"""
+
+VALID_SPECULATION = ("none", "ngram", "eagle3")
 
 
 class Fit(Enum):
@@ -105,6 +128,40 @@ class Plan:
     n_slots: int = 1
     kv_quant: str = "q8_0"
     cram_mib: int | None = None
+    speculation: str = "ngram"
+    """Which speculative decoder to run. See docs/research/perf-flags.md.
+
+    `ngram` (default) is model-free: ~16 MB, no draft model, no draft KV, and
+    llama.cpp's maintainer notes it is aimed at *"iterating over a block of
+    text/code"* and that *"MoEs require long drafts"* — this deployment is both.
+
+    `eagle3` needs a real draft head, and its KV is sized by the **total** `-c`
+    rather than the draft length, which is a much larger bill than it looks.
+    """
+
+    cache_reuse: int = 256
+    """Minimum chunk length for KV reuse past the common prefix (`--cache-reuse`).
+
+    Defaults to 0 (off) in llama.cpp. Costs no memory and is precisely aimed at
+    the coding-agent pattern where a tool result is inserted mid-prompt and
+    everything after it shifts. Larger N reuses less but shifts less.
+    """
+
+    @property
+    def effective_speculation(self) -> str:
+        mode = self.speculation.lower()
+        if mode not in VALID_SPECULATION:
+            raise ValueError(
+                f"unknown speculation mode {self.speculation!r}; "
+                f"expected one of {', '.join(VALID_SPECULATION)}"
+                + (
+                    " - note ngram-cache is deliberately unsupported (issue #27852: "
+                    "acceptance collapses from 86% to 11%)"
+                    if "cache" in mode
+                    else ""
+                )
+            )
+        return mode
 
     @property
     def effective_cram_mib(self) -> int:
@@ -143,6 +200,9 @@ class Verdict:
     n_gpu_layers: int = 0
     """Layers to place on the GPU (`-ngl`) for a dense model."""
 
+    spec_vram_gb: float = 0.0
+    """VRAM the speculative decoder costs. Zero for model-free ngram."""
+
     def __bool__(self) -> bool:
         """A REFUSE verdict is falsy, so `if verdict:` cannot silently proceed."""
         return self.status is not Fit.REFUSE
@@ -150,6 +210,15 @@ class Verdict:
     @property
     def ctx_size_flag(self) -> int:
         return self.plan.ctx_size_flag
+
+    @property
+    def decode_estimate(self) -> DecodeEstimate:
+        """What this configuration is likely to cost in throughput.
+
+        Deliberately attached to the verdict rather than computed separately, so
+        the speed shown always corresponds to the offload the solver chose.
+        """
+        return estimate_decode(self.model, self.n_cpu_moe)
 
     def _offload_flags(self) -> str:
         """Turn the computed GB split into the flags that actually enforce it.
@@ -167,8 +236,11 @@ class Verdict:
 
     def llama_server_flags(self) -> str:
         """The exact invocation. See docs/DECISIONS.md §7 for why each value."""
+        model_path = self.model.source_path or (
+            f"<path-to>/{self.model.name}-{self.model.quant}.gguf"
+        )
         parts = [
-            f"-m <path-to>/{self.model.name}-{self.model.quant}.gguf",
+            f"-m {model_path}",
             "-a claude-local-coder",  # clients filter IDs lacking "claude"
             "--host 0.0.0.0 --port 8080",
             "--device Vulkan0",
@@ -179,10 +251,25 @@ class Verdict:
             "-fa on",
             f"-ctk {self.plan.kv_quant} -ctv {self.plan.kv_quant}",
             "-b 4096 -ub 1024",  # avoids Vulkan garbage output, bug #27237
-            "-lm mmap+mlock",  # needs SeLockMemoryPrivilege - verify
+            # NOT mmap+mlock: pinning 12.11 GB of weights into ~10.5 GB of
+            # usable RAM cannot succeed. `auto` maps them and lets the OS manage.
+            "-lm auto",
+            # `-fit` defaults ON and silently rewrites unset args to fit VRAM,
+            # as far down as 4096 context - discarding the plan computed above
+            # with nothing in the output to say it happened.
+            "-fit off",
+            f"--cache-reuse {self.plan.cache_reuse}",
             f"-cram {self.plan.effective_cram_mib}",
             "--jinja --metrics --sse-ping-interval 30",
         ]
+        spec = self.plan.effective_speculation
+        if spec == "ngram":
+            # Preset for ngram-mod: n-match 24, n-min 48, n-max 64. Long drafts
+            # on purpose - short ones do not amortise MoE expert streaming.
+            parts.insert(-1, "--spec-default")
+        elif spec == "eagle3":
+            parts.insert(-1, "--spec-type draft-eagle3 -md <path-to>/eagle3-gpt-oss-20b.gguf")
+            parts.insert(-1, "-ctkd q8_0 -ctvd q8_0")
         if self.plan.n_slots > 1:
             # 0.10 lets a laptop steal another's slot on shared boilerplate.
             parts.insert(-1, "-sps 0.5")
@@ -204,6 +291,7 @@ class Verdict:
             f"  RAM   {self.ram_used_gb:5.2f} / {self.hardware.ram_usable_gb:5.2f} GB usable "
             f"(spilled weights {self.weights_spilled_gb:.2f})",
             f"  Split {offload}",
+            f"  Speed {self.decode_estimate.summary()}",
             f"  Headroom {self.headroom_gb:+.2f} GB",
         ]
         lines += [f"  ! {r}" for r in self.reasons]
@@ -215,6 +303,27 @@ def solve(hw: Hardware, model: Model, plan: Plan) -> Verdict:
     """Decide whether this plan fits, refusing anything that would page."""
     reasons: list[str] = []
     warnings: list[str] = []
+
+    # A constraint, not a budget. The model limit is PER SLOT, unlike `-c` which
+    # is the total pool - so 3 x 100K is fine on a 131K model even though the
+    # pool is 300K.
+    if model.max_context is not None and plan.context_per_slot > model.max_context:
+        reasons.append(
+            f"{plan.context_per_slot:,} tokens per slot exceeds the {model.max_context:,} "
+            f"this model was trained for - llama.cpp will refuse to start"
+        )
+        return _refuse(hw, model, plan, 0.0, reasons, warnings)
+
+    if model.license_is_commercial is False:
+        warnings.append(
+            f"licence '{model.license}' does not permit commercial use - "
+            "fine for personal use, not for work"
+        )
+    elif model.license_is_commercial is None and model.license:
+        warnings.append(
+            f"licence '{model.license}' is bespoke - read it; licences are "
+            "per-checkpoint, and sibling models of the same family often differ"
+        )
 
     # Derived from architecture where known, so a new model cannot be added with a
     # wrong hand-typed constant. Includes the q8_0 block-scale overhead, and the
@@ -232,8 +341,27 @@ def solve(hw: Hardware, model: Model, plan: Plan) -> Verdict:
             "-cram at or above the 8192 MiB default will consume most of your usable RAM"
         )
 
+    # Speculative decoding is not free, and its bill is easy to misread.
+    spec = plan.effective_speculation
+    spec_vram = 0.0
+    spec_ram = 0.0
+    if spec == "ngram":
+        spec_ram = SPEC_NGRAM_RAM_GB
+    elif spec == "eagle3":
+        # The trap: the draft context is NOT the draft length. llama.cpp copies
+        # the params wholesale and never overrides n_ctx, so the draft KV is
+        # sized by the total `-c`. Issue #28433 reports this killing servers.
+        draft_kv_gb = SPEC_EAGLE3_KV_BYTES_PER_TOKEN * plan.ctx_size_flag / 1_000_000_000
+        spec_vram = SPEC_EAGLE3_WEIGHTS_GB + draft_kv_gb
+        warnings.append(
+            f"EAGLE3 costs {spec_vram:.2f} GB of VRAM ({SPEC_EAGLE3_WEIGHTS_GB:.2f} weights "
+            f"+ {draft_kv_gb:.2f} draft KV sized by the TOTAL -c {plan.ctx_size_flag:,}, "
+            "not the draft length) - and its benefit here is unverified; measure "
+            "model-free ngram speculation first"
+        )
+
     # KV and compute buffers live on the GPU; whatever VRAM is left holds weights.
-    vram_for_weights = hw.vram_usable_gb - kv_gb - COMPUTE_BUFFER_GB
+    vram_for_weights = hw.vram_usable_gb - kv_gb - COMPUTE_BUFFER_GB - spec_vram
     if vram_for_weights <= 0:
         reasons.append(
             f"KV cache alone ({kv_gb:.2f} GB) plus compute buffers exceed "
@@ -257,7 +385,7 @@ def solve(hw: Hardware, model: Model, plan: Plan) -> Verdict:
             n_gpu_layers = max(0, math.floor(weights_in_vram / model.gb_per_layer))
 
     cram_gb = plan.effective_cram_mib / 1024.0
-    ram_used = weights_spilled + cram_gb + PROCESS_OVERHEAD_GB
+    ram_used = weights_spilled + cram_gb + PROCESS_OVERHEAD_GB + spec_ram
     headroom = hw.ram_usable_gb - ram_used
 
     if headroom < 0:
@@ -287,13 +415,14 @@ def solve(hw: Hardware, model: Model, plan: Plan) -> Verdict:
         kv_gb=kv_gb,
         weights_in_vram_gb=weights_in_vram,
         weights_spilled_gb=weights_spilled,
-        vram_used_gb=weights_in_vram + kv_gb + COMPUTE_BUFFER_GB,
+        vram_used_gb=weights_in_vram + kv_gb + COMPUTE_BUFFER_GB + spec_vram,
         ram_used_gb=ram_used,
         headroom_gb=headroom,
         reasons=tuple(reasons),
         warnings=tuple(warnings),
         n_cpu_moe=n_cpu_moe,
         n_gpu_layers=n_gpu_layers,
+        spec_vram_gb=spec_vram,
     )
 
 

@@ -9,6 +9,8 @@ Written before the implementation, per docs/PLAN.md Phase 1.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from localllm.budget import Fit, Hardware, Plan, solve
@@ -19,6 +21,7 @@ from localllm.catalogue import (
     QWEN3_CODER_30B_A3B,
     QWEN25_CODER_7B,
     QWEN25_CODER_14B,
+    Model,
 )
 
 # The reference machine: MSI Alpha, stock, no upgrades possible.
@@ -243,9 +246,14 @@ def test_flags_never_emit_q4_kv():
     assert "q4_0" not in flags
 
 
-def test_flags_include_mlock_and_batch_settings():
+def test_flags_include_load_mode_and_batch_settings():
     flags = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1)).llama_server_flags()
-    assert "-lm mmap+mlock" in flags
+    # This assertion used to require `-lm mmap+mlock`, and so was pinning a bug
+    # rather than a behaviour: mlock asks the OS to pin all 12.11 GB of weights
+    # into ~10.5 GB of usable RAM, which cannot succeed. The deprecated
+    # `--mlock`/`--no-mmap` spellings are gone too.
+    assert "-lm auto" in flags
+    assert "mlock" not in flags
     assert "-b 4096" in flags  # avoids Vulkan garbage-output bug #27237
     assert "-fa on" in flags
 
@@ -385,3 +393,215 @@ def test_measurement_cannot_exceed_the_stated_total():
 
 def test_measured_vram_cannot_exceed_installed_vram():
     assert Hardware(8.0, 16.0, measured_vram_free_gb=99.0).vram_usable_gb <= 8.0
+
+
+# --- Constraints that are not arithmetic -----------------------------------
+# A plan can be perfectly sized and still be invalid. These are the checks a
+# memory-only solver would never make.
+
+
+class TestContextExceedsModelMaximum:
+    """`-c` above the model's trained context is rejected by llama.cpp itself.
+
+    The budget would be *correct* about a plan that cannot start, which is the
+    worst kind of wrong answer: confident and useless.
+    """
+
+    def _model(self, max_context: int | None) -> Model:
+        return replace(GPT_OSS_20B, max_context=max_context)
+
+    def test_refuses_context_above_model_maximum(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        v = solve(hw, self._model(131072), Plan(context_per_slot=200_000))
+        assert v.status is Fit.REFUSE
+        assert not v
+        assert any("131,072" in r for r in v.reasons)
+
+    def test_refusal_names_the_limit_and_the_request(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        v = solve(hw, self._model(131072), Plan(context_per_slot=200_000))
+        joined = " ".join(v.reasons)
+        assert "200,000" in joined and "131,072" in joined
+
+    def test_the_limit_is_per_slot_not_the_total_pool(self) -> None:
+        """`-c` is the total, but the model limit applies to each slot.
+
+        3 slots x 100K = 300K total, which is far above the model's 131K -- yet
+        every slot is within limits, so this must be allowed.
+        """
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        v = solve(hw, self._model(131072), Plan(context_per_slot=100_000, n_slots=3))
+        assert not any("exceeds" in r and "trained" in r for r in v.reasons)
+
+    def test_exactly_at_the_limit_is_allowed(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        v = solve(hw, self._model(131072), Plan(context_per_slot=131072))
+        assert not any("trained" in r for r in v.reasons)
+
+    def test_unknown_maximum_does_not_refuse(self) -> None:
+        """Absence of a stated limit is not evidence of a low one."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        v = solve(hw, self._model(None), Plan(context_per_slot=200_000))
+        assert not any("trained" in r for r in v.reasons)
+
+
+class TestLicenceWarning:
+    def test_non_commercial_model_warns(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        m = replace(GPT_OSS_20B, license="cc-by-nc-4.0", license_is_commercial=False)
+        v = solve(hw, m, Plan(context_per_slot=8192))
+        assert any("commercial" in w for w in v.warnings)
+
+    def test_permissive_model_is_silent(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        m = replace(GPT_OSS_20B, license="apache-2.0", license_is_commercial=True)
+        v = solve(hw, m, Plan(context_per_slot=8192))
+        assert not any("licen" in w for w in v.warnings)
+
+    def test_bespoke_licence_asks_the_user_to_read_it(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        m = replace(GPT_OSS_20B, license="llama3.2", license_is_commercial=None)
+        v = solve(hw, m, Plan(context_per_slot=8192))
+        assert any("llama3.2" in w for w in v.warnings)
+
+    def test_unstated_licence_is_silent(self) -> None:
+        """Most GGUFs omit it; warning every time would train the user to ignore."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        m = replace(GPT_OSS_20B, license=None, license_is_commercial=None)
+        v = solve(hw, m, Plan(context_per_slot=8192))
+        assert not any("licen" in w for w in v.warnings)
+
+
+# --- Throughput features ---------------------------------------------------
+# Verified against llama.cpp source at b10819+; see
+# docs/research/perf-flags.md. Every flag here was checked against
+# common/arg.cpp rather than taken from a guide, because the speculative
+# decoding CLI was renamed wholesale in April 2026 (PR #22397) and the old
+# spelling now hard-errors at startup rather than warning.
+
+
+class TestSpeculativeDecoding:
+    def _flags(self, **kw: object) -> str:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        return solve(hw, GPT_OSS_20B, Plan(context_per_slot=16384, **kw)).llama_server_flags()
+
+    def test_ngram_speculation_is_on_by_default(self) -> None:
+        """~16 MB, no draft model, no draft KV. There is no reason not to."""
+        assert "--spec-default" in self._flags()
+
+    def test_can_be_turned_off(self) -> None:
+        assert "--spec-default" not in self._flags(speculation="none")
+
+    def test_never_emits_the_removed_draft_flags(self) -> None:
+        """`--draft-max`/`--draft-min` were REMOVED, not deprecated.
+
+        They call arg_removed() and abort startup. Any guide older than
+        2026-05 still recommends them.
+        """
+        flags = self._flags()
+        assert "--draft-max" not in flags
+        assert "--draft-min" not in flags
+
+    def test_never_selects_the_broken_ngram_cache_backend(self) -> None:
+        """Issue #27852: per-slot cache leaks across requests, dropping
+        acceptance from 86% to 11% - slower than no speculation at all.
+        Reproduced on an MoE offload topology exactly like ours."""
+        assert "ngram-cache" not in self._flags()
+
+    def test_a_draft_model_is_not_used(self) -> None:
+        """No small model shares gpt-oss's o200k_harmony vocab, and the
+        compatibility check is a hard throw, not a fallback."""
+        flags = self._flags()
+        assert " -md " not in flags and "--model-draft" not in flags
+
+
+class TestCacheReuse:
+    def test_cache_reuse_is_enabled(self) -> None:
+        """Costs nothing and is precisely aimed at the coding-agent pattern:
+        a tool result lands mid-prompt and shifts everything after it."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        v = solve(hw, GPT_OSS_20B, Plan(context_per_slot=16384))
+        assert "--cache-reuse" in v.llama_server_flags()
+
+    def test_context_shift_stays_off(self) -> None:
+        """Default flipped to disabled in 2026 and should stay that way:
+        silently dropping the head of a 90%-identical prompt destroys the
+        prefix cache that makes coding agents usable."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        assert (
+            "--context-shift"
+            not in solve(hw, GPT_OSS_20B, Plan(context_per_slot=16384)).llama_server_flags()
+        )
+
+
+class TestLoadMode:
+    def test_does_not_pin_more_memory_than_exists(self) -> None:
+        """The bug this test exists for: `-lm mmap+mlock` asks the OS to pin
+        all 12.11 GB of weights into ~10.5 GB of usable RAM."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        v = solve(hw, GPT_OSS_20B, Plan(context_per_slot=16384))
+        assert "mlock" not in v.llama_server_flags()
+
+    def test_does_not_use_the_deprecated_spellings(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        flags = solve(hw, GPT_OSS_20B, Plan(context_per_slot=16384)).llama_server_flags()
+        assert "--no-mmap" not in flags and "--mlock" not in flags
+
+
+class TestAutoFitIsDisabled:
+    def test_fit_is_explicitly_off(self) -> None:
+        """`-fit` defaults ON and silently rewrites unset args to fit VRAM,
+        as far down as 4096 context. That would quietly discard the plan this
+        solver just computed - and the user would never see why."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        assert (
+            "-fit off" in solve(hw, GPT_OSS_20B, Plan(context_per_slot=16384)).llama_server_flags()
+        )
+
+
+class TestSpeculationBudget:
+    def test_ngram_costs_a_little_ram(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        off = solve(hw, GPT_OSS_20B, Plan(context_per_slot=16384, speculation="none"))
+        ngram = solve(hw, GPT_OSS_20B, Plan(context_per_slot=16384, speculation="ngram"))
+        assert ngram.ram_used_gb > off.ram_used_gb
+        assert ngram.ram_used_gb - off.ram_used_gb < 0.05  # ~16 MB, not GB
+
+    def test_eagle3_draft_kv_is_sized_by_the_total_pool_not_the_draft_length(self) -> None:
+        """The trap worth encoding: `common_base_params_to_speculative()` copies
+        the params and never overrides `n_ctx`, so the draft KV is sized by the
+        FULL `-c`, not by `--spec-draft-n-max`. Open issue #28433 reports this
+        killing servers at decode entry on large contexts.
+        """
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        small = solve(hw, GPT_OSS_20B, Plan(context_per_slot=8192, speculation="eagle3"))
+        large = solve(hw, GPT_OSS_20B, Plan(context_per_slot=65536, speculation="eagle3"))
+        assert large.spec_vram_gb > small.spec_vram_gb
+
+    def test_eagle3_costs_vram_that_ngram_does_not(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        ngram = solve(hw, GPT_OSS_20B, Plan(context_per_slot=16384, speculation="ngram"))
+        eagle = solve(hw, GPT_OSS_20B, Plan(context_per_slot=16384, speculation="eagle3"))
+        assert eagle.spec_vram_gb > ngram.spec_vram_gb
+        assert ngram.spec_vram_gb == 0.0
+
+    def test_eagle3_offloads_more_experts_to_pay_for_itself(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        ngram = solve(hw, GPT_OSS_20B, Plan(context_per_slot=32768, speculation="ngram"))
+        eagle = solve(hw, GPT_OSS_20B, Plan(context_per_slot=32768, speculation="eagle3"))
+        assert eagle.n_cpu_moe > ngram.n_cpu_moe
+
+    def test_eagle3_warns_that_it_is_unmeasured(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        v = solve(hw, GPT_OSS_20B, Plan(context_per_slot=16384, speculation="eagle3"))
+        assert any("unverified" in w.lower() or "unmeasured" in w.lower() for w in v.warnings)
+
+    def test_unknown_speculation_mode_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="speculation"):
+            _ = Plan(context_per_slot=16384, speculation="ngram-cache").effective_speculation
+
+    def test_rejecting_ngram_cache_says_why(self) -> None:
+        """It is a plausible-looking value that is actively harmful, so the
+        error should stop someone re-adding it from a stale guide."""
+        with pytest.raises(ValueError, match="27852"):
+            _ = Plan(context_per_slot=16384, speculation="ngram-cache").effective_speculation

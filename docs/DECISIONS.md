@@ -425,6 +425,71 @@ absorbs the overflow — so monitor rather than assume:
 
 ---
 
+## 7b. Throughput — **DECIDED: model-free speculation + cache reuse**
+
+Verified against `common/arg.cpp` and `tools/server/server.cpp` at b10819. Full
+report in [`research/perf-flags.md`](research/perf-flags.md). Guides are unusually
+dangerous here: the speculative-decoding CLI was renamed wholesale in April 2026
+(PR #22397, `14e733e36`), and the old flags **abort startup** rather than warn.
+
+| Decision | Cost | Why |
+|---|---|---|
+| **`--spec-default`** (ngram-mod) | ~16 MB RAM | No draft model, no draft KV, one hash pool shared across all slots. PR #19164's author targets it at *"iterating over a block of text/code"* and notes *"MoEs require long drafts"* — this deployment is both. |
+| **`--cache-reuse 256`** | 0 bytes | Past the common prefix, KV-shifts matching runs into place instead of reprocessing. Aimed exactly at a tool result landing mid-prompt and shifting everything after it. |
+| **`-lm auto`** | — | **Fixes a bug.** `mmap+mlock` asked the OS to pin 12.11 GB of weights into ~10.5 GB of usable RAM. |
+| **`-fit off`** | — | `-fit` defaults ON and rewrites unset args down to 4096 context, silently discarding the computed plan. |
+| **`-cram 1024/2048`** | *saves* 6–7 GB | Default is 8192 MiB. |
+
+### Why not a draft model
+
+Classic speculation is **impossible** here. `common_speculative_are_compatible()`
+compares token text byte-for-byte from id 5 upward and **throws** on mismatch — it
+does not fall back. No small model shares gpt-oss's `o200k_harmony` vocab.
+
+An EAGLE3 head exists (336 MB) and bypasses that check, but carries a trap worth
+stating plainly: `common_base_params_to_speculative()` copies the params and
+**never overrides `n_ctx`**, so the draft KV is sized by the **total `-c`**, not by
+the draft length. Open issue #28433 reports exactly that killing servers at decode
+entry. The solver models this, and refuses accordingly.
+
+### Why speculation should help *more* here, not less
+
+Counter-intuitively, MoE offload is close to the best case for speculation. Decode
+on a host-offloaded MoE layer streams the routed experts' weights from system RAM
+*per token*. Verifying D drafted tokens in one forward pass streams the **union** of
+experts across those D tokens — bounded by all 32 rather than 4×D. Hence long
+drafts, and hence the maintainer's remark about MoEs. **Unmeasured on Vulkan/RDNA2;
+Phase 0 measures it.**
+
+### Rejected
+
+- **`ngram-cache`** — issue #27852: per-slot cache leaks across requests, acceptance
+  **86% → 11%**, slower than no speculation. Reproduced on an MoE-offload topology
+  like ours. The solver raises with the issue number if anyone re-adds it.
+- **`-dt` / `--defrag-thold`** — a dead no-op (`GGML_UNUSED(value)`). Guides still
+  recommend it.
+- **`--kv-unified`** — does *not* dedupe shared prefixes. Three identical system
+  prompts still occupy three copies of cells.
+- **Context shift** — default flipped to disabled; leave it off. Silently dropping
+  the head of a 90%-identical prompt destroys the prefix cache coding agents depend on.
+
+### The context/speed tradeoff, quantified
+
+`localllm speed` makes visible what the budget hides: every GB of KV is a GB not
+holding expert weights.
+
+```
+     4,096 ctx  ->  -ncmoe 14  ->  ~19-40 tok/s
+   131,072 ctx  ->  -ncmoe 18  ->  ~17-35 tok/s
+```
+
+**32× the context costs about 11% of decode speed.** Sliding-window attention on half
+of gpt-oss's layers costs a fixed amount regardless of context, so KV stays small
+enough that context barely displaces experts. The usual "keep context small to stay
+fast" advice is wrong for this model. Bandwidth-roofline estimate, not a benchmark.
+
+---
+
 ## 8. Should this repo exist?
 
 **Verified with the GitHub API — most of the original scope already exists, and better:**
