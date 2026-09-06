@@ -22,6 +22,7 @@ from localllm.client import (
     Outcome,
     Probe,
     ProbeError,
+    check_inference,
     check_model_visibility,
     diagnose,
 )
@@ -296,3 +297,122 @@ class TestNoBomInTheKeyFile:
         store.add("laptop-a")
         raw = store.write_api_key_file(tmp_path / "keys.txt").read_bytes()
         assert raw.split(b"\n")[0].startswith(b"#")
+
+
+# --- Does inference actually work? -----------------------------------------
+# A listed model proves the server started, not that a request will succeed.
+# Every error shape below was read from the source (see docs/research/http-api.md),
+# including the two extra fields llama.cpp puts inside the error object on a
+# context overflow - which means exact numbers, with no message parsing.
+
+
+class TestContextExceeded:
+    """`400 exceed_context_size_error` carries `n_prompt_tokens` and `n_ctx`
+    as siblings of `code`/`message`/`type`. Reading them beats scraping the
+    message, which has two different wordings depending on context shift.
+    """
+
+    BODY = {
+        "error": {
+            "code": 400,
+            "message": (
+                "input (9001 tokens) is larger than the max context size (8192 tokens). skipping"
+            ),
+            "type": "exceed_context_size_error",
+            "n_prompt_tokens": 9001,
+            "n_ctx": 8192,
+        }
+    }
+
+    def test_it_is_not_reported_as_a_generic_bad_request(self) -> None:
+        d = diagnose(Probe(url="http://s/v1/chat/completions", status=400, body=self.BODY))
+        assert d.outcome is Outcome.CONTEXT_EXCEEDED
+
+    def test_it_reports_both_exact_numbers(self) -> None:
+        d = diagnose(Probe(url="http://s/v1/chat/completions", status=400, body=self.BODY))
+        assert "9,001" in d.detail and "8,192" in d.detail
+
+    def test_the_fix_explains_the_per_slot_division(self) -> None:
+        """The trap that makes this confusing: -c is the TOTAL pool, so three
+        slots each get a third of it."""
+        d = diagnose(Probe(url="http://s/v1/chat/completions", status=400, body=self.BODY))
+        assert "-c" in d.fix and ("slot" in d.fix.lower() or "total" in d.fix.lower())
+
+    def test_a_plain_400_is_still_a_plain_400(self) -> None:
+        d = diagnose(
+            Probe(url="http://s/x", status=400, body={"error": {"type": "invalid_request_error"}})
+        )
+        assert d.outcome is not Outcome.CONTEXT_EXCEEDED
+
+    def test_a_400_with_no_body_does_not_crash(self) -> None:
+        assert diagnose(Probe(url="http://s/x", status=400)).outcome is not Outcome.OK
+
+
+class TestCapacity:
+    """`GET /slots?fail_on_no_slot=1` is a purpose-built capacity probe.
+
+    It matters because a fourth client on `-np 3` is NOT rejected - it queues.
+    The only symptom is latency, so without this the user sees a server that
+    "works" but is inexplicably slow.
+    """
+
+    def test_all_slots_busy_is_reported_as_capacity_not_failure(self) -> None:
+        p = Probe(
+            url="http://s/slots?fail_on_no_slot=1",
+            status=503,
+            body={
+                "error": {"code": 503, "message": "no slot available", "type": "unavailable_error"}
+            },
+        )
+        assert diagnose(p).outcome is Outcome.NO_CAPACITY
+
+    def test_busy_is_distinguished_from_still_loading(self) -> None:
+        """Both are 503. Confusing them tells a user to wait for a load that
+        finished long ago."""
+        loading = Probe(url="http://s/health", status=503, body={"error": "Loading model"})
+        busy = Probe(
+            url="http://s/slots", status=503, body={"error": {"message": "no slot available"}}
+        )
+        assert diagnose(loading).outcome is Outcome.LOADING
+        assert diagnose(busy).outcome is Outcome.NO_CAPACITY
+
+    def test_the_capacity_message_explains_queueing(self) -> None:
+        p = Probe(
+            url="http://s/slots", status=503, body={"error": {"message": "no slot available"}}
+        )
+        d = diagnose(p)
+        assert "queue" in (d.detail + d.fix).lower()
+
+    def test_free_capacity_passes(self) -> None:
+        assert diagnose(Probe(url="http://s/slots", status=200, body=[])).outcome is Outcome.OK
+
+
+class TestInferenceProbe:
+    """The final question: not 'is it listed' but 'does it answer'."""
+
+    def test_a_completion_response_is_accepted(self) -> None:
+        body = {"choices": [{"message": {"content": "ok"}}]}
+        assert check_inference(Probe(url="http://s/v1/chat/completions", status=200, body=body))
+
+    def test_an_empty_choices_list_is_a_failure(self) -> None:
+        """A 200 with nothing in it is not a working model."""
+        f = check_inference(
+            Probe(url="http://s/v1/chat/completions", status=200, body={"choices": []})
+        )
+        assert not f
+
+    def test_a_non_json_200_is_a_failure(self) -> None:
+        """A proxy returning an HTML page still answers 200."""
+        f = check_inference(Probe(url="http://s/v1/chat/completions", status=200, body="<html>"))
+        assert not f
+        assert f.outcome is Outcome.BAD_ENDPOINT
+
+    def test_an_error_status_is_diagnosed_normally(self) -> None:
+        f = check_inference(Probe(url="http://s/v1/chat/completions", status=401))
+        assert f.outcome is Outcome.UNAUTHORISED
+
+    def test_a_template_failure_surfaces_as_a_server_error(self) -> None:
+        """A chat template that cannot handle the request throws, and llama.cpp
+        returns 500 rather than 400."""
+        f = check_inference(Probe(url="http://s/v1/chat/completions", status=500))
+        assert f.outcome is Outcome.SERVER_ERROR

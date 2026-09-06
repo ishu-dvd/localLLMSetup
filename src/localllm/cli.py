@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .budget import Fit, Hardware, Plan, recommend, solve
 from .catalogue import CATALOGUE, model_from_gguf
-from .client import check_model_visibility, diagnose, probe
+from .client import Outcome, check_inference, check_model_visibility, diagnose, probe
 from .detect import detect
 from .gguf import GgufError, read_gguf_file, read_gguf_url
 from .join import SUPPORTED, build_client_config
@@ -339,6 +339,40 @@ def cmd_check(args: argparse.Namespace) -> int:
             print(f"         -> {finding.fix}")
             worst = 1
 
+    if worst == 0:
+        # Capacity is informational: a request beyond -np queues rather than
+        # failing, so a busy server is not a broken one - but the resulting
+        # latency is otherwise unexplained.
+        capacity = diagnose(probe(f"{base}/slots?fail_on_no_slot=1", api_key=args.api_key))
+        if capacity.outcome is Outcome.NO_CAPACITY:
+            print("  [busy] every slot is currently in use")
+            print(f"         {capacity.fix}")
+        elif capacity.outcome is Outcome.NOT_ENABLED:
+            print("  [--  ] capacity unknown (/slots is disabled on this server)")
+        else:
+            print("  [ok  ] a slot is free")
+
+    if worst == 0 and not args.no_inference:
+        # The only check that exercises the path a coding agent actually uses.
+        result = probe(
+            f"{base}/v1/chat/completions",
+            api_key=args.api_key,
+            json_body={
+                "model": args.model,
+                "messages": [{"role": "user", "content": "Reply with the word ok."}],
+                "max_tokens": 8,
+                "stream": False,
+            },
+            timeout=args.inference_timeout,
+        )
+        finding = check_inference(result)
+        mark = "ok  " if finding else "FAIL"
+        print(f"  [{mark}] the server generates a completion")
+        print(f"         {finding.detail}")
+        if not finding:
+            print(f"         -> {finding.fix}")
+            worst = 1
+
     print("\nAll checks passed." if worst == 0 else "\nSee the suggested fix above.")
     return worst
 
@@ -559,6 +593,17 @@ def main(argv: list[str] | None = None) -> int:
         "--model",
         default="claude-local-coder",
         help="the model id the client is configured for",
+    )
+    check.add_argument(
+        "--no-inference",
+        action="store_true",
+        help="skip the generation check (which occupies a slot briefly)",
+    )
+    check.add_argument(
+        "--inference-timeout",
+        type=float,
+        default=60.0,
+        help="seconds to wait for the generation check; a cold model is slow",
     )
     check.set_defaults(func=cmd_check)
 

@@ -70,9 +70,11 @@ class Outcome(Enum):
     OK = "OK"
     UNREACHABLE = "UNREACHABLE"
     LOADING = "LOADING"
+    NO_CAPACITY = "NO_CAPACITY"
     UNAUTHORISED = "UNAUTHORISED"
     BAD_ENDPOINT = "BAD_ENDPOINT"
     NOT_ENABLED = "NOT_ENABLED"
+    CONTEXT_EXCEEDED = "CONTEXT_EXCEEDED"
     SERVER_ERROR = "SERVER_ERROR"
     MODEL_NOT_FOUND = "MODEL_NOT_FOUND"
     ALIAS_NOT_CLAUDE_COMPATIBLE = "ALIAS_NOT_CLAUDE_COMPATIBLE"
@@ -100,9 +102,26 @@ class Finding:
         return self.outcome is Outcome.OK
 
 
+def _error_field(body: Any, key: str) -> Any:
+    """Read a field from llama.cpp's error envelope: ``{"error": {...}}``."""
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+        return body["error"].get(key)
+    return None
+
+
 def _looks_like_loading(body: Any) -> bool:
     """llama.cpp answers /health with 503 while the model loads."""
     return "loading model" in json.dumps(body).lower() if body is not None else False
+
+
+def _looks_like_no_capacity(body: Any) -> bool:
+    """`/slots?fail_on_no_slot=1` answers 503 when every slot is in use.
+
+    Shares a status code with the loading gate, so the body is the only thing
+    that separates them — and confusing the two tells a user to wait for a load
+    that finished long ago.
+    """
+    return "no slot available" in json.dumps(body).lower() if body is not None else False
 
 
 def diagnose(probe: Probe) -> Finding:
@@ -117,12 +136,33 @@ def diagnose(probe: Probe) -> Finding:
     if 200 <= status < 300:
         return Finding(Outcome.OK, f"{probe.url} responded {status}")
 
+    if status == 503 and _looks_like_no_capacity(probe.body):
+        return Finding(
+            Outcome.NO_CAPACITY,
+            f"every slot on {probe.url} is busy right now",
+            "not a fault - a request beyond -np is queued, not rejected, so the "
+            "only symptom is latency. Raise -np if laptops routinely wait, "
+            "remembering each slot permanently reserves its share of the KV cache",
+        )
+
     if status == 503 and _looks_like_loading(probe.body):
         return Finding(
             Outcome.LOADING,
             f"{probe.url} is up but still loading the model",
             "wait - a 12 GB model takes a minute or two from cold, and longer "
             "if the file is not in the page cache yet",
+        )
+
+    if status == 400 and _error_field(probe.body, "type") == "exceed_context_size_error":
+        sent = _error_field(probe.body, "n_prompt_tokens")
+        limit = _error_field(probe.body, "n_ctx")
+        return Finding(
+            Outcome.CONTEXT_EXCEEDED,
+            f"the prompt was {sent:,} tokens but this slot holds {limit:,}"
+            if isinstance(sent, int) and isinstance(limit, int)
+            else f"{probe.url} rejected the prompt as longer than the context",
+            "raise -c on the server, remembering it is the TOTAL pool divided "
+            "across slots: 32K each across 3 slots needs -c 98304, not -c 32768",
         )
 
     if status in (401, 403):
@@ -255,14 +295,59 @@ def check_model_visibility(listing: Any, wanted: str | None) -> Finding:
     return Finding(Outcome.OK, f"the server offers '{checked}'")
 
 
+def check_inference(result: Probe) -> Finding:
+    """Did the server actually generate something?
+
+    A listed model proves llama-server started. It does not prove a request will
+    succeed — the chat template can throw, the prompt can exceed the slot, or a
+    proxy can return a cheerful 200 containing an HTML error page. This is the
+    only check that exercises the path a coding agent actually uses.
+    """
+    finding = diagnose(result)
+    if not finding:
+        return finding
+
+    body = result.body
+    if not isinstance(body, dict):
+        return Finding(
+            Outcome.BAD_ENDPOINT,
+            "the server answered 200 but not with JSON - something other than "
+            "llama-server may be replying, such as a proxy error page",
+            "check the base URL points at llama-server itself",
+        )
+
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return Finding(
+            Outcome.SERVER_ERROR,
+            "the server answered 200 but generated no completion",
+            "check the server log - the model is loaded but produced nothing, "
+            "which usually means the chat template rejected the request",
+        )
+
+    return Finding(Outcome.OK, "the server generated a completion")
+
+
 # --- IO --------------------------------------------------------------------
 # Everything above is pure. This is the only part that touches the network, and
 # it does nothing except turn an attempt into a Probe.
 
 
-def probe(url: str, api_key: str | None = None, timeout: float = DEFAULT_TIMEOUT_S) -> Probe:
-    """Make one request and record what happened. Never raises for HTTP status."""
-    request = urllib.request.Request(url, method="GET")
+def probe(
+    url: str,
+    api_key: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT_S,
+    json_body: dict[str, Any] | None = None,
+) -> Probe:
+    """Make one request and record what happened. Never raises for HTTP status.
+
+    Passing `json_body` makes it a POST, which is how the inference check
+    exercises the same endpoint a coding agent actually uses.
+    """
+    data = json.dumps(json_body).encode("utf-8") if json_body is not None else None
+    request = urllib.request.Request(url, data=data, method="POST" if data else "GET")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
     if api_key:
         # llama.cpp reads Authorization first and falls back to X-Api-Key only
         # when Authorization is EMPTY (server-http.cpp, middleware_validate_api_key).
