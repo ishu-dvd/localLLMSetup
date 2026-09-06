@@ -23,7 +23,9 @@ import pytest
 from localllm.budget import Hardware, Plan, solve
 from localllm.catalogue import GPT_OSS_20B
 from localllm.verify import (
+    TOLERANCE_GB,
     UNDER_PREDICT_FAIL_GB,
+    UNDER_PREDICT_FAIL_RATIO,
     Observed,
     Severity,
     compare,
@@ -271,3 +273,61 @@ class TestRelativeThreshold:
         """Doubling something worth 0.05 GB is not worth failing a run over."""
         c = compare(verdict_for(), observed(compute_gb=None, kv_gb=0.43, vram_model_gb=6.10))
         assert c.severity is Severity.OK
+
+
+class TestSeverityPrecedence:
+    def test_a_failure_outranks_a_warning(self) -> None:
+        """A report containing both must read FAIL, or a script that checks the
+        top-line severity proceeds past a broken run."""
+        c = compare(verdict_for(), observed(vram_model_gb=6.98, ram_model_gb=4.50))
+        assert any(f.severity is Severity.FAIL for f in c.findings)
+        assert any(f.severity is Severity.WARN for f in c.findings)
+        assert c.severity is Severity.FAIL
+        assert not c
+
+
+class TestNoiseFloor:
+    """Without an absolute floor, the ratio rule fires on rounding.
+
+    KV is small enough that a 0.22 GB difference - well inside the noise from
+    MiB rounding and unmodelled scratch - is a 1.5x ratio. The floor is what
+    stops every run failing on arithmetic dust.
+    """
+
+    def test_a_small_absolute_difference_is_ignored_despite_a_large_ratio(self) -> None:
+        c = compare(verdict_for(), observed(kv_gb=0.65))
+        assert (0.65 / 0.43) > UNDER_PREDICT_FAIL_RATIO, "the ratio rule alone would fire"
+        assert abs(0.65 - 0.43) < TOLERANCE_GB, "but it is inside the noise floor"
+        assert c.severity is Severity.OK
+
+
+class TestComputeBufferSeverity:
+    def test_a_larger_compute_buffer_than_assumed_fails(self) -> None:
+        """Under-reserving VRAM is the direction that ends in a failed load."""
+        c = compare(verdict_for(), observed(compute_gb=1.40))
+        assert c.severity is Severity.FAIL
+
+    def test_a_smaller_compute_buffer_only_warns(self) -> None:
+        c = compare(verdict_for(), observed(compute_gb=0.15))
+        assert c.severity is Severity.WARN
+        assert c
+
+
+class TestSlidingWindowKvIsUsed:
+    def test_ignoring_the_swa_cache_would_halve_the_observation(self) -> None:
+        """Reading only one of llama.cpp's two KV lines makes a correct
+        derivation look like a 2x overestimate."""
+        c = compare(verdict_for(), observed(kv_gb=0.22, kv_swa_gb=0.21))
+        assert c.observed.total_kv_gb == pytest.approx(0.43)
+        assert c.severity is Severity.OK
+
+
+class TestCalibrationValue:
+    def test_the_suggested_compute_buffer_is_the_measured_one(self) -> None:
+        c = compare(verdict_for(), observed(compute_gb=0.82))
+        assert c.calibration["COMPUTE_BUFFER_GB"] == pytest.approx(0.82)
+
+    def test_the_report_prints_it_ready_to_paste(self) -> None:
+        text = compare(verdict_for(), observed(compute_gb=0.82)).report()
+        assert "COMPUTE_BUFFER_GB = 0.82" in text
+
