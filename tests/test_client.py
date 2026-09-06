@@ -401,6 +401,17 @@ class TestInferenceProbe:
         )
         assert not f
 
+    def test_a_response_with_no_choices_key_is_a_failure(self) -> None:
+        """Distinct from an empty list, and a real shape rather than a contrived
+        one: `/v1/messages` answers with `content`, not `choices`. A base URL
+        pointing at the Anthropic endpoint returns a perfectly valid body that
+        this OpenAI-shaped check must still refuse to call a success.
+        """
+        body = {"content": [{"type": "text", "text": "ok"}], "role": "assistant"}
+        f = check_inference(Probe(url="http://s/v1/chat/completions", status=200, body=body))
+        assert not f
+        assert f.outcome is Outcome.SERVER_ERROR
+
     def test_a_non_json_200_is_a_failure(self) -> None:
         """A proxy returning an HTML page still answers 200."""
         f = check_inference(Probe(url="http://s/v1/chat/completions", status=200, body="<html>"))
