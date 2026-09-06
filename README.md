@@ -54,6 +54,15 @@ capable coding model, free, on hardware you already own.
 8 GB RX 6600M as ~4095 MB. Use the registry `HardwareInformation.qwMemorySize` (REG_QWORD)
 or DXGI instead. A silent 2× under-read corrupts every downstream sizing decision.
 
+**3. The speculative-decoding CLI was renamed wholesale in April 2026** (PR #22397).
+`--draft-max` and `--draft-min` don't warn — they call `arg_removed()` and abort
+startup. Every guide older than about May 2026 produces a server that won't launch.
+
+**4. `-fit` defaults to ON**, and silently rewrites unset arguments to fit VRAM — as far
+down as 4096 context. It will quietly discard a carefully computed plan and give you a
+much smaller context than you asked for, with nothing in the output to say so. This repo
+emits `-fit off`.
+
 ---
 
 ## Does this repo need to exist?
@@ -86,7 +95,7 @@ llama.cpp, llama-swap and gguf-parser. Not a new inference stack.
 git clone https://github.com/ishu-dvd/localLLMSetup
 cd localLLMSetup
 $env:PYTHONPATH="src"
-python -m pytest tests          # 226 tests
+python -m pytest tests          # 337 tests
 ```
 
 **Point it at a real model file** and it reads the facts from the file rather than
@@ -103,6 +112,34 @@ note     : model facts read from gpt-oss-20b-MXFP4.gguf (dense split measured fr
 Layer count, KV heads, head dimension, sliding-window layout and the **exact
 expert-vs-dense split** all come from the GGUF header — the last of which is what
 decides `-ncmoe N`.
+
+**See what more context actually costs you.** The budget answers *"does it fit?"*.
+On a machine where the model doesn't fit in VRAM, the more useful question is
+*"what did fitting cost?"* — because every GB of KV cache is a GB not holding
+expert weights:
+
+```powershell
+python -m localllm.cli speed --vram 8 --ram 16
+```
+
+```
+  ctx/slot  -ncmoe  GB/tok VRAM  GB/tok RAM    est tok/s
+----------------------------------------------------------
+     4,096      14         2.45        0.74    19-40
+    16,384      14         2.45        0.74    19-40
+    32,768      15         2.40        0.80    19-39
+   131,072      18         2.24        0.96    17-35
+
+4,096 -> 131,072 context costs about 11% of decode speed.
+  That is cheap: this model's sliding-window attention keeps KV small, so context
+  barely displaces expert weights. Take the context.
+```
+
+That result contradicts the usual advice. On gpt-oss-20b, 32× the context moves
+`-ncmoe` only from 14 to 18, because half its layers use sliding-window attention
+and cost a fixed amount regardless of context length. It's a bandwidth-roofline
+estimate, not a benchmark — useful for comparing two configurations, not for
+predicting absolute speed.
 
 **See what your hardware can run** (auto-detects; refuses to invent numbers):
 
@@ -172,7 +209,7 @@ On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
 | 5 — client onboarding | ✅ done, 33 tests |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**226 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
+**337 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
 
 ---
 
