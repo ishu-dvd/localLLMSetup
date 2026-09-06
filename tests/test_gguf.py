@@ -13,10 +13,15 @@ import pytest
 
 from localllm.gguf import (
     GGUF_MAGIC,
+    HEADER_READ_BYTES,
+    PROGRESSIVE_READ_STEPS,
     T_ARRAY,
     T_STRING,
     T_UINT32,
     GgufError,
+    GgufTruncated,
+    hf_gguf_url,
+    parse_content_range,
     parse_gguf_header,
 )
 
@@ -422,3 +427,198 @@ def test_gguf_model_can_be_solved():
     assert v.kv_gb > 0
     assert v.n_cpu_moe > 0
     assert "-ncmoe" in v.llama_server_flags()
+
+
+# --- Truncation is recoverable, not fatal -----------------------------------
+# Learned from a real file: gpt-oss-20b's tokenizer vocabulary pushes the
+# metadata block past 8 MiB. A reader must be able to ask for more.
+
+
+def test_truncation_raises_a_distinguishable_error():
+    with pytest.raises(GgufTruncated):
+        parse_gguf_header(DENSE[:20])
+
+
+def test_truncated_is_still_a_gguf_error():
+    """Callers that only catch GgufError must keep working."""
+    assert issubclass(GgufTruncated, GgufError)
+
+
+def test_truncation_reports_how_far_it_got():
+    try:
+        parse_gguf_header(DENSE[:30])
+    except GgufTruncated as exc:
+        assert exc.offset > 0
+        assert "read more" in str(exc)
+
+
+def test_default_read_size_is_large_enough_for_a_real_vocabulary():
+    """Measured: 8 MiB fails on gpt-oss-20b, 24 MiB works. 4 MiB was the old
+    default and would have failed on the first real file."""
+    assert HEADER_READ_BYTES >= 24 * 1024 * 1024
+
+
+def test_progressive_steps_start_small_and_escalate():
+    assert PROGRESSIVE_READ_STEPS[0] <= 2 * 1024 * 1024
+    assert list(PROGRESSIVE_READ_STEPS) == sorted(PROGRESSIVE_READ_STEPS)
+    assert PROGRESSIVE_READ_STEPS[-1] >= HEADER_READ_BYTES
+
+
+# --- Architectures that hide their sliding-window pattern -------------------
+
+
+def test_gpt_oss_pattern_comes_from_the_architecture_table():
+    """The real gpt-oss GGUF publishes sliding_window=128 and NO pattern key.
+    Without the table we would assume 24 global layers and double the KV."""
+    raw = build_gguf(
+        "gpt-oss",
+        {
+            "gpt-oss.block_count": 24,
+            "gpt-oss.attention.head_count_kv": 8,
+            "gpt-oss.attention.key_length": 64,
+            "gpt-oss.attention.sliding_window": 128,
+        },
+    )
+    md = parse_gguf_header(raw)
+    assert md.full_attn_layers == 12
+    assert "architecture default" in md.full_attn_layers_source
+
+
+def test_explicit_pattern_beats_the_architecture_table():
+    raw = build_gguf(
+        "gpt-oss",
+        {
+            "gpt-oss.block_count": 24,
+            "gpt-oss.attention.head_count_kv": 8,
+            "gpt-oss.attention.key_length": 64,
+            "gpt-oss.attention.sliding_window": 128,
+            "gpt-oss.attention.sliding_window_pattern": 4,
+        },
+    )
+    md = parse_gguf_header(raw)
+    assert md.full_attn_layers == 6
+    assert md.full_attn_layers_source == "sliding_window_pattern"
+
+
+def test_unknown_architecture_with_a_window_stays_conservative():
+    raw = build_gguf(
+        "mysteryarch",
+        {
+            "mysteryarch.block_count": 32,
+            "mysteryarch.attention.head_count_kv": 8,
+            "mysteryarch.attention.key_length": 128,
+            "mysteryarch.attention.sliding_window": 512,
+        },
+    )
+    md = parse_gguf_header(raw)
+    assert md.full_attn_layers == 32
+    assert "conservative" in md.full_attn_layers_source
+
+
+def test_source_is_reported_so_a_heuristic_is_never_mistaken_for_fact():
+    assert parse_gguf_header(HYBRID).full_attn_layers_source == "per-layer KV head array"
+    assert "conservative" in parse_gguf_header(DENSE).full_attn_layers_source
+
+
+# --- Remote reading helpers -------------------------------------------------
+
+
+def test_parses_content_range_total():
+    assert parse_content_range("bytes 0-1048575/12109566624") == 12_109_566_624
+
+
+def test_content_range_without_total_is_none():
+    assert parse_content_range("bytes 0-100/*") is None
+    assert parse_content_range("") is None
+
+
+def test_hf_spec_becomes_a_resolve_url():
+    assert hf_gguf_url("ggml-org/gpt-oss-20b-GGUF/gpt-oss-20b-MXFP4.gguf") == (
+        "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-MXFP4.gguf"
+    )
+
+
+def test_hf_prefix_is_optional():
+    assert hf_gguf_url("hf:a/b/c.gguf") == hf_gguf_url("a/b/c.gguf")
+
+
+def test_nested_filenames_are_preserved():
+    assert hf_gguf_url("a/b/sub/dir/c.gguf").endswith("resolve/main/sub/dir/c.gguf")
+
+
+def test_full_urls_pass_through_untouched():
+    url = "https://example.com/model.gguf"
+    assert hf_gguf_url(url) == url
+
+
+def test_malformed_spec_is_rejected():
+    with pytest.raises(ValueError, match="owner/repo"):
+        hf_gguf_url("just-a-name")
+
+
+# --- Presentation details ---------------------------------------------------
+
+
+def test_file_type_renders_as_a_name_not_an_integer():
+    """general.file_type is an int; 38 means MXFP4, which nobody can read."""
+    from localllm.catalogue import model_from_gguf
+
+    raw = build_gguf(
+        "gpt-oss",
+        {
+            "gpt-oss.block_count": 24,
+            "gpt-oss.attention.head_count_kv": 8,
+            "gpt-oss.attention.key_length": 64,
+            "general.file_type": 38,
+        },
+    )
+    m = model_from_gguf(parse_gguf_header(raw, file_size_bytes=12_109_566_624))
+    assert m.quant == "MXFP4"
+
+
+def test_unknown_file_type_falls_back_to_gguf():
+    from localllm.catalogue import model_from_gguf
+
+    raw = build_gguf(
+        "x",
+        {
+            "x.block_count": 4,
+            "x.attention.head_count_kv": 8,
+            "x.attention.key_length": 128,
+            "general.file_type": 999,
+        },
+    )
+    assert model_from_gguf(parse_gguf_header(raw, file_size_bytes=1000)).quant == "gguf"
+
+
+def test_source_path_is_used_verbatim_in_the_m_flag():
+    """A user who pointed at a real file should get that path back, not a placeholder."""
+    from localllm.budget import Hardware, Plan, solve
+    from localllm.catalogue import model_from_gguf
+
+    md = parse_gguf_header(SLIDING_MOE, file_size_bytes=12_110_000_000)
+    m = model_from_gguf(md, source_path=r"C:\models\real.gguf")
+    flags = solve(Hardware(8.0, 16.0), m, Plan(32_768, 1)).llama_server_flags()
+    assert r"-m C:\models\real.gguf" in flags
+
+
+def test_placeholder_path_used_when_source_is_unknown():
+    from localllm.budget import Hardware, Plan, solve
+    from localllm.catalogue import GPT_OSS_20B
+
+    flags = solve(Hardware(8.0, 16.0), GPT_OSS_20B, Plan(32_768, 1)).llama_server_flags()
+    assert "<path-to>" in flags
+
+
+def test_catalogue_gpt_oss_matches_the_real_file():
+    """Verified against ggml-org/gpt-oss-20b-GGUF (12,109,566,624 bytes, 459 tensors).
+    These are the values the real GGUF reports, not estimates."""
+    from localllm.catalogue import GPT_OSS_20B
+
+    assert GPT_OSS_20B.n_layers == 24
+    assert GPT_OSS_20B.n_kv_heads == 8
+    assert GPT_OSS_20B.head_dim == 64
+    assert GPT_OSS_20B.full_attn_layers == 12
+    assert GPT_OSS_20B.sliding_window == 128
+    assert GPT_OSS_20B.dense_gb == pytest.approx(1.918, abs=0.001)
+    assert GPT_OSS_20B.weights_gb == pytest.approx(12.11, abs=0.01)

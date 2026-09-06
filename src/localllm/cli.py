@@ -18,7 +18,7 @@ from pathlib import Path
 from .budget import Fit, Hardware, Plan, recommend, solve
 from .catalogue import CATALOGUE, model_from_gguf
 from .detect import detect
-from .gguf import GgufError, read_gguf_file
+from .gguf import GgufError, read_gguf_file, read_gguf_url
 from .join import SUPPORTED, build_client_config
 from .keys import DeviceExistsError, DeviceNotFoundError, KeyStore
 from .serve import (
@@ -104,16 +104,41 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _model_from_args(args: argparse.Namespace) -> tuple[object | None, list[str]]:
-    """Load a model from a real GGUF when one is given. Returns (model, notes)."""
-    path = getattr(args, "gguf", None)
-    if not path:
+    """Load a model from a real GGUF when one is given. Returns (model, notes).
+
+    Accepts a local path, a full URL, or a `owner/repo/file.gguf` Hugging Face
+    spec. The remote path reads only the header, so a 12 GB model can be sized
+    without downloading it.
+    """
+    spec = getattr(args, "gguf", None)
+    if not spec:
         return None, []
+
+    text = str(spec)
+    is_remote = text.startswith(("http://", "https://", "hf:")) or (
+        "/" in text and not Path(text).exists()
+    )
+
     try:
-        md = read_gguf_file(str(path))
-        model = model_from_gguf(md, name=Path(path).stem, quant=md.kv.get("general.file_type", ""))
+        if is_remote:
+            md = read_gguf_url(text)
+            source = text
+            local_path = None
+        else:
+            md = read_gguf_file(text)
+            source = Path(text).name
+            local_path = str(Path(text).resolve())
+        model = model_from_gguf(md, name=Path(text).stem, source_path=local_path)
     except (GgufError, ValueError, OSError) as exc:
-        return None, [f"could not read {path}: {exc}"]
-    return model, [f"model facts read from {Path(path).name} ({model.notes})"]
+        return None, [f"could not read {spec}: {exc}"]
+
+    notes = [
+        f"model facts read from {source}",
+        f"  weights {md.weights_gb:.2f} GB, {md.n_layers} layers, "
+        f"{md.full_attn_layers} global-attention ({md.full_attn_layers_source})",
+        f"  {model.notes}",
+    ]
+    return model, notes
 
 
 def cmd_plan(args: argparse.Namespace) -> int:
@@ -319,10 +344,11 @@ def _add_plan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--cram", type=int, default=None, help="prompt cache RAM in MiB")
     p.add_argument(
         "--gguf",
-        type=Path,
+        type=str,
         default=None,
-        help="path to a real .gguf - reads layers, KV heads, head dim and the "
-        "exact expert/dense split from the file instead of the catalogue",
+        help="a .gguf path, URL, or owner/repo/file.gguf spec - reads layers, KV "
+        "heads, head dim and the exact expert/dense split from the file itself. "
+        "Remote specs read only the header, so a 12GB model is sized without downloading it.",
     )
     p.add_argument(
         "--llama-server",

@@ -16,11 +16,37 @@ All values are little-endian.
 
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO
 
 GGUF_MAGIC = b"GGUF"
+
+HEADER_READ_BYTES = 32 * 1024 * 1024
+"""Bytes to read before parsing.
+
+Deliberately large: the metadata block contains the tokenizer vocabulary, which
+for a 200k-token model runs to tens of megabytes. Measured against the real
+`ggml-org/gpt-oss-20b-GGUF`: 8 MiB is **not** enough, 24 MiB is. An earlier 4 MiB
+default failed on the first real file it ever saw.
+"""
+
+PROGRESSIVE_READ_STEPS = (2 * 1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024, 96 * 1024 * 1024)
+"""Escalating read sizes, so a remote fetch usually costs 2 MiB, not 32."""
+
+SLIDING_WINDOW_PATTERN_BY_ARCH = {
+    # Some architectures alternate global and sliding-window attention but do
+    # NOT record the pattern in GGUF metadata - only the window size. Without
+    # this table the parser assumes every layer is global, which overstates KV
+    # by the pattern factor (2x for gpt-oss). Verified against the real
+    # gpt-oss-20b GGUF, which publishes attention.sliding_window=128 and no
+    # pattern key at all.
+    "gpt-oss": 2,  # alternating: 12 of 24 layers are global
+    "gemma3": 6,  # 5 sliding layers per global one
+    "gemma3n": 6,
+}
+
 
 # Value type tags from the GGUF spec.
 (
@@ -53,12 +79,24 @@ _SCALAR = {
     T_FLOAT64: ("<d", 8),
 }
 
-HEADER_READ_BYTES = 4 * 1024 * 1024
-"""How much of a GGUF to read to be confident of covering the metadata block."""
-
 
 class GgufError(ValueError):
     pass
+
+
+class GgufTruncated(GgufError):
+    """Ran out of bytes mid-parse.
+
+    Carried separately from other errors so a caller reading over HTTP can
+    respond by fetching more, rather than giving up on a perfectly good file.
+    """
+
+    def __init__(self, wanted: int, offset: int, available: int):
+        super().__init__(
+            f"truncated GGUF: wanted {wanted} bytes at offset {offset}, "
+            f"only {available} remain - read more of the file"
+        )
+        self.offset = offset
 
 
 class _Reader:
@@ -68,10 +106,7 @@ class _Reader:
 
     def take(self, n: int) -> bytes:
         if self.pos + n > len(self.data):
-            raise GgufError(
-                f"truncated GGUF: wanted {n} bytes at offset {self.pos}, "
-                f"only {len(self.data) - self.pos} remain"
-            )
+            raise GgufTruncated(n, self.pos, len(self.data) - self.pos)
         chunk = self.data[self.pos : self.pos + n]
         self.pos += n
         return chunk
@@ -155,10 +190,12 @@ class GgufMetadata:
     def full_attn_layers(self) -> int | None:
         """Layers whose KV cache grows with context length.
 
-        Three cases, in order of reliability:
+        Four cases, in order of reliability:
           1. per-layer KV-head array -> count the non-zero entries
-          2. a sliding-window pattern of N -> every Nth layer is global
-          3. neither -> assume every layer is global, which OVERSTATES KV.
+          2. an explicit sliding-window pattern of N -> every Nth layer is global
+          3. a known architecture that alternates but doesn't say so in metadata
+             -> use the table (see SLIDING_WINDOW_PATTERN_BY_ARCH)
+          4. nothing -> assume every layer is global, which OVERSTATES KV.
              That is the safe direction: it reserves too much, not too little.
         """
         v = self.head_count_kv
@@ -172,7 +209,26 @@ class GgufMetadata:
         pattern = self._arch("attention.sliding_window_pattern")
         if pattern and int(pattern) > 1:
             return max(1, layers // int(pattern))
+
+        # Some architectures alternate but publish only the window size.
+        if self.sliding_window:
+            known = SLIDING_WINDOW_PATTERN_BY_ARCH.get(self.architecture)
+            if known and known > 1:
+                return max(1, layers // known)
+
         return layers
+
+    @property
+    def full_attn_layers_source(self) -> str:
+        """How full_attn_layers was determined - so a heuristic is never mistaken
+        for something the file actually said."""
+        if isinstance(self.head_count_kv, list):
+            return "per-layer KV head array"
+        if self._arch("attention.sliding_window_pattern"):
+            return "sliding_window_pattern"
+        if self.sliding_window and SLIDING_WINDOW_PATTERN_BY_ARCH.get(self.architecture):
+            return f"architecture default for {self.architecture!r} (not in file)"
+        return "assumed all-global (conservative)"
 
     @property
     def head_dim(self) -> int | None:
@@ -333,3 +389,54 @@ def read_gguf_file(path: str, max_bytes: int = HEADER_READ_BYTES) -> GgufMetadat
 
 def read_gguf_stream(stream: BinaryIO, file_size_bytes: int | None = None) -> GgufMetadata:
     return parse_gguf_header(stream.read(HEADER_READ_BYTES), file_size_bytes=file_size_bytes)
+
+
+def parse_content_range(header: str) -> int | None:
+    """Total size from a `Content-Range: bytes 0-1048575/12109566624` header."""
+    m = re.search(r"/\s*(\d+)\s*$", header.strip())
+    return int(m.group(1)) if m else None
+
+
+def hf_gguf_url(spec: str) -> str:
+    """Turn `owner/repo/file.gguf` into a Hugging Face resolve URL.
+
+    Anything already looking like a URL is returned unchanged.
+    """
+    if spec.startswith(("http://", "https://")):
+        return spec
+    spec = spec.removeprefix("hf:")
+    parts = spec.split("/")
+    if len(parts) < 3:
+        raise ValueError(f"expected owner/repo/file.gguf, got {spec!r}")
+    owner, repo, filename = parts[0], parts[1], "/".join(parts[2:])
+    return f"https://huggingface.co/{owner}/{repo}/resolve/main/{filename}"
+
+
+def read_gguf_url(url: str, steps: tuple[int, ...] = PROGRESSIVE_READ_STEPS) -> GgufMetadata:
+    """Read just enough of a remote GGUF to size it, without downloading it.
+
+    Escalates through `steps` so the common case costs a couple of megabytes
+    rather than the tens of megabytes a large tokenizer vocabulary can occupy.
+    Answers "will this model fit?" before committing to a 12 GB download.
+    """
+    from urllib.request import Request, urlopen
+
+    url = hf_gguf_url(url)
+    last: GgufTruncated | None = None
+
+    for want in steps:
+        req = Request(url, headers={"Range": f"bytes=0-{want - 1}"})
+        with urlopen(req, timeout=60) as resp:  # noqa: S310 - https URL, user supplied
+            data = resp.read()
+            total = parse_content_range(resp.headers.get("Content-Range", "") or "")
+            if total is None:
+                length = resp.headers.get("Content-Length")
+                total = int(length) if length and length.isdigit() else None
+        try:
+            return parse_gguf_header(data, file_size_bytes=total)
+        except GgufTruncated as exc:
+            last = exc
+            if len(data) < want:
+                break  # server gave us everything it has; more will not help
+
+    raise last or GgufError(f"could not read a GGUF header from {url}")

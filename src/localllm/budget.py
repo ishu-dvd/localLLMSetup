@@ -167,8 +167,11 @@ class Verdict:
 
     def llama_server_flags(self) -> str:
         """The exact invocation. See docs/DECISIONS.md §7 for why each value."""
+        model_path = self.model.source_path or (
+            f"<path-to>/{self.model.name}-{self.model.quant}.gguf"
+        )
         parts = [
-            f"-m <path-to>/{self.model.name}-{self.model.quant}.gguf",
+            f"-m {model_path}",
             "-a claude-local-coder",  # clients filter IDs lacking "claude"
             "--host 0.0.0.0 --port 8080",
             "--device Vulkan0",

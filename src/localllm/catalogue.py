@@ -74,6 +74,8 @@ class Model:
 
     swe_bench_verified: float | None = None
     notes: str = ""
+    source_path: str | None = None
+    """Where this model actually lives, used verbatim in the -m flag."""
 
     @property
     def id(self) -> str:
@@ -132,7 +134,7 @@ GPT_OSS_20B = Model(
     weights_gb=12.11,
     kb_per_token_q8=12.0,
     n_layers=24,
-    dense_gb=1.8,
+    dense_gb=1.918,
     is_moe=True,
     n_kv_heads=8,
     head_dim=64,
@@ -142,7 +144,11 @@ GPT_OSS_20B = Model(
     active_params_b=3.6,
     native_quant=True,
     swe_bench_verified=60.4,
-    notes="MXFP4 is the native release format - zero quantisation loss.",
+    notes=(
+        "MXFP4 is the native release format - zero quantisation loss. "
+        "Architecture and dense_gb verified against the real GGUF "
+        "(ggml-org/gpt-oss-20b-GGUF, 12,109,566,624 bytes, 459 tensors)."
+    ),
 )
 
 KAT_CODER_Q2_K_L = Model(
@@ -275,7 +281,49 @@ CATALOGUE: dict[str, Model] = {
 }
 
 
-def model_from_gguf(md: Any, name: str | None = None, quant: str | None = None) -> Model:
+GGML_FILE_TYPES = {
+    0: "F32",
+    1: "F16",
+    2: "Q4_0",
+    3: "Q4_1",
+    7: "Q8_0",
+    8: "Q5_0",
+    9: "Q5_1",
+    10: "Q2_K",
+    11: "Q3_K_S",
+    12: "Q3_K_M",
+    13: "Q3_K_L",
+    14: "Q4_K_S",
+    15: "Q4_K_M",
+    16: "Q5_K_S",
+    17: "Q5_K_M",
+    18: "Q6_K",
+    19: "IQ2_XXS",
+    20: "IQ2_XS",
+    21: "Q2_K_S",
+    22: "IQ3_XS",
+    23: "IQ3_XXS",
+    24: "IQ1_S",
+    25: "IQ4_NL",
+    26: "IQ3_S",
+    27: "IQ3_M",
+    28: "IQ2_S",
+    29: "IQ2_M",
+    30: "IQ4_XS",
+    31: "IQ1_M",
+    32: "BF16",
+    38: "MXFP4",
+}
+"""ggml file-type tags, so `general.file_type` renders as a name rather than an
+integer nobody can read."""
+
+
+def model_from_gguf(
+    md: Any,
+    name: str | None = None,
+    quant: str | None = None,
+    source_path: str | None = None,
+) -> Model:
     """Build a Model from a real GGUF file's own metadata.
 
     Everything here is read from the file rather than hand-entered, which is the
@@ -300,7 +348,7 @@ def model_from_gguf(md: Any, name: str | None = None, quant: str | None = None) 
 
     return Model(
         name=name or md.architecture,
-        quant=quant or "gguf",
+        quant=quant or GGML_FILE_TYPES.get(md.kv.get("general.file_type"), "gguf"),
         weights_gb=md.weights_gb,
         kb_per_token_q8=0.0,  # unused: architecture is known, so KV is derived
         n_layers=md.n_layers,
@@ -311,6 +359,7 @@ def model_from_gguf(md: Any, name: str | None = None, quant: str | None = None) 
         full_attn_layers=md.full_attn_layers,
         sliding_layers=md.sliding_layers,
         sliding_window=md.sliding_window,
+        source_path=source_path,
         notes=(
             "read from GGUF; "
             + (
