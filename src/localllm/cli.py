@@ -17,6 +17,8 @@ from pathlib import Path
 
 from .budget import Fit, Hardware, Plan, recommend, solve
 from .catalogue import CATALOGUE, model_from_gguf
+from .client import Api, Outcome, check_inference, check_model_visibility, diagnose, probe
+from .constants import MODEL_ALIAS
 from .detect import detect
 from .gguf import GgufError, read_gguf_file, read_gguf_url
 from .join import SUPPORTED, build_client_config
@@ -25,7 +27,6 @@ from .serve import (
     preflight,
     probe_free_disk_gb,
     probe_llama_build,
-    probe_lock_pages_privilege,
     render_nssm_script,
     render_powercfg_script,
     render_watchdog_script,
@@ -294,6 +295,84 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0 if comparison else 1
 
 
+def cmd_check(args: argparse.Namespace) -> int:
+    """Answer, from a client laptop: *can I actually use this server?*
+
+    `join` writes a config and stops. Everything after that — reachability, the
+    key, whether the client will even list the model — the user discovers via
+    whatever their coding agent chooses to surface, which is usually nothing.
+    """
+    base = args.server.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    api = Api(args.api)
+
+    print(f"Checking {base} from this laptop, as a {api.value} client\n")
+    steps = [
+        ("reachable and healthy", f"{base}/health", False),
+        ("API key accepted", f"{base}/v1/models", True),
+    ]
+
+    worst = 0
+    listing = None
+    for label, url, needs_key in steps:
+        result = probe(url, api_key=args.api_key if needs_key else None)
+        finding = diagnose(result)
+        mark = "ok  " if finding else "FAIL"
+        print(f"  [{mark}] {label}")
+        if not finding:
+            print(f"         {finding.detail}")
+            if finding.fix:
+                print(f"         -> {finding.fix}")
+            worst = 1
+            # A later step cannot mean anything once an earlier one has failed:
+            # an unreachable server produces a misleading auth verdict.
+            break
+        if needs_key:
+            listing = result.body
+
+    if listing is not None:
+        finding = check_model_visibility(listing, wanted=args.model, api=api)
+        mark = "ok  " if finding else "FAIL"
+        print(f"  [{mark}] model is visible to the client")
+        print(f"         {finding.detail}")
+        if not finding:
+            print(f"         -> {finding.fix}")
+            worst = 1
+
+    if worst == 0:
+        # Capacity is informational: a request beyond -np queues rather than
+        # failing, so a busy server is not a broken one - but the resulting
+        # latency is otherwise unexplained.
+        capacity = diagnose(probe(f"{base}/slots?fail_on_no_slot=1", api_key=args.api_key))
+        if capacity.outcome is Outcome.NO_CAPACITY:
+            print("  [busy] every slot is currently in use")
+            print(f"         {capacity.fix}")
+        elif capacity.outcome is Outcome.NOT_ENABLED:
+            print("  [--  ] capacity unknown (/slots is disabled on this server)")
+        else:
+            print("  [ok  ] a slot is free")
+
+    if worst == 0 and not args.no_inference:
+        # The only check that exercises the path a coding agent actually uses.
+        result = probe(
+            f"{base}{api.completion_path}",
+            api_key=args.api_key,
+            json_body=api.probe_body(args.model),
+            timeout=args.inference_timeout,
+        )
+        finding = check_inference(result, api=api)
+        mark = "ok  " if finding else "FAIL"
+        print(f"  [{mark}] the server generates a completion")
+        print(f"         {finding.detail}")
+        if not finding:
+            print(f"         -> {finding.fix}")
+            worst = 1
+
+    print("\nAll checks passed." if worst == 0 else "\nSee the suggested fix above.")
+    return worst
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     """Preflight, then emit everything needed to run this 24/7."""
     hw, notes = _hardware_from(args)
@@ -322,7 +401,6 @@ def cmd_up(args: argparse.Namespace) -> int:
         verdict,
         llama_build=build,
         free_disk_gb=probe_free_disk_gb(args.out),
-        has_lock_pages=probe_lock_pages_privilege(),
         gpu_detected=gpu_ok,
     )
 
@@ -462,7 +540,14 @@ def _add_plan_args(p: argparse.ArgumentParser) -> None:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI without running anything.
+
+    Separate from `main` so the wiring can be inspected and tested on its own.
+    It was previously built inline, which meant every subcommand's arguments
+    could only be exercised by executing that subcommand — and a missing `--api`
+    argument once crashed a command while the whole unit suite stayed green.
+    """
     parser = argparse.ArgumentParser(
         prog="localllm",
         description="Run one coding model on one laptop; use it from the others.",
@@ -500,6 +585,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     verify.set_defaults(func=cmd_verify)
 
+    check = sub.add_parser(
+        "check",
+        help="from a client laptop: can this machine actually use the server?",
+    )
+    check.add_argument("--server", required=True, help="e.g. http://msi.tailnet:8080")
+    check.add_argument("--api-key", default=None, help="this device's key")
+    check.add_argument(
+        "--model",
+        default=MODEL_ALIAS,
+        help="the model id the client is configured for",
+    )
+    check.add_argument(
+        "--api",
+        choices=[a.value for a in Api],
+        default=Api.OPENAI.value,
+        help="which API the client speaks; openai is the recommended path",
+    )
+    check.add_argument(
+        "--no-inference",
+        action="store_true",
+        help="skip the generation check (which occupies a slot briefly)",
+    )
+    check.add_argument(
+        "--inference-timeout",
+        type=float,
+        default=60.0,
+        help="seconds to wait for the generation check; a cold model is slow",
+    )
+    check.set_defaults(func=cmd_check)
+
     up = sub.add_parser("up", help="preflight, then generate the 24/7 service definition")
     _add_plan_args(up)
     up.add_argument("--service-name", default="localllm")
@@ -525,13 +640,17 @@ def main(argv: list[str] | None = None) -> int:
     join.add_argument("--client", required=True, choices=list(SUPPORTED))
     join.add_argument("--device", required=True)
     join.add_argument("--url", required=True, help="e.g. http://msi.tailnet.ts.net:8080")
-    join.add_argument("--model", default="claude-local-coder")
+    join.add_argument("--model", default=MODEL_ALIAS)
     join.add_argument("--context", type=int, default=32768)
     join.add_argument("--out", type=Path, default=Path("."))
     join.add_argument("--store", type=Path, default=DEFAULT_STORE)
     join.set_defaults(func=cmd_join)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     return int(args.func(args))
 
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from localllm.keys import (
@@ -204,3 +206,44 @@ def test_caddyfile_handles_device_names_with_spaces(store):
     conf = store.render_caddyfile("ai.example.ts.net")
     assert "@Ishaan_MacBook" in conf
     assert 'X-Device "Ishaan MacBook"' in conf
+
+
+class TestApiKeyFileLineEndings:
+    """The allow-list must not depend on which platform wrote it.
+
+    llama.cpp reads it with `std::getline`, which splits on \n and does NOT
+    strip \r (common/arg.cpp, `--api-key-file`). It relies on C++ text-mode
+    translation to remove it, and that only happens when the file is read on the
+    same platform family that wrote it.
+
+    `Path.write_text` translates \n to os.linesep, so on Windows this file would
+    contain `key\r\n`. Used from a Linux host, a container or WSL, llama.cpp
+    would register `key\r` - matching no Authorization header any client sends.
+    Every request 401s, with nothing anywhere to explain it.
+    """
+
+    def _written(self, tmp_path: Path) -> bytes:
+        store = KeyStore(tmp_path / "keys.json")
+        store.add("laptop-a")
+        return store.write_api_key_file(tmp_path / "keys.txt").read_bytes()
+
+    def test_no_carriage_returns_are_written(self, tmp_path: Path) -> None:
+        assert b"\r" not in self._written(tmp_path)
+
+    def test_keys_round_trip_through_getline_semantics(self, tmp_path: Path) -> None:
+        """Simulate `std::getline` exactly: split on \n, strip nothing."""
+        store = KeyStore(tmp_path / "keys.json")
+        issued = store.add("laptop-a").key
+        raw = store.write_api_key_file(tmp_path / "keys.txt").read_bytes()
+
+        parsed = [
+            line for line in raw.decode("utf-8").split("\n") if line and not line.startswith("#")
+        ]
+        assert issued in parsed, "the key llama.cpp registers must equal the key issued"
+
+    def test_the_file_still_ends_with_a_newline(self, tmp_path: Path) -> None:
+        assert self._written(tmp_path).endswith(b"\n")
+
+    def test_comments_survive_for_attribution(self, tmp_path: Path) -> None:
+        text = self._written(tmp_path).decode("utf-8")
+        assert any(ln.startswith("#") and "laptop-a" in ln for ln in text.split("\n"))

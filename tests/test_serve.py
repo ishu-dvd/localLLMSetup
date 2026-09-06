@@ -9,13 +9,17 @@ from __future__ import annotations
 import pytest
 
 from localllm.budget import Fit, Hardware, Plan, solve
-from localllm.catalogue import GPT_OSS_20B, KAT_CODER_Q2_K_L, QWEN25_CODER_14B
+from localllm.catalogue import (
+    GPT_OSS_20B,
+    KAT_CODER_Q2_K_L,
+    QWEN25_CODER_7B,
+    QWEN25_CODER_14B,
+)
 from localllm.serve import (
     MIN_LLAMA_BUILD,
     Level,
     build_is_recent_enough,
     parse_llama_build,
-    parse_lock_pages_privilege,
     preflight,
     render_nssm_script,
     render_powercfg_script,
@@ -36,7 +40,6 @@ def run(verdict=GOOD, *, build=10819, disk=200.0, lock=True, gpu=True):
         verdict,
         llama_build=build,
         free_disk_gb=disk,
-        has_lock_pages=lock,
         gpu_detected=gpu,
     )
 
@@ -83,55 +86,6 @@ def test_stale_build_message_explains_the_cost():
     pf = run(build=9000)
     detail = next(c for c in pf.checks if c.name == "llama build")
     assert "prefill" in detail.remedy
-
-
-# --- Lock pages privilege ---------------------------------------------------
-
-
-SECEDIT = (
-    "[Privilege Rights]\n"
-    "SeLockMemoryPrivilege = *S-1-5-21-1,Administrator\n"
-    "SeServiceLogonRight = *S-1-5-80-0\n"
-)
-
-
-def test_privilege_detected_when_granted():
-    assert parse_lock_pages_privilege(SECEDIT, "Administrator")
-
-
-def test_privilege_absent_for_other_account():
-    assert not parse_lock_pages_privilege(SECEDIT, "guest")
-
-
-def test_privilege_absent_when_line_missing():
-    assert not parse_lock_pages_privilege("[Privilege Rights]\n", "Administrator")
-
-
-def test_missing_privilege_warns_when_weights_spill():
-    """mlock degrades silently without the privilege - must be visible."""
-    assert GOOD.weights_spilled_gb > 0
-    pf = run(lock=False)
-    assert level_of(pf, "lock pages") is Level.WARN
-    assert pf, "a missing privilege should warn, not block startup"
-
-
-def test_missing_privilege_remedy_is_actionable():
-    pf = run(lock=False)
-    remedy = next(c for c in pf.checks if c.name == "lock pages").remedy
-    assert "secpol.msc" in remedy
-
-
-def test_privilege_irrelevant_when_nothing_spills():
-    fully_in_vram = solve(MSI, GPT_OSS_20B, Plan(1024, 1, cram_mib=1024))
-    if fully_in_vram.weights_spilled_gb == 0:
-        pf = preflight(
-            fully_in_vram,
-            llama_build=10819,
-            free_disk_gb=200.0,
-            has_lock_pages=False,
-            gpu_detected=True,
-        )
-        assert level_of(pf, "lock pages") is Level.PASS
 
 
 # --- Budget -----------------------------------------------------------------
@@ -304,3 +258,82 @@ def test_watchdog_targets_the_given_metrics_url():
 def test_scripts_are_non_empty_and_commented(script):
     assert script.strip()
     assert script.lstrip().startswith("#")
+
+
+class TestPreflightMatchesTheFlagsWeActuallyEmit:
+    """The lock-pages check drifted away from the invocation it describes.
+
+    PR #2 changed the generated flags from `-lm mmap+mlock` to `-lm auto`,
+    because pinning 12.11 GB of weights into ~10.5 GB of usable RAM cannot
+    succeed. The preflight kept warning about mlock anyway - telling the user to
+    edit security policy and REBOOT to enable a mode this project deliberately
+    does not use.
+    """
+
+    def test_the_generated_flags_do_not_use_mlock(self) -> None:
+        assert "mlock" not in GOOD.llama_server_flags()
+
+    def test_no_check_recommends_granting_the_privilege(self) -> None:
+        for check in run(GOOD).checks:
+            assert "SeLockMemoryPrivilege not granted" not in check.detail
+            assert "secpol" not in check.remedy
+
+    def test_paging_risk_is_still_reported(self) -> None:
+        """Removing the mlock advice must not remove the underlying concern -
+        weights in system RAM can still be evicted."""
+        pf = run(GOOD)
+        residency = [c for c in pf.checks if c.name == "residency"]
+        assert residency, "the residency risk should still be stated somewhere"
+
+    def test_the_residency_note_names_the_real_mitigation(self) -> None:
+        """Which is the solver refusing over-committed plans, plus monitoring -
+        not a privilege grant."""
+        pf = run(GOOD)
+        text = " ".join(c.detail + c.remedy for c in pf.checks)
+        assert "Pages Input" in text or "refus" in text.lower()
+
+    def test_a_plan_with_no_spill_says_so(self) -> None:
+        """Nothing lives in system RAM, so there is nothing to evict."""
+        fits = solve(MSI, QWEN25_CODER_7B, Plan(8192, 1, cram_mib=1024))
+        assert fits.weights_spilled_gb == 0
+        pf = run(fits)
+        assert any("no weights spill" in c.detail for c in pf.checks)
+
+
+class TestResidencySeverity:
+    """A PASS when comfortable, a WARN only when the margin is thin.
+
+    Warning on every plan whose weights spill would warn about the normal case -
+    which is how a user learns to ignore warnings. The distinction only appears
+    with fixtures on both sides of it, and the first attempt at these tests
+    silently failed to land, so the mutants survived while the behaviour was
+    already correct.
+    """
+
+    def test_a_comfortable_plan_passes(self) -> None:
+        assert GOOD.status is Fit.FITS
+        assert GOOD.weights_spilled_gb > 0
+        assert level_of(run(), "residency") is Level.PASS
+
+    def test_a_tight_plan_warns(self) -> None:
+        assert TIGHT.status is Fit.TIGHT
+        assert level_of(run(TIGHT), "residency") is Level.WARN
+
+    def test_a_tight_plan_still_starts(self) -> None:
+        """Thin margin is a caution, not a refusal - the budget already decides
+        what is impossible."""
+        assert run(TIGHT)
+
+    def test_the_warning_says_what_to_do(self) -> None:
+        remedy = next(c for c in run(TIGHT).checks if c.name == "residency").remedy
+        assert "Pages Input" in remedy or "context" in remedy
+
+    def test_the_pass_carries_no_remedy(self) -> None:
+        """A remedy on a PASS is noise, and a pre-existing test asserts the
+        report never prints one."""
+        assert next(c for c in run().checks if c.name == "residency").remedy == ""
+
+    def test_neither_level_mentions_mlock(self) -> None:
+        for pf in (run(), run(TIGHT)):
+            text = " ".join(c.detail + c.remedy for c in pf.checks)
+            assert "mlock" not in text and "secpol" not in text
