@@ -17,6 +17,7 @@ from pathlib import Path
 
 from .budget import Fit, Hardware, Plan, recommend, solve
 from .catalogue import CATALOGUE, model_from_gguf
+from .client import check_model_visibility, diagnose, probe
 from .detect import detect
 from .gguf import GgufError, read_gguf_file, read_gguf_url
 from .join import SUPPORTED, build_client_config
@@ -294,6 +295,54 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0 if comparison else 1
 
 
+def cmd_check(args: argparse.Namespace) -> int:
+    """Answer, from a client laptop: *can I actually use this server?*
+
+    `join` writes a config and stops. Everything after that — reachability, the
+    key, whether the client will even list the model — the user discovers via
+    whatever their coding agent chooses to surface, which is usually nothing.
+    """
+    base = args.server.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+
+    print(f"Checking {base} from this laptop\n")
+    steps = [
+        ("reachable and healthy", f"{base}/health", False),
+        ("API key accepted", f"{base}/v1/models", True),
+    ]
+
+    worst = 0
+    listing = None
+    for label, url, needs_key in steps:
+        result = probe(url, api_key=args.api_key if needs_key else None)
+        finding = diagnose(result)
+        mark = "ok  " if finding else "FAIL"
+        print(f"  [{mark}] {label}")
+        if not finding:
+            print(f"         {finding.detail}")
+            if finding.fix:
+                print(f"         -> {finding.fix}")
+            worst = 1
+            # A later step cannot mean anything once an earlier one has failed:
+            # an unreachable server produces a misleading auth verdict.
+            break
+        if needs_key:
+            listing = result.body
+
+    if listing is not None:
+        finding = check_model_visibility(listing, wanted=args.model)
+        mark = "ok  " if finding else "FAIL"
+        print(f"  [{mark}] model is visible to the client")
+        print(f"         {finding.detail}")
+        if not finding:
+            print(f"         -> {finding.fix}")
+            worst = 1
+
+    print("\nAll checks passed." if worst == 0 else "\nSee the suggested fix above.")
+    return worst
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     """Preflight, then emit everything needed to run this 24/7."""
     hw, notes = _hardware_from(args)
@@ -499,6 +548,19 @@ def main(argv: list[str] | None = None) -> int:
         help="path to a saved llama-server startup log (redirect stderr to capture it)",
     )
     verify.set_defaults(func=cmd_verify)
+
+    check = sub.add_parser(
+        "check",
+        help="from a client laptop: can this machine actually use the server?",
+    )
+    check.add_argument("--server", required=True, help="e.g. http://msi.tailnet:8080")
+    check.add_argument("--api-key", default=None, help="this device's key")
+    check.add_argument(
+        "--model",
+        default="claude-local-coder",
+        help="the model id the client is configured for",
+    )
+    check.set_defaults(func=cmd_check)
 
     up = sub.add_parser("up", help="preflight, then generate the 24/7 service definition")
     _add_plan_args(up)

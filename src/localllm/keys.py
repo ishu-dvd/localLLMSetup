@@ -120,9 +120,24 @@ class KeyStore:
         return "\n".join(lines) + "\n"
 
     def write_api_key_file(self, path: Path | str) -> Path:
+        """Write the allow-list with **explicit LF endings**.
+
+        `Path.write_text` translates ``\\n`` to ``os.linesep``, so on Windows this
+        would emit ``key\\r\\n``. llama.cpp reads the file with ``std::getline``,
+        which splits on ``\\n`` and does **not** strip ``\\r`` — it relies entirely
+        on C++ text-mode translation to remove it, and that only happens when the
+        file is read on the same platform family that wrote it.
+
+        So a key file generated here and used anywhere else — a Linux host, a
+        container, WSL — would hand llama.cpp ``key\\r``, which matches no
+        ``Authorization`` header any client sends. Every request would 401 with
+        nothing anywhere to explain it. Writing LF explicitly removes the
+        platform dependency from a security-critical file for no cost.
+        """
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(self.render_api_key_file(), encoding="utf-8")
+        with p.open("w", encoding="utf-8", newline="\n") as fh:
+            fh.write(self.render_api_key_file())
         return p
 
     def render_caddyfile(self, hostname: str, upstream: str = "127.0.0.1:8080") -> str:
