@@ -31,6 +31,7 @@ from .serve import (
     render_watchdog_script,
 )
 from .speed import context_speed_curve
+from .verify import compare, read_server_log
 
 _MARK = {Fit.FITS: "OK  ", Fit.TIGHT: "TIGHT", Fit.REFUSE: "NO  "}
 DEFAULT_STORE = Path.home() / ".localllm" / "keys.json"
@@ -252,6 +253,47 @@ def cmd_speed(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Check what the solver predicted against what the server actually did.
+
+    This is the only command that can tell the user the plan was *wrong* — every
+    other one reasons from assumptions. Exit code is non-zero on a failure so it
+    can gate a script, which matters most for CPU fallback: the server starts,
+    answers correctly, and runs an order of magnitude slower.
+    """
+    hw, notes = _hardware_from(args)
+    gguf_model, gguf_notes = _model_from_args(args)
+    notes.extend(gguf_notes)
+    for n in notes:
+        print(f"note     : {n}")
+
+    plan = Plan(
+        context_per_slot=args.context,
+        n_slots=args.slots,
+        kv_quant=args.kv_quant,
+        cram_mib=args.cram,
+    )
+    verdict = solve(hw, gguf_model, plan) if gguf_model is not None else recommend(hw, plan)
+    if verdict is None:
+        print("No model in the catalogue fits this plan, so there is nothing to verify.")
+        return 1
+    if not verdict:
+        print(verdict.explain())
+        print("\nThe solver refused this plan, so there is nothing to verify against.")
+        return 1
+
+    try:
+        observed = read_server_log(args.log)
+    except OSError as exc:
+        print(f"could not read {args.log}: {exc}")
+        return 1
+
+    comparison = compare(verdict, observed)
+    print()
+    print(comparison.report())
+    return 0 if comparison else 1
+
+
 def cmd_up(args: argparse.Namespace) -> int:
     """Preflight, then emit everything needed to run this 24/7."""
     hw, notes = _hardware_from(args)
@@ -445,6 +487,18 @@ def main(argv: list[str] | None = None) -> int:
         help="context lengths to compare (default: 4K..128K)",
     )
     speed.set_defaults(func=cmd_speed)
+
+    verify = sub.add_parser(
+        "verify",
+        help="check a llama-server startup log against what the solver predicted",
+    )
+    _add_plan_args(verify)
+    verify.add_argument(
+        "--log",
+        required=True,
+        help="path to a saved llama-server startup log (redirect stderr to capture it)",
+    )
+    verify.set_defaults(func=cmd_verify)
 
     up = sub.add_parser("up", help="preflight, then generate the 24/7 service definition")
     _add_plan_args(up)

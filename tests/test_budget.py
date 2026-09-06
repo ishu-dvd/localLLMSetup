@@ -135,8 +135,13 @@ def test_dense_14b_refused_at_three_slots():
 
 
 def test_moe_accepted_where_dense_refused():
-    plan = Plan(32_768, 3)
-    assert solve(MSI_ALPHA, QWEN25_CODER_14B, plan).status is Fit.REFUSE
+    """A dense model must hold every weight; an MoE can spill experts to RAM.
+
+    At three slots both now refuse, so the comparison is made at one slot where
+    the structural difference is still what decides it.
+    """
+    plan = Plan(32_768, 1)
+    assert solve(MSI_ALPHA, QWEN3_CODER_30B_A3B, plan).status is Fit.REFUSE
     assert solve(MSI_ALPHA, GPT_OSS_20B, plan).status is not Fit.REFUSE
 
 
@@ -199,15 +204,35 @@ def test_gpt_oss_reaches_128k_on_a_single_client():
     assert r.status is not Fit.REFUSE
 
 
-def test_kat_coder_iq3_is_tight_not_comfortable_at_one_slot():
-    """~0.4 GB of margin on a 16 GB machine is not real margin."""
+def test_kat_coder_iq3_is_refused_at_one_slot():
+    """It used to be offered as TIGHT, on a compute-buffer figure that was half
+    the real one.
+
+    Re-anchoring that constant on a measured Vulkan log (2.07 GB at -ub 1024,
+    not 0.50) takes 1.5 GB out of the VRAM available for weights, and this plan
+    stops fitting. The tool removing a plan that would have paged is the tool
+    working — that is the entire reason `localllm verify` exists.
+    """
     r = solve(MSI_ALPHA, KAT_CODER_IQ3_XXS, Plan(32_768, 1, cram_mib=1024))
+    assert r.status is Fit.REFUSE
+    assert not r
+
+
+def test_kat_coder_q2_is_tight_at_one_slot():
+    """Also demoted by the corrected compute buffer: FITS -> TIGHT."""
+    r = solve(MSI_ALPHA, KAT_CODER_Q2_K_L, Plan(32_768, 1, cram_mib=1024))
     assert r.status is Fit.TIGHT
 
 
-def test_kat_coder_q2_fits_at_one_slot():
-    r = solve(MSI_ALPHA, KAT_CODER_Q2_K_L, Plan(32_768, 1, cram_mib=1024))
+def test_the_headline_recommendation_survives_the_correction():
+    """The check on over-conservatism.
+
+    Raising a reserve until nothing fits is not caution, it is a broken solver.
+    gpt-oss-20b MXFP4 at 32K on one client must still fit with real margin.
+    """
+    r = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
     assert r.status is Fit.FITS
+    assert r.headroom_gb > 1.0
 
 
 # --- Recommendations --------------------------------------------------------
