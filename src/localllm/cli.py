@@ -595,7 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--api-key", default=None, help="this device's key")
     check.add_argument(
         "--model",
-        default="claude-local-coder",
+        default=MODEL_ALIAS,
         help="the model id the client is configured for",
     )
     check.add_argument(

@@ -347,3 +347,56 @@ class TestEverySubcommandIsWired:
 
         args = build_parser().parse_args(argv)
         assert callable(args.func)
+
+
+class TestTheRealEntryPoint:
+    """`main()` with no argument is how the installed command actually runs.
+
+    Every other test passes an explicit list, so `argv or []` - the classic
+    falsy-empty-list footgun - would break every real invocation with
+    "required: command" while the whole suite stayed green.
+    """
+
+    def test_main_reads_sys_argv_when_given_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv", ["localllm", "plan", "--vram", "8", "--ram", "16", "--context", "8192"]
+        )
+        assert main() == 0
+        assert "FITS" in capsys.readouterr().out
+
+    def test_an_explicit_empty_list_is_not_the_same_as_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Passing [] must still be an error, even though sys.argv is valid -
+        which is exactly the distinction `argv or []` erases."""
+        monkeypatch.setattr("sys.argv", ["localllm", "plan", "--vram", "8", "--ram", "16"])
+        with pytest.raises(SystemExit) as exc:
+            main([])
+        assert exc.value.code != 0
+
+
+class TestNoDuplicatedAliasLiteral:
+    """A value-equality test cannot tell a reference from a copy.
+
+    `test_check_defaults_to_the_same_alias` passed while `check --model` still
+    held the literal string, because the literal happened to equal the constant
+    at that moment - which is precisely the drift the constant exists to
+    prevent. Only mutation testing caught it, so this pins the structural fact
+    instead of the value.
+    """
+
+    def test_the_alias_literal_appears_only_where_it_is_defined(self) -> None:
+        from pathlib import Path as P
+
+        src = P(__file__).resolve().parents[1] / "src" / "localllm"
+        offenders = [
+            f.name
+            for f in src.glob("*.py")
+            if f.name != "constants.py" and MODEL_ALIAS in f.read_text(encoding="utf-8")
+        ]
+        assert not offenders, (
+            f"{offenders} hold the alias literally instead of importing MODEL_ALIAS - "
+            "a copy cannot be kept in step with the definition"
+        )

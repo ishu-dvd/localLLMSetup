@@ -18,8 +18,8 @@ likely cause**, and saying which one saves an hour of guessing:
 
 That last one is the cruellest: everything connects, nothing errors, and the
 client silently shows an empty model list. Claude-compatible clients filter on
-the substring ``claude``, which is why the generated invocation passes
-``-a claude-local-coder``.
+the substring `claude`, which is why the generated invocation passes a
+`MODEL_ALIAS` containing it.
 
 Diagnosis is pure — a `Probe` describes what an attempt saw, and `diagnose`
 turns it into a finding. The HTTP itself lives in `probe()` at the bottom, so
@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from .constants import CLAUDE_ALIAS_SUBSTRING
+from .constants import CLAUDE_ALIAS_SUBSTRING, MODEL_ALIAS
 
 PUBLIC_ENDPOINTS = ("/health", "/v1/health", "/")
 """The only paths exempt from the API key check.
@@ -332,7 +332,7 @@ def check_model_visibility(listing: Any, wanted: str | None, api: Api = Api.OPEN
             f"'{CLAUDE_ALIAS_SUBSTRING}'",
             f"Claude-compatible clients filter the model list on "
             f"'{CLAUDE_ALIAS_SUBSTRING}' and will show an empty picker. Restart "
-            f"with -a claude-local-coder, or use an OpenAI-style client instead",
+            f"with -a {MODEL_ALIAS}, or use an OpenAI-style client instead",
         )
 
     return Finding(Outcome.OK, f"the server offers '{checked}'")
