@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 
 from localllm.client import (
+    PUBLIC_ENDPOINTS,
     Outcome,
     Probe,
     ProbeError,
@@ -224,3 +225,26 @@ class TestUnknownStatus:
     def test_a_probe_with_neither_status_nor_error_is_rejected(self) -> None:
         with pytest.raises(ValueError):
             diagnose(Probe(url="http://s/h"))
+
+
+class TestPublicEndpoints:
+    """Separating reachability from authentication depends on /health being
+    exempt from the API key check. Verified in server-http.cpp: the exempt set
+    holds exactly /health and /v1/health, plus the embedded UI assets.
+    """
+
+    def test_health_needs_no_key(self) -> None:
+        assert "/health" in PUBLIC_ENDPOINTS
+
+    def test_the_versioned_alias_is_also_public(self) -> None:
+        assert "/v1/health" in PUBLIC_ENDPOINTS
+
+    def test_the_model_list_is_not_public(self) -> None:
+        """If it were, the auth step would pass without ever testing the key."""
+        assert "/v1/models" not in PUBLIC_ENDPOINTS
+
+    def test_a_401_on_health_is_still_diagnosed_as_auth(self) -> None:
+        """It should not happen, but if a reverse proxy in front of llama-server
+        demands a key, saying so beats reporting a puzzling generic failure."""
+        d = diagnose(Probe(url="http://s/health", status=401))
+        assert d.outcome is Outcome.UNAUTHORISED

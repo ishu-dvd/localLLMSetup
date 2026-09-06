@@ -43,6 +43,15 @@ exists. An alias without it produces a client that connects perfectly and offers
 no models.
 """
 
+PUBLIC_ENDPOINTS = ("/health", "/v1/health")
+"""The only paths exempt from the API key check.
+
+Verified in `tools/server/server-http.cpp` (`get_public_endpoints`), which holds
+exactly these two plus the embedded UI assets. That is what lets reachability be
+tested separately from authentication: a `/health` probe needs no key, so a
+failure there is unambiguously the network rather than the credentials.
+"""
+
 DEFAULT_TIMEOUT_S = 10.0
 
 
