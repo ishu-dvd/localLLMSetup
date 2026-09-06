@@ -40,7 +40,7 @@ def _hardware_from(args: argparse.Namespace) -> tuple[Hardware, list[str]]:
     if args.vram is not None and args.ram is not None:
         return Hardware(vram_total_gb=args.vram, ram_total_gb=args.ram), notes
 
-    det = detect()
+    det = detect(getattr(args, "llama_server", None))
     notes.extend(det.warnings)
     probed = det.to_hardware()
     if probed is None:
@@ -52,6 +52,7 @@ def _hardware_from(args: argparse.Namespace) -> tuple[Hardware, list[str]]:
             ram_total_gb=args.ram or probed.ram_total_gb,
             os=probed.os,
             measured_ram_available_gb=probed.measured_ram_available_gb,
+            measured_vram_free_gb=probed.measured_vram_free_gb,
         ),
         notes,
     )
@@ -80,7 +81,7 @@ def _table(hw: Hardware, plan: Plan) -> str:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
-    det = detect()
+    det = detect(getattr(args, "llama_server", None))
     print(f"OS       : {det.os}")
     print(f"RAM      : {det.ram_gb:.1f} GB" if det.ram_gb else "RAM      : unknown")
     if not det.gpus:
@@ -162,7 +163,7 @@ def cmd_up(args: argparse.Namespace) -> int:
         print("No model fits this plan. Reduce --context or --slots.", file=sys.stderr)
         return 1
 
-    det = detect()
+    det = detect(getattr(args, "llama_server", None))
     gpu_ok = any(not g.is_virtual and g.vram_gb for g in det.gpus)
     build = probe_llama_build(args.llama_server) if args.llama_server else None
 
@@ -294,6 +295,12 @@ def _add_plan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--slots", type=int, default=1, help="number of client laptops")
     p.add_argument("--kv-quant", default="q8_0", choices=["f16", "q8_0", "q4_0"])
     p.add_argument("--cram", type=int, default=None, help="prompt cache RAM in MiB")
+    p.add_argument(
+        "--llama-server",
+        default=None,
+        help="path to llama-server.exe - lets us read VRAM from llama.cpp's own "
+        "device list, which is more accurate than anything the OS reports",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -313,7 +320,6 @@ def main(argv: list[str] | None = None) -> int:
 
     up = sub.add_parser("up", help="preflight, then generate the 24/7 service definition")
     _add_plan_args(up)
-    up.add_argument("--llama-server", default=None, help="path to llama-server.exe")
     up.add_argument("--service-name", default="localllm")
     up.add_argument("--out", type=Path, default=Path("./deploy"))
     up.set_defaults(func=cmd_up)

@@ -76,15 +76,19 @@ class Hardware:
     @property
     def vram_usable_gb(self) -> float:
         if self.measured_vram_free_gb is not None:
-            return max(0.0, self.measured_vram_free_gb)
+            # A measurement can never exceed the installed total.
+            return max(0.0, min(self.measured_vram_free_gb, self.vram_total_gb))
         return max(0.0, self.vram_total_gb - VRAM_DRIVER_RESERVE_GB)
 
     @property
     def ram_usable_gb(self) -> float:
         if self.measured_ram_available_gb is not None:
+            # Clamp to the stated total: an explicit --ram must not be silently
+            # overridden by a measurement taken from a different machine profile.
+            available = min(self.measured_ram_available_gb, self.ram_total_gb)
             # Leave a little room so the machine stays responsive rather than
             # consuming literally every free byte.
-            return max(0.0, self.measured_ram_available_gb - MEASURED_RAM_SAFETY_GB)
+            return max(0.0, available - MEASURED_RAM_SAFETY_GB)
         reserve = WINDOWS_IDLE_RAM_GB if self.os == "windows" else 2.0
         return max(0.0, self.ram_total_gb - reserve)
 
@@ -212,8 +216,12 @@ def solve(hw: Hardware, model: Model, plan: Plan) -> Verdict:
     reasons: list[str] = []
     warnings: list[str] = []
 
-    scale = KV_QUANT_SCALE.get(plan.kv_quant, 1.0)
-    kv_gb = model.kb_per_token_q8 * scale * plan.context_per_slot * plan.n_slots / 1_000_000
+    # Derived from architecture where known, so a new model cannot be added with a
+    # wrong hand-typed constant. Includes the q8_0 block-scale overhead, and the
+    # fixed (not per-token) cost of sliding-window layers.
+    per_token_bytes = model.kv_bytes_per_token(plan.kv_quant)
+    fixed_bytes = model.kv_fixed_bytes(plan.kv_quant)
+    kv_gb = (per_token_bytes * plan.context_per_slot + fixed_bytes) * plan.n_slots / 1_000_000_000
 
     if plan.kv_quant == "q4_0":
         warnings.append(

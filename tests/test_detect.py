@@ -15,6 +15,7 @@ from localllm.detect import (
     is_virtual_gpu,
     parse_cim_video,
     parse_linux_meminfo,
+    parse_llama_devices,
     parse_registry_vram,
 )
 
@@ -150,6 +151,69 @@ def test_registry_only_device_still_detected():
     det = build_detection(MSI_REGISTRY, "", MSI_RAM)
     assert det.primary_gpu is not None
     assert det.primary_gpu.name == "AMD Radeon RX 6600M"
+
+
+# --- llama.cpp device list: the authoritative VRAM source -------------------
+
+LLAMA_DEVICES = """Available devices:
+  Vulkan0: AMD Radeon RX 6600M (8176 MiB, 7959 MiB free)
+"""
+
+
+def test_parses_llama_device_list():
+    assert parse_llama_devices(LLAMA_DEVICES) == [
+        ("AMD Radeon RX 6600M", pytest.approx(8.573, abs=0.01), pytest.approx(8.345, abs=0.01))
+    ]
+
+
+def test_parses_multiple_devices():
+    text = LLAMA_DEVICES + "  Vulkan1: Intel UHD Graphics (2048 MiB, 2048 MiB free)\n"
+    assert len(parse_llama_devices(text)) == 2
+
+
+def test_ignores_non_device_lines():
+    assert parse_llama_devices("Available devices:\nsome noise\n") == []
+
+
+def test_llama_device_list_wins_over_registry():
+    """It is the view llama.cpp itself has, and it reports FREE VRAM."""
+    det = build_detection(MSI_REGISTRY, MSI_CIM, MSI_RAM, llama_devices_text=LLAMA_DEVICES)
+    gpu = det.primary_gpu
+    assert gpu is not None
+    assert "llama.cpp" in gpu.source
+    assert gpu.free_vram_gb is not None
+
+
+def test_free_vram_reaches_hardware_and_is_used():
+    det = build_detection(
+        MSI_REGISTRY,
+        MSI_CIM,
+        MSI_RAM,
+        available_ram_bytes=9_000_000_000,
+        llama_devices_text=LLAMA_DEVICES,
+    )
+    hw = det.to_hardware()
+    assert hw is not None
+    assert hw.measured_vram_free_gb is not None
+    # Uses the measured value, not total-minus-assumed-reserve.
+    assert hw.vram_usable_gb == pytest.approx(hw.measured_vram_free_gb)
+
+
+def test_busy_gpu_shrinks_the_vram_budget():
+    busy = "Available devices:\n  Vulkan0: AMD Radeon RX 6600M (8176 MiB, 3000 MiB free)\n"
+    idle_hw = build_detection(
+        MSI_REGISTRY, MSI_CIM, MSI_RAM, llama_devices_text=LLAMA_DEVICES
+    ).to_hardware()
+    busy_hw = build_detection(MSI_REGISTRY, MSI_CIM, MSI_RAM, llama_devices_text=busy).to_hardware()
+    assert idle_hw is not None and busy_hw is not None
+    assert busy_hw.vram_usable_gb < idle_hw.vram_usable_gb
+
+
+def test_falls_back_to_registry_when_llama_server_absent():
+    det = build_detection(MSI_REGISTRY, MSI_CIM, MSI_RAM, llama_devices_text="")
+    gpu = det.primary_gpu
+    assert gpu is not None
+    assert "registry" in gpu.source
 
 
 # --- Measured free RAM ------------------------------------------------------
