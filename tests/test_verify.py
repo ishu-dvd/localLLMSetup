@@ -17,10 +17,11 @@ harder than they pin any tolerance value.
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
-from localllm.budget import Hardware, Plan, solve
+from localllm.budget import Hardware, Plan, compute_buffer_gb, solve
 from localllm.catalogue import GPT_OSS_20B
 from localllm.verify import (
     TOLERANCE_GB,
@@ -35,17 +36,24 @@ from localllm.verify import (
 
 
 def observed(**kw: object) -> Observed:
-    """An observation that agrees with the solver, so tests perturb one field."""
+    """An observation that agrees with the solver, so tests perturb one field.
+
+    Derived from the verdict rather than hardcoded, so that changing a solver
+    constant does not silently turn every unrelated test into a memory-mismatch
+    failure — which is exactly what happened when the compute buffer was
+    re-anchored on a real measurement.
+    """
+    v = verdict_for()
     defaults: dict[str, object] = {
         "device": "AMD Radeon RX 6600M",
         "backend": "Vulkan",
-        "vram_model_gb": 5.98,
-        "ram_model_gb": 6.13,
-        "kv_gb": 0.43,
-        "compute_gb": 0.50,
+        "vram_model_gb": v.weights_in_vram_gb,
+        "ram_model_gb": v.weights_spilled_gb,
+        "kv_gb": v.kv_gb,
+        "compute_gb": compute_buffer_gb(),
         "layers_offloaded": 25,
         "layers_total": 25,
-        "expert_layers_on_cpu": 15,
+        "expert_layers_on_cpu": v.n_cpu_moe,
     }
     defaults.update(kw)
     return Observed(**defaults)  # type: ignore[arg-type]
@@ -92,12 +100,13 @@ class TestMemoryAsymmetry:
         assert c.severity is Severity.FAIL
 
     def test_using_much_less_vram_than_predicted_only_warns(self) -> None:
-        c = compare(verdict_for(), observed(vram_model_gb=4.50))
+        c = compare(verdict_for(), observed(vram_model_gb=verdict_for().weights_in_vram_gb - 1.5))
         assert c.severity is Severity.WARN
         assert c, "a conservative prediction still ran successfully"
 
     def test_small_differences_are_accepted(self) -> None:
-        c = compare(verdict_for(), observed(vram_model_gb=6.03, kv_gb=0.44))
+        v = verdict_for()
+        c = compare(v, observed(vram_model_gb=v.weights_in_vram_gb + 0.05, kv_gb=v.kv_gb + 0.01))
         assert c.severity is Severity.OK
 
     def test_kv_underestimate_fails(self) -> None:
@@ -114,12 +123,12 @@ class TestComputeBuffer:
     """The last magic constant. It is a flat 0.5 GB that ignores -ub entirely."""
 
     def test_a_much_larger_compute_buffer_is_reported(self) -> None:
-        c = compare(verdict_for(), observed(compute_gb=1.40))
+        c = compare(verdict_for(), observed(compute_gb=compute_buffer_gb() + 1.0))
         assert any("compute" in f.detail.lower() for f in c.findings)
 
     def test_the_finding_names_the_constant_to_change(self) -> None:
-        c = compare(verdict_for(), observed(compute_gb=1.40))
-        assert any("COMPUTE_BUFFER_GB" in f.detail for f in c.findings)
+        c = compare(verdict_for(), observed(compute_gb=compute_buffer_gb() + 1.0))
+        assert any("COMPUTE_BUFFER_MEASURED_GB" in f.detail for f in c.findings)
 
 
 class TestExpertOffload:
@@ -160,11 +169,13 @@ class TestCalibration:
     """The real payoff: turn a run into corrected constants."""
 
     def test_suggests_a_measured_compute_buffer(self) -> None:
-        c = compare(verdict_for(), observed(compute_gb=0.82))
-        assert c.calibration["COMPUTE_BUFFER_GB"] == pytest.approx(0.82)
+        c = compare(verdict_for(), observed(compute_gb=compute_buffer_gb() - 0.6))
+        assert c.calibration["COMPUTE_BUFFER_MEASURED_GB"] == pytest.approx(
+            (compute_buffer_gb() - 0.6) / 2, abs=0.01
+        )
 
     def test_no_suggestion_when_the_assumption_held(self) -> None:
-        assert "COMPUTE_BUFFER_GB" not in compare(verdict_for(), observed()).calibration
+        assert "COMPUTE_BUFFER_MEASURED_GB" not in compare(verdict_for(), observed()).calibration
 
     def test_calibration_covers_the_vram_reserve(self) -> None:
         """Total observed VRAM against the card's size gives the real reserve."""
@@ -273,7 +284,10 @@ class TestRelativeThreshold:
 
     def test_proportionally_large_but_absolutely_tiny_stays_quiet(self) -> None:
         """Doubling something worth 0.05 GB is not worth failing a run over."""
-        c = compare(verdict_for(), observed(compute_gb=None, kv_gb=0.43, vram_model_gb=6.10))
+        v = verdict_for()
+        c = compare(
+            v, observed(compute_gb=None, kv_gb=v.kv_gb, vram_model_gb=v.weights_in_vram_gb + 0.1)
+        )
         assert c.severity is Severity.OK
 
 
@@ -306,7 +320,7 @@ class TestNoiseFloor:
 class TestComputeBufferSeverity:
     def test_a_larger_compute_buffer_than_assumed_fails(self) -> None:
         """Under-reserving VRAM is the direction that ends in a failed load."""
-        c = compare(verdict_for(), observed(compute_gb=1.40))
+        c = compare(verdict_for(), observed(compute_gb=compute_buffer_gb() + 1.0))
         assert c.severity is Severity.FAIL
 
     def test_a_smaller_compute_buffer_only_warns(self) -> None:
@@ -326,12 +340,14 @@ class TestSlidingWindowKvIsUsed:
 
 class TestCalibrationValue:
     def test_the_suggested_compute_buffer_is_the_measured_one(self) -> None:
-        c = compare(verdict_for(), observed(compute_gb=0.82))
-        assert c.calibration["COMPUTE_BUFFER_GB"] == pytest.approx(0.82)
+        c = compare(verdict_for(), observed(compute_gb=compute_buffer_gb() - 0.6))
+        assert c.calibration["COMPUTE_BUFFER_MEASURED_GB"] == pytest.approx(
+            (compute_buffer_gb() - 0.6) / 2, abs=0.01
+        )
 
     def test_the_report_prints_it_ready_to_paste(self) -> None:
-        text = compare(verdict_for(), observed(compute_gb=0.82)).report()
-        assert "COMPUTE_BUFFER_GB = 0.82" in text
+        text = compare(verdict_for(), observed(compute_gb=compute_buffer_gb() - 0.6)).report()
+        assert "COMPUTE_BUFFER_MEASURED_GB" in text
 
 
 # --- Log parsing -----------------------------------------------------------
@@ -662,3 +678,199 @@ class TestMultipleBuffersPerBucket:
         assert o.compute_gb is None
         assert o.vram_model_gb is None and o.ram_model_gb is None
         assert o.total_vram_gb == 0.0
+
+
+# --- The real log ----------------------------------------------------------
+# A genuine llama-server startup from a Vulkan run of gpt-oss-20b with -ncmoe,
+# captured in docs/research/log-formats.md. Synthetic fixtures prove the parser
+# handles what I *expect* llama.cpp to print; only a real log proves it handles
+# what llama.cpp actually prints.
+
+REAL_LOG = Path(__file__).parent / "fixtures" / "gpt-oss-20b-vulkan-ncmoe.log"
+
+
+class TestAgainstARealLog:
+    def _observed(self) -> Observed:
+        return read_server_log(REAL_LOG)
+
+    def test_model_weights_split_matches_the_log(self) -> None:
+        o = self._observed()
+        assert o.vram_model_gb == pytest.approx(4699.90 * 1024 * 1024 / 1e9, abs=1e-6)
+        assert o.ram_model_gb == pytest.approx(7218.45 * 1024 * 1024 / 1e9, abs=1e-6)
+
+    def test_both_kv_caches_are_summed(self) -> None:
+        """96.00 MiB non-SWA + 15.00 MiB SWA. Taking either alone is wrong."""
+        o = self._observed()
+        assert o.total_kv_gb == pytest.approx(111.00 * 1024 * 1024 / 1e9, abs=1e-6)
+
+    def test_the_kv_summary_lines_are_not_added(self) -> None:
+        """This log contains `size = 96.00 MiB (...) K (f16): 48.00, V (f16): 48.00`
+        for each cache - the same bytes stated three more times. Counting them
+        would give 111 + 111 + 111."""
+        assert self._observed().total_kv_gb == pytest.approx(0.11639, abs=1e-4)
+
+    def test_vulkan_host_compute_buffer_is_excluded(self) -> None:
+        """The log has BOTH `Vulkan0 compute buffer size = 985.20 MiB` and
+        `Vulkan_Host compute buffer size = 58.33 MiB`. Only the first is VRAM."""
+        o = self._observed()
+        assert o.compute_gb == pytest.approx(985.20 * 1024 * 1024 / 1e9, abs=1e-6)
+
+    def test_the_output_buffer_is_excluded(self) -> None:
+        assert self._observed().compute_gb < 1.1
+
+    def test_partial_offload_is_read_correctly(self) -> None:
+        """24/25, not 25/25: the output layer stayed on the CPU."""
+        o = self._observed()
+        assert (o.layers_offloaded, o.layers_total) == (24, 25)
+
+    def test_the_gpu_is_recognised_as_in_use(self) -> None:
+        o = self._observed()
+        assert o.gpu_in_use is True
+        assert (o.device, o.backend) == ("Vulkan0", "Vulkan")
+
+    def test_the_older_kv_cache_prefix_still_parses(self) -> None:
+        """This log is from a build that printed `llama_kv_cache_unified:`;
+        current builds print `llama_kv_cache:`. Anchoring on the prefix rather
+        than the keyword would match nothing on one of them."""
+        assert "llama_kv_cache_unified:" in REAL_LOG.read_text(encoding="utf-8")
+        assert self._observed().total_kv_gb is not None
+
+    def test_ncmoe_leaves_no_trace_at_this_verbosity(self) -> None:
+        """The run used -ncmoe, yet the log has no override lines and the
+        offloaded counts are unchanged - so unknown, not zero."""
+        assert self._observed().expert_layers_on_cpu is None
+
+    def test_the_compute_buffer_is_twice_the_assumed_constant(self) -> None:
+        """The finding this fixture exists for.
+
+        `COMPUTE_BUFFER_GB` was 0.5. The real value here is 1.03 GB - and this
+        run used `n_ubatch = 512`, while the invocation this project generates
+        uses 1024, so the true figure for our configuration is larger still.
+        Under-reserving VRAM is the direction that ends in a failed load.
+        """
+        assert self._observed().compute_gb == pytest.approx(1.033, abs=0.01)
+
+
+class TestComputeBufferScalesWithUbatch:
+    """The compute buffer was a flat 0.5 GB that ignored -ub entirely.
+
+    A real Vulkan log of this exact model measured 985.20 MiB at n_ubatch=512 -
+    twice the assumed constant, in the direction that under-reserves VRAM. The
+    generated invocation uses -ub 1024, so the true figure is larger still.
+
+    Activation tensors are linear in n_ubatch and some of the graph is fixed, so
+    scaling linearly from the measured anchor is an over-estimate - which is the
+    safe direction for a VRAM reserve.
+    """
+
+    def test_the_anchor_reproduces_the_measurement(self) -> None:
+        assert compute_buffer_gb(512) == pytest.approx(1.033, abs=0.01)
+
+    def test_doubling_ubatch_doubles_the_buffer(self) -> None:
+        assert compute_buffer_gb(1024) == pytest.approx(2 * compute_buffer_gb(512), rel=0.01)
+
+    def test_a_smaller_ubatch_costs_less_vram(self) -> None:
+        assert compute_buffer_gb(256) < compute_buffer_gb(512)
+
+    def test_it_never_returns_zero(self) -> None:
+        """A tiny ubatch does not mean a free graph."""
+        assert compute_buffer_gb(1) > 0.0
+
+    def test_the_plan_carries_ubatch(self) -> None:
+        assert Plan(context_per_slot=8192).n_ubatch == 1024
+
+    def test_the_flags_use_the_plan_value(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        flags = solve(hw, GPT_OSS_20B, Plan(8192, n_ubatch=512)).llama_server_flags()
+        assert "-ub 512" in flags
+
+    def test_the_budget_and_the_flags_agree(self) -> None:
+        """They disagreed before: the flags hardcoded -ub 1024 while the budget
+        used a constant that knew nothing about it."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        small = solve(hw, GPT_OSS_20B, Plan(8192, n_ubatch=512))
+        large = solve(hw, GPT_OSS_20B, Plan(8192, n_ubatch=1024))
+        assert "-ub 512" in small.llama_server_flags()
+        assert "-ub 1024" in large.llama_server_flags()
+        assert large.weights_in_vram_gb < small.weights_in_vram_gb
+
+    def test_an_extreme_ubatch_is_refused(self) -> None:
+        """`-ub 2048` needs a 4.13 GB compute buffer, leaving almost nothing for
+        weights. Refusing is right: the alternative is spilling the whole model
+        to RAM and calling it a plan."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        assert not solve(hw, GPT_OSS_20B, Plan(8192, n_ubatch=2048))
+
+    def test_a_larger_ubatch_spills_more_weights(self) -> None:
+        """VRAM spent on the compute graph is VRAM not holding weights."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        small = solve(hw, GPT_OSS_20B, Plan(8192, n_ubatch=512))
+        large = solve(hw, GPT_OSS_20B, Plan(8192, n_ubatch=2048))
+        assert large.n_cpu_moe > small.n_cpu_moe
+
+    def test_the_default_plan_still_fits(self) -> None:
+        """Raising the constant must not make the headline configuration
+        impossible - if it did, the constant would be wrong, not the plan."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        assert solve(hw, GPT_OSS_20B, Plan(32768))
+
+
+class TestVerifyUsesTheSameComputeBuffer:
+    def test_the_real_log_now_agrees_with_the_prediction(self) -> None:
+        """The whole point: a measurement that refuted the constant should stop
+        being a finding once the constant is corrected."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        v = solve(hw, GPT_OSS_20B, Plan(4096, n_ubatch=512))
+        o = read_server_log(REAL_LOG)
+        assert not any("compute" in f.detail.lower() for f in compare(v, o).findings)
+
+
+class TestReserveCalibrationHonesty:
+    """The driver reserve cannot be derived from a run whose split was chosen.
+
+    `VRAM = total - observed` only measures the driver reserve if the run was
+    trying to fill VRAM. Under `-ncmoe` the operator picks the split, so unused
+    VRAM may simply be unused. Turning that into a reserve bakes one person's
+    conservative flag into everyone's budget.
+    """
+
+    def test_leftover_vram_is_not_silently_called_a_reserve(self) -> None:
+        v = verdict_for()
+        o = observed(vram_model_gb=v.weights_in_vram_gb - 1.5)
+        assert "VRAM_DRIVER_RESERVE_GB" not in compare(v, o).calibration
+
+    def test_the_leftover_is_reported_instead(self) -> None:
+        v = verdict_for()
+        c = compare(v, observed(vram_model_gb=v.weights_in_vram_gb - 1.5))
+        assert any("unused" in f.detail.lower() for f in c.findings)
+
+    def test_the_finding_offers_both_explanations(self) -> None:
+        """Either the reserve is bigger than assumed, or -ncmoe was set more
+        conservatively. The log cannot distinguish them, so say both."""
+        v = verdict_for()
+        c = compare(v, observed(vram_model_gb=v.weights_in_vram_gb - 1.5))
+        detail = " ".join(f.detail for f in c.findings)
+        assert "ncmoe" in detail.lower() and "reserve" in detail.lower()
+
+    def test_a_saturated_run_still_calibrates(self) -> None:
+        """When observed VRAM lands where the plan expected, the leftover really
+        is the reserve and is worth recording."""
+        v = verdict_for()
+        o = observed(vram_model_gb=v.weights_in_vram_gb, kv_gb=v.kv_gb)
+        c = compare(v, o)
+        assert "VRAM_DRIVER_RESERVE_GB" in c.calibration or c.severity is Severity.OK
+
+    def test_the_real_log_does_not_produce_a_reserve_number(self) -> None:
+        """End to end on the real fixture, which left 1.9 GB of VRAM unused."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        v = solve(hw, GPT_OSS_20B, Plan(4096, n_ubatch=512, kv_quant="f16"))
+        c = compare(v, read_server_log(REAL_LOG))
+        assert "VRAM_DRIVER_RESERVE_GB" not in c.calibration
+
+    def test_an_unobserved_component_does_not_look_like_unused_vram(self) -> None:
+        """If the compute buffer line is missing, the VRAM total is incomplete -
+        and the shortfall is something we failed to read, not spare capacity."""
+        v = verdict_for()
+        c = compare(v, observed(compute_gb=None))
+        assert not any("unused" in f.detail.lower() for f in c.findings)
+        assert "VRAM_DRIVER_RESERVE_GB" not in c.calibration

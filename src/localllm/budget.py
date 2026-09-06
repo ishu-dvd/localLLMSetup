@@ -33,8 +33,41 @@ VRAM_DRIVER_RESERVE_GB = 1.0
 WINDOWS_IDLE_RAM_GB = 5.5
 """Windows 11 at idle. 16 GB total yields ~10.5 GB usable."""
 
-COMPUTE_BUFFER_GB = 0.5
-"""llama.cpp scratch buffers on the GPU."""
+COMPUTE_BUFFER_MEASURED_GB = 1.033
+"""GPU compute buffer, **measured** at the ubatch below.
+
+985.20 MiB from a real Vulkan `llama-server` log of gpt-oss-20b with `-ncmoe`
+(see `tests/fixtures/gpt-oss-20b-vulkan-ncmoe.log`). This replaces a flat 0.5 GB
+assumption that was out by 2x in the direction that under-reserves VRAM — which
+is exactly the class of error `localllm verify` was built to catch, and the first
+real log it saw caught one.
+"""
+
+COMPUTE_BUFFER_MEASURED_UBATCH = 512
+"""The `n_ubatch` that measurement was taken at."""
+
+DEFAULT_UBATCH = 1024
+"""`-ub`. 512 can produce garbage output on Vulkan (llama.cpp bug #27237)."""
+
+
+def compute_buffer_gb(n_ubatch: int = DEFAULT_UBATCH) -> float:
+    """Scale the measured compute buffer to a given micro-batch size.
+
+    Activation tensors are linear in `n_ubatch` while part of the graph is fixed,
+    so scaling the whole thing linearly **over-estimates** — deliberately, since
+    a VRAM reserve that is too small fails the load and one that is too large
+    merely costs context.
+
+    One measurement, one architecture, one backend. It is a far better basis
+    than the flat constant it replaces, and still wants confirming on the target
+    machine.
+    """
+    scale = max(1, n_ubatch) / COMPUTE_BUFFER_MEASURED_UBATCH
+    return COMPUTE_BUFFER_MEASURED_GB * scale
+
+
+COMPUTE_BUFFER_GB = COMPUTE_BUFFER_MEASURED_GB
+"""Retained for the measured-anchor case; prefer `compute_buffer_gb(n_ubatch)`."""
 
 PROCESS_OVERHEAD_GB = 0.4
 """The llama-server process itself."""
@@ -128,6 +161,11 @@ class Plan:
     n_slots: int = 1
     kv_quant: str = "q8_0"
     cram_mib: int | None = None
+    n_ubatch: int = DEFAULT_UBATCH
+    """`-ub`. Sets both the flag and the compute-buffer reserve, which were
+    previously allowed to disagree: the flags hardcoded 1024 while the budget
+    used a flat constant that knew nothing about it."""
+
     speculation: str = "ngram"
     """Which speculative decoder to run. See docs/research/perf-flags.md.
 
@@ -250,7 +288,7 @@ class Verdict:
             "-t 8",
             "-fa on",
             f"-ctk {self.plan.kv_quant} -ctv {self.plan.kv_quant}",
-            "-b 4096 -ub 1024",  # avoids Vulkan garbage output, bug #27237
+            f"-b 4096 -ub {self.plan.n_ubatch}",  # 512 can emit garbage on Vulkan, bug #27237
             # NOT mmap+mlock: pinning 12.11 GB of weights into ~10.5 GB of
             # usable RAM cannot succeed. `auto` maps them and lets the OS manage.
             "-lm auto",
@@ -361,10 +399,11 @@ def solve(hw: Hardware, model: Model, plan: Plan) -> Verdict:
         )
 
     # KV and compute buffers live on the GPU; whatever VRAM is left holds weights.
-    vram_for_weights = hw.vram_usable_gb - kv_gb - COMPUTE_BUFFER_GB - spec_vram
+    compute_gb = compute_buffer_gb(plan.n_ubatch)
+    vram_for_weights = hw.vram_usable_gb - kv_gb - compute_gb - spec_vram
     if vram_for_weights <= 0:
         reasons.append(
-            f"KV cache alone ({kv_gb:.2f} GB) plus compute buffers exceed "
+            f"KV cache ({kv_gb:.2f} GB) plus the {compute_gb:.2f} GB compute buffer exceed "
             f"{hw.vram_usable_gb:.2f} GB of usable VRAM"
         )
         return _refuse(hw, model, plan, kv_gb, reasons, warnings)
@@ -415,7 +454,7 @@ def solve(hw: Hardware, model: Model, plan: Plan) -> Verdict:
         kv_gb=kv_gb,
         weights_in_vram_gb=weights_in_vram,
         weights_spilled_gb=weights_spilled,
-        vram_used_gb=weights_in_vram + kv_gb + COMPUTE_BUFFER_GB + spec_vram,
+        vram_used_gb=weights_in_vram + kv_gb + compute_gb + spec_vram,
         ram_used_gb=ram_used,
         headroom_gb=headroom,
         reasons=tuple(reasons),

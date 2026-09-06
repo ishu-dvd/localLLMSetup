@@ -33,7 +33,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from .budget import COMPUTE_BUFFER_GB, Verdict
+from .budget import (
+    COMPUTE_BUFFER_MEASURED_UBATCH,
+    VRAM_DRIVER_RESERVE_GB,
+    Verdict,
+    compute_buffer_gb,
+)
 
 TOLERANCE_GB = 0.25
 """Absolute slack before a difference is worth mentioning at all.
@@ -158,7 +163,7 @@ class Comparison:
             ("VRAM weights", v.weights_in_vram_gb, o.vram_model_gb),
             ("RAM weights", v.weights_spilled_gb, o.ram_model_gb),
             ("KV cache", v.kv_gb, o.total_kv_gb),
-            ("compute buffer", COMPUTE_BUFFER_GB, o.compute_gb),
+            ("compute buffer", compute_buffer_gb(self.verdict.plan.n_ubatch), o.compute_gb),
         ]
 
     def report(self) -> str:
@@ -407,19 +412,22 @@ def compare(verdict: Verdict, observed: Observed) -> Comparison:
     _compare_memory("RAM weights", verdict.weights_spilled_gb, observed.ram_model_gb, findings)
     _compare_memory("KV cache", verdict.kv_gb, observed.total_kv_gb, findings)
 
+    expected_compute = compute_buffer_gb(verdict.plan.n_ubatch)
     if (
         observed.compute_gb is not None
-        and abs(observed.compute_gb - COMPUTE_BUFFER_GB) > TOLERANCE_GB
+        and abs(observed.compute_gb - expected_compute) > TOLERANCE_GB
     ):
         findings.append(
             Finding(
-                Severity.WARN if observed.compute_gb < COMPUTE_BUFFER_GB else Severity.FAIL,
-                f"compute buffer is {observed.compute_gb:.2f} GB, not the assumed "
-                f"{COMPUTE_BUFFER_GB:.2f} - set COMPUTE_BUFFER_GB to the measured value "
-                f"(it scales with -ub, which the current flat constant ignores)",
+                Severity.WARN if observed.compute_gb < expected_compute else Severity.FAIL,
+                f"compute buffer is {observed.compute_gb:.2f} GB, not the expected "
+                f"{expected_compute:.2f} at -ub {verdict.plan.n_ubatch} - re-anchor "
+                f"COMPUTE_BUFFER_MEASURED_GB on this run",
             )
         )
-        calibration["COMPUTE_BUFFER_GB"] = observed.compute_gb
+        calibration["COMPUTE_BUFFER_MEASURED_GB"] = round(
+            observed.compute_gb * COMPUTE_BUFFER_MEASURED_UBATCH / max(1, verdict.plan.n_ubatch), 3
+        )
 
     if (
         observed.expert_layers_on_cpu is not None
@@ -446,16 +454,40 @@ def compare(verdict: Verdict, observed: Observed) -> Comparison:
             )
         )
 
-    # The reserve is the only way to learn what the driver and display actually
-    # hold back, and it is the assumption the whole VRAM budget rests on.
-    total_vram = observed.total_vram_gb
-    if total_vram > 0:
-        reserve = verdict.hardware.vram_total_gb - total_vram
-        if (
-            reserve >= 0
-            and abs(reserve - (verdict.hardware.vram_total_gb - verdict.vram_used_gb))
-            > TOLERANCE_GB
-        ):
+    # The driver reserve is the assumption the whole VRAM budget rests on, and
+    # `total - observed` is the only way to see it. Two conditions have to hold
+    # before that subtraction means anything.
+    #
+    # First, every VRAM component must have been observed — a missing compute
+    # buffer line makes the total look small and the leftover look like a
+    # reserve, when it is really just something we failed to read.
+    #
+    # Second, the run must have been trying to fill VRAM. Under `-ncmoe` the
+    # operator picks the split, so unused VRAM may simply be unused, and
+    # recording it as a reserve bakes one person's conservative flag into
+    # everyone's budget.
+    vram_fully_observed = (
+        observed.vram_model_gb is not None
+        and observed.total_kv_gb is not None
+        and observed.compute_gb is not None
+    )
+    if vram_fully_observed and observed.total_vram_gb > 0:
+        reserve = verdict.hardware.vram_total_gb - observed.total_vram_gb
+        expected_reserve = verdict.hardware.vram_total_gb - verdict.vram_used_gb
+        drift = reserve - expected_reserve
+        if drift > TOLERANCE_GB:
+            findings.append(
+                Finding(
+                    Severity.WARN,
+                    f"{drift:.2f} GB of VRAM went unused - either the driver reserve is "
+                    f"larger than the assumed {VRAM_DRIVER_RESERVE_GB:.2f} GB, or -ncmoe "
+                    f"was set more conservatively than this plan's {verdict.n_cpu_moe}. "
+                    f"The log cannot tell those apart, so no reserve is inferred from it",
+                )
+            )
+        elif reserve >= 0 and abs(drift) > TOLERANCE_GB:
+            # Less VRAM left than expected: the card really does hold back more
+            # than assumed, and nothing about -ncmoe can explain that away.
             calibration["VRAM_DRIVER_RESERVE_GB"] = round(reserve, 2)
 
     return Comparison(verdict, observed, tuple(findings), calibration)

@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 
 from localllm.budget import Fit, Hardware, Plan, solve
-from localllm.catalogue import GPT_OSS_20B, KAT_CODER_IQ3_XXS, QWEN25_CODER_14B
+from localllm.catalogue import GPT_OSS_20B, KAT_CODER_Q2_K_L, QWEN25_CODER_14B
 from localllm.serve import (
     MIN_LLAMA_BUILD,
     Level,
@@ -24,7 +24,10 @@ from localllm.serve import (
 
 MSI = Hardware(vram_total_gb=8.0, ram_total_gb=16.0, os="windows")
 GOOD = solve(MSI, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
-TIGHT = solve(MSI, KAT_CODER_IQ3_XXS, Plan(32_768, 1, cram_mib=1024))
+# KAT_CODER_IQ3_XXS used to sit here, but it now REFUSES: re-anchoring the
+# compute buffer on a measured Vulkan log took 1.5 GB out of the VRAM available
+# for weights. Q2_K_L is the one that is genuinely TIGHT now.
+TIGHT = solve(MSI, KAT_CODER_Q2_K_L, Plan(32_768, 1, cram_mib=1024))
 DOOMED = solve(MSI, QWEN25_CODER_14B, Plan(32_768, 3))
 
 

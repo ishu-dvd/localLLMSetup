@@ -140,9 +140,19 @@ class TestContextSpeedCurve:
         assert speeds == sorted(speeds, reverse=True)
 
     def test_curve_reports_the_offload_that_causes_it(self) -> None:
+        # A wide span is needed: this model's KV is cheap enough that 8K and 32K
+        # land on the same offload, which is itself the interesting result.
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        curve = context_speed_curve(hw, GPT_OSS_20B, [8192, 131072])
+        assert curve[0][1].n_cpu_moe < curve[-1][1].n_cpu_moe
+
+    def test_moderate_context_increases_are_free(self) -> None:
+        """8K to 32K needs no extra expert offload at all — the KV growth fits
+        inside VRAM already spare. Worth pinning, because it is the basis of the
+        advice to take the context."""
         hw = Hardware(vram_total_gb=8, ram_total_gb=16)
         curve = context_speed_curve(hw, GPT_OSS_20B, [8192, 32768])
-        assert curve[0][1].n_cpu_moe < curve[-1][1].n_cpu_moe
+        assert curve[0][1].n_cpu_moe == curve[-1][1].n_cpu_moe
 
     def test_skips_contexts_that_do_not_fit(self) -> None:
         hw = Hardware(vram_total_gb=8, ram_total_gb=16)
