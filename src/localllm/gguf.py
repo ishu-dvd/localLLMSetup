@@ -47,6 +47,36 @@ SLIDING_WINDOW_PATTERN_BY_ARCH = {
     "gemma3n": 6,
 }
 
+PERMISSIVE_LICENSES = frozenset(
+    {
+        "apache-2.0",
+        "mit",
+        "bsd-2-clause",
+        "bsd-3-clause",
+        "cc0-1.0",
+        "cc-by-4.0",
+        "cc-by-sa-4.0",
+        "unlicense",
+        "isc",
+    }
+)
+"""SPDX identifiers that permit commercial use without extra conditions."""
+
+RESTRICTED_LICENSES = frozenset(
+    {
+        "cc-by-nc-4.0",
+        "cc-by-nc-sa-4.0",
+        "cc-by-nc-nd-4.0",
+        "creativeml-openrail-m",
+        "bigscience-openrail-m",
+    }
+)
+"""Identifiers that forbid or condition commercial use.
+
+Anything else — ``llama3.2``, ``gemma``, ``qwen``, ``other`` — is a bespoke
+licence that must be read, not classified.
+"""
+
 
 # Value type tags from the GGUF spec.
 (
@@ -243,6 +273,48 @@ class GgufMetadata:
         return None
 
     @property
+    def n_embd(self) -> int | None:
+        v = self._arch("embedding_length")
+        return int(v) if v else None
+
+    @property
+    def max_context(self) -> int | None:
+        """The context the model was actually trained/extended to.
+
+        Exceeding this is not a memory problem — it is an invalid request, and
+        the budget arithmetic would be perfectly correct about a plan that
+        cannot run. Worth reading precisely because a solver that only reasons
+        about memory would never notice.
+        """
+        v = self._arch("context_length")
+        return int(v) if v else None
+
+    @property
+    def license(self) -> str | None:
+        v = self.kv.get("general.license")
+        return str(v) if v else None
+
+    @property
+    def license_is_commercial(self) -> bool | None:
+        """True / False / None, where None means *unknown*, not *fine*.
+
+        Licences are per-checkpoint, never per-family: Qwen2.5-3B is
+        non-commercial while 0.5B and 1.5B of the same generation are
+        Apache-2.0. So a bespoke identifier (``llama3.2``, ``gemma``, ``other``)
+        must resolve to unknown and be read by a human — collapsing it to True
+        is how a project ends up shipping on a licence nobody checked.
+        """
+        spdx = self.license
+        if spdx is None:
+            return None
+        key = spdx.strip().lower()
+        if key in PERMISSIVE_LICENSES:
+            return True
+        if key in RESTRICTED_LICENSES or "-nc" in key or "noncommercial" in key:
+            return False
+        return None
+
+    @property
     def sliding_window(self) -> int:
         v = self._arch("attention.sliding_window")
         return int(v) if v else 0
@@ -257,6 +329,11 @@ class GgufMetadata:
     @property
     def expert_count(self) -> int:
         v = self._arch("expert_count")
+        return int(v) if v else 0
+
+    @property
+    def expert_used_count(self) -> int:
+        v = self._arch("expert_used_count")
         return int(v) if v else 0
 
     @property

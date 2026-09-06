@@ -68,6 +68,10 @@ class Model:
 
     active_params_b: float | None = None
     coding_specialist: bool = False
+    expert_count: int = 0
+    expert_used_count: int = 0
+    """How many experts a token routes to. Only these are read per token, which
+    is why an MoE decodes far faster than its total weight suggests."""
     native_quant: bool = False
     """True when this quantisation IS the released format, so there is no
     quantisation loss at all. Only gpt-oss-20b's MXFP4 qualifies."""
@@ -76,6 +80,18 @@ class Model:
     notes: str = ""
     source_path: str | None = None
     """Where this model actually lives, used verbatim in the -m flag."""
+
+    max_context: int | None = None
+    """The trained/extended context length, from the GGUF's own `context_length`.
+
+    Not a memory quantity: asking for more is simply invalid, and llama.cpp
+    refuses at startup. Tracked here so the solver can say so before the user
+    downloads 12 GB and finds out.
+    """
+
+    license: str | None = None
+    license_is_commercial: bool | None = None
+    """Three-state, where None means unknown rather than acceptable."""
 
     @property
     def id(self) -> str:
@@ -144,6 +160,11 @@ GPT_OSS_20B = Model(
     active_params_b=3.6,
     native_quant=True,
     swe_bench_verified=60.4,
+    max_context=131072,
+    license="apache-2.0",
+    license_is_commercial=True,
+    expert_count=32,
+    expert_used_count=4,
     notes=(
         "MXFP4 is the native release format - zero quantisation loss. "
         "Architecture and dense_gb verified against the real GGUF "
@@ -360,6 +381,11 @@ def model_from_gguf(
         sliding_layers=md.sliding_layers,
         sliding_window=md.sliding_window,
         source_path=source_path,
+        max_context=md.max_context,
+        license=md.license,
+        license_is_commercial=md.license_is_commercial,
+        expert_count=md.expert_count,
+        expert_used_count=md.expert_used_count,
         notes=(
             "read from GGUF; "
             + (

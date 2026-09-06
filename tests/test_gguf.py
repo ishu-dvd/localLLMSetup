@@ -622,3 +622,81 @@ def test_catalogue_gpt_oss_matches_the_real_file():
     assert GPT_OSS_20B.sliding_window == 128
     assert GPT_OSS_20B.dense_gb == pytest.approx(1.918, abs=0.001)
     assert GPT_OSS_20B.weights_gb == pytest.approx(12.11, abs=0.01)
+
+
+# --- Model limits and licence: facts the file states about itself ----------
+# These are not budget arithmetic - they are constraints that make an otherwise
+# perfectly-sized plan invalid. A plan is wrong if it exceeds the trained
+# context, and a model is unusable commercially regardless of whether it fits.
+
+
+class TestMaxContext:
+    def test_reads_context_length(self) -> None:
+        g = parse_gguf_header(build_gguf("gpt-oss", {"gpt-oss.context_length": 131072}))
+        assert g.max_context == 131072
+
+    def test_absent_when_not_stated(self) -> None:
+        g = parse_gguf_header(build_gguf("gpt-oss", {"gpt-oss.block_count": 24}))
+        assert g.max_context is None
+
+    def test_is_architecture_scoped(self) -> None:
+        """A `llama.context_length` key must not be read for a gpt-oss model."""
+        g = parse_gguf_header(build_gguf("gpt-oss", {"llama.context_length": 4096}))
+        assert g.max_context is None
+
+
+class TestLicence:
+    def test_reads_licence(self) -> None:
+        g = parse_gguf_header(build_gguf("gpt-oss", {"general.license": "apache-2.0"}))
+        assert g.license == "apache-2.0"
+
+    def test_absent_when_not_stated(self) -> None:
+        assert parse_gguf_header(build_gguf("gpt-oss", {})).license is None
+
+    @pytest.mark.parametrize(
+        "spdx",
+        [
+            "apache-2.0",
+            "mit",
+            "Apache-2.0",  # case is not normalised upstream
+            "bsd-3-clause",
+        ],
+    )
+    def test_permissive_licences_are_commercial(self, spdx: str) -> None:
+        g = parse_gguf_header(build_gguf("gpt-oss", {"general.license": spdx}))
+        assert g.license_is_commercial is True
+
+    @pytest.mark.parametrize(
+        "spdx",
+        [
+            "cc-by-nc-4.0",
+            "cc-by-nc-sa-4.0",
+            "CC-BY-NC-SA-4.0",
+            "creativeml-openrail-m",  # use-restricted
+        ],
+    )
+    def test_restricted_licences_are_not_commercial(self, spdx: str) -> None:
+        g = parse_gguf_header(build_gguf("gpt-oss", {"general.license": spdx}))
+        assert g.license_is_commercial is False
+
+    @pytest.mark.parametrize("spdx", ["other", "llama3.2", "gemma", "qwen"])
+    def test_bespoke_licences_are_unknown_not_assumed_free(self, spdx: str) -> None:
+        """The expensive mistake is assuming a custom licence is permissive.
+
+        Qwen2.5-3B is non-commercial while 0.5B and 1.5B are Apache-2.0 - the
+        family tells you nothing. Unknown must stay unknown.
+        """
+        g = parse_gguf_header(build_gguf("gpt-oss", {"general.license": spdx}))
+        assert g.license_is_commercial is None
+
+    def test_unstated_licence_is_unknown(self) -> None:
+        assert parse_gguf_header(build_gguf("gpt-oss", {})).license_is_commercial is None
+
+
+class TestEmbeddingLength:
+    def test_reads_embedding_length(self) -> None:
+        g = parse_gguf_header(build_gguf("gpt-oss", {"gpt-oss.embedding_length": 2880}))
+        assert g.n_embd == 2880
+
+    def test_absent_when_not_stated(self) -> None:
+        assert parse_gguf_header(build_gguf("gpt-oss", {})).n_embd is None
