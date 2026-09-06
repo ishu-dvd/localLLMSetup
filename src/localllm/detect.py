@@ -39,12 +39,17 @@ class GpuInfo:
     """Where the number came from - shown to the user so a bad reading is visible."""
 
     is_virtual: bool = False
+    free_vram_gb: float | None = None
+    """Free VRAM, when the source can report it. Only llama.cpp's device list can."""
 
 
 @dataclass
 class Detection:
     gpus: list[GpuInfo] = field(default_factory=list)
     ram_gb: float | None = None
+    ram_available_gb: float | None = None
+    """Free RAM at probe time. Preferred over the assumed OS-idle reserve."""
+
     os: str = "unknown"
     warnings: list[str] = field(default_factory=list)
 
@@ -59,7 +64,13 @@ class Detection:
         gpu = self.primary_gpu
         if gpu is None or gpu.vram_gb is None or self.ram_gb is None:
             return None
-        return Hardware(vram_total_gb=gpu.vram_gb, ram_total_gb=self.ram_gb, os=self.os)
+        return Hardware(
+            vram_total_gb=gpu.vram_gb,
+            ram_total_gb=self.ram_gb,
+            os=self.os,
+            measured_ram_available_gb=self.ram_available_gb,
+            measured_vram_free_gb=gpu.free_vram_gb,
+        )
 
 
 # --- Pure parsers -----------------------------------------------------------
@@ -111,15 +122,64 @@ def parse_linux_meminfo(text: str) -> float | None:
     return None
 
 
+def parse_llama_devices(text: str) -> list[tuple[str, float, float]]:
+    """Parse `llama-server --list-devices` into (name, total_gb, free_gb).
+
+    Expected shape:
+
+        Available devices:
+          Vulkan0: AMD Radeon RX 6600M (8176 MiB, 8176 MiB free)
+
+    This is the most trustworthy VRAM source available, because it is the view
+    llama.cpp *itself* has - the same numbers it will use when deciding what it
+    can allocate. It sidesteps the Windows `AdapterRAM` uint32 problem entirely,
+    and unlike the registry it reports **free** VRAM, not just installed.
+    """
+    out: list[tuple[str, float, float]] = []
+    pattern = re.compile(
+        r"^\s*\S+:\s*(?P<name>.+?)\s*\(\s*(?P<total>\d+)\s*MiB,\s*(?P<free>\d+)\s*MiB free\s*\)"
+    )
+    for line in text.splitlines():
+        m = pattern.match(line)
+        if m:
+            mib = 1024 * 1024 / 1_000_000_000
+            out.append(
+                (
+                    m.group("name").strip(),
+                    int(m.group("total")) * mib,
+                    int(m.group("free")) * mib,
+                )
+            )
+    return out
+
+
 def build_detection(
     registry_text: str,
     cim_text: str,
     total_ram_bytes: int | None,
     os_name: str = "windows",
+    available_ram_bytes: int | None = None,
+    llama_devices_text: str = "",
 ) -> Detection:
     """Combine the probe outputs into a Detection. Pure - no IO."""
     det = Detection(os=os_name)
     det.ram_gb = total_ram_bytes / 1_000_000_000 if total_ram_bytes else None
+    det.ram_available_gb = available_ram_bytes / 1_000_000_000 if available_ram_bytes else None
+
+    # llama.cpp's own device list is the most authoritative source, so it wins.
+    llama_devices = parse_llama_devices(llama_devices_text)
+    if llama_devices:
+        for name, total_gb, free_gb in llama_devices:
+            det.gpus.append(
+                GpuInfo(
+                    name=name,
+                    vram_gb=total_gb,
+                    source="llama.cpp --list-devices",
+                    is_virtual=is_virtual_gpu(name),
+                    free_vram_gb=free_gb,
+                )
+            )
+        return det
 
     registry = dict(parse_registry_vram(registry_text))
     cim = parse_cim_video(cim_text)
@@ -186,30 +246,42 @@ _PS_CIM = (
 
 _PS_RAM = "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"
 
+_PS_RAM_FREE = "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory"
+"""Returns KB, not bytes - Win32_OperatingSystem reports in kilobytes."""
+
 
 def _powershell(script: str) -> str:
+    return _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script])
+
+
+def _run(cmd: list[str]) -> str:
     try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-        return r.stdout
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+        return (r.stdout or "") + (r.stderr or "")
     except (OSError, subprocess.SubprocessError):
         return ""
 
 
-def detect() -> Detection:
-    """Probe the current machine."""
+def detect(llama_server: str | None = None) -> Detection:
+    """Probe the current machine.
+
+    Pass a path to `llama-server` to get VRAM from llama.cpp's own device list,
+    which is both more accurate and more relevant than anything the OS reports.
+    """
+    devices_text = ""
+    if llama_server:
+        devices_text = _run([llama_server, "--list-devices"])
+
     if sys.platform == "win32":
         ram_raw = _powershell(_PS_RAM).strip()
+        free_kb = _powershell(_PS_RAM_FREE).strip()
         return build_detection(
             registry_text=_powershell(_PS_REGISTRY),
             cim_text=_powershell(_PS_CIM),
             total_ram_bytes=int(ram_raw) if ram_raw.isdigit() else None,
             os_name="windows",
+            available_ram_bytes=int(free_kb) * 1024 if free_kb.isdigit() else None,
+            llama_devices_text=devices_text,
         )
 
     ram = None
@@ -218,6 +290,10 @@ def detect() -> Detection:
             ram = parse_linux_meminfo(fh.read())
     except OSError:
         pass
-    det = Detection(os="linux", ram_gb=ram)
-    det.warnings.append("GPU detection on Linux is not implemented yet - pass --vram explicitly")
+    det = build_detection("", "", None, os_name="linux", llama_devices_text=devices_text)
+    det.ram_gb = ram
+    if not det.gpus:
+        det.warnings.append(
+            "GPU detection on Linux needs --llama-server, or pass --vram explicitly"
+        )
     return det

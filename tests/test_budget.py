@@ -17,6 +17,7 @@ from localllm.catalogue import (
     KAT_CODER_IQ3_XXS,
     KAT_CODER_Q2_K_L,
     QWEN3_CODER_30B_A3B,
+    QWEN25_CODER_7B,
     QWEN25_CODER_14B,
 )
 
@@ -56,19 +57,69 @@ def test_kv_scales_linearly_with_slot_count():
 
 
 def test_kv_matches_researched_figures():
-    # gpt-oss-20b: 12.0 KB/token/slot at q8_0 -> 0.39 GB at 32K, 1 slot.
-    assert solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1)).kv_gb == pytest.approx(0.39, abs=0.02)
-    # Qwen2.5-Coder-14B: 96 KB/token -> 9.44 GB at 3x32K.
-    assert solve(MSI_ALPHA, QWEN25_CODER_14B, Plan(32_768, 3)).kv_gb == pytest.approx(
-        9.44, abs=0.05
-    )
+    """Derived KV should be close to the researched figures, but slightly HIGHER.
+
+    The research quoted KV in KiB and this solver previously divided by 1000,
+    understating it by ~2.4%; it also ignored q8_0's block-scale overhead
+    (34 bytes per 32 values), a further ~6%. Deriving from architecture fixes
+    both, so these now land above the old numbers - in the safe direction.
+    """
+    gpt = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1)).kv_gb
+    assert 0.39 <= gpt <= 0.45  # was 0.39 flat
+
+    qwen = solve(MSI_ALPHA, QWEN25_CODER_14B, Plan(32_768, 3)).kv_gb
+    assert 9.44 <= qwen <= 10.5  # was 9.44 flat
 
 
-def test_q4_kv_halves_cost_but_is_flagged():
+def test_derivation_reproduces_the_researched_kib_constants():
+    """Proof the architecture data is right: 2 x full_attn x kv_heads x head_dim,
+    expressed in KiB, must equal the hand-entered reference values."""
+    for model in (GPT_OSS_20B, QWEN25_CODER_14B, QWEN25_CODER_7B, KAT_CODER_Q2_K_L):
+        raw = 2 * model.full_attn_layers * model.n_kv_heads * model.head_dim
+        assert raw / 1024 == pytest.approx(model.kb_per_token_q8, abs=0.01), model.id
+
+
+def test_q8_kv_includes_block_scale_overhead():
+    """q8_0 is 34 bytes per 32 values, not 32 - a real 6% that was being ignored."""
+    raw = 2 * GPT_OSS_20B.full_attn_layers * GPT_OSS_20B.n_kv_heads * GPT_OSS_20B.head_dim
+    assert GPT_OSS_20B.kv_bytes_per_token("q8_0") == pytest.approx(raw * 1.0625)
+
+
+def test_sliding_window_layers_cost_a_fixed_amount_not_per_token():
+    """This is why gpt-oss-20b's KV is so cheap at long context."""
+    assert GPT_OSS_20B.sliding_layers > 0
+    assert GPT_OSS_20B.kv_fixed_bytes("q8_0") > 0
+    # Doubling context must not double the fixed part.
+    short = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1)).kv_gb
+    long = solve(MSI_ALPHA, GPT_OSS_20B, Plan(65_536, 1)).kv_gb
+    assert long < short * 2
+
+
+def test_dense_model_has_no_fixed_kv_term():
+    assert QWEN25_CODER_14B.kv_fixed_bytes("q8_0") == 0.0
+
+
+def test_q4_kv_is_cheaper_than_q8_but_not_exactly_half():
+    """0.5625 vs 1.0625 bytes/element - the block scale does not halve."""
     r = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, kv_quant="q4_0"))
     q8 = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, kv_quant="q8_0"))
-    assert r.kv_gb == pytest.approx(q8.kv_gb / 2, rel=1e-6)
+    assert r.kv_gb < q8.kv_gb
+    assert r.kv_gb > q8.kv_gb / 2
     assert any("tool calling" in w for w in r.warnings)
+
+
+def test_f16_kv_is_the_most_expensive():
+    f16 = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, kv_quant="f16")).kv_gb
+    q8 = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, kv_quant="q8_0")).kv_gb
+    assert f16 > q8
+
+
+def test_unknown_architecture_falls_back_to_the_reference_constant():
+    from dataclasses import replace
+
+    stub = replace(GPT_OSS_20B, n_kv_heads=0, head_dim=0, full_attn_layers=0)
+    assert not stub.architecture_known
+    assert stub.kv_bytes_per_token("q8_0") == pytest.approx(stub.kb_per_token_q8 * 1024)
 
 
 # --- The dense-vs-MoE outcome ----------------------------------------------
@@ -213,3 +264,124 @@ def test_flags_alias_contains_claude_substring():
     """Claude-compatible clients filter out model IDs lacking 'claude'."""
     flags = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1)).llama_server_flags()
     assert "-a claude-" in flags
+
+
+# --- The offload split must survive into the command ------------------------
+# The solver computes that N GB of weights cannot fit in VRAM. If that number
+# never reaches the command line, llama.cpp tries to load everything onto the
+# GPU and dies. These tests exist because it originally did exactly that.
+
+
+def test_moe_with_spill_emits_ncmoe():
+    v = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    assert v.weights_spilled_gb > 0, "fixture must actually spill"
+    assert "-ncmoe " in v.llama_server_flags()
+
+
+def test_never_claims_full_gpu_offload_while_weights_spill():
+    """`-ngl 99` with no offload directive is a guaranteed OOM."""
+    v = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    flags = v.llama_server_flags()
+    assert not (flags.count("-ngl 99") and "-ncmoe" not in flags and "-ncffn" not in flags)
+
+
+def test_ncmoe_grows_when_less_vram_is_available():
+    """Less VRAM -> more expert layers must move to system RAM."""
+    big = solve(Hardware(16.0, 16.0), GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    small = solve(Hardware(8.0, 16.0), GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    assert small.n_cpu_moe > big.n_cpu_moe
+
+
+def test_ncmoe_is_zero_when_everything_fits_in_vram():
+    v = solve(Hardware(48.0, 64.0), GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    assert v.weights_spilled_gb == 0
+    assert v.n_cpu_moe == 0
+    assert "-ncmoe" not in v.llama_server_flags()
+
+
+def test_ncmoe_never_exceeds_the_layer_count():
+    v = solve(Hardware(1.5, 16.0), GPT_OSS_20B, Plan(4096, 1, cram_mib=512))
+    assert v.n_cpu_moe <= GPT_OSS_20B.n_layers
+
+
+def test_ncmoe_matches_the_researched_value_for_gpt_oss():
+    """hw-runtime independently recommended -ncmoe 14 for this exact config."""
+    v = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    assert 12 <= v.n_cpu_moe <= 18
+
+
+def test_dense_model_uses_partial_ngl_not_ncmoe():
+    """-ncmoe only moves MoE expert weights; a dense model needs partial -ngl."""
+    v = solve(MSI_ALPHA, QWEN25_CODER_14B, Plan(8_192, 1, cram_mib=1024))
+    if v.status is not Fit.REFUSE and v.weights_spilled_gb > 0:
+        flags = v.llama_server_flags()
+        assert "-ncmoe" not in flags
+        assert "-ngl 99" not in flags
+
+
+def test_dense_ngl_is_fewer_than_all_layers_when_spilling():
+    v = solve(MSI_ALPHA, QWEN25_CODER_14B, Plan(8_192, 1, cram_mib=1024))
+    if v.status is not Fit.REFUSE and v.weights_spilled_gb > 0:
+        assert 0 <= v.n_gpu_layers < QWEN25_CODER_14B.n_layers
+
+
+def test_offload_is_reported_in_explain():
+    v = solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
+    assert "ncmoe" in v.explain() or "offload" in v.explain().lower()
+
+
+# --- Measured reserves beat assumed ones ------------------------------------
+# The OS-idle reserve is the assumption this solver is most sensitive to.
+# When a real measurement exists, use it.
+
+
+def test_measured_ram_overrides_the_assumed_reserve():
+    assumed = Hardware(8.0, 16.0)
+    measured = Hardware(8.0, 16.0, measured_ram_available_gb=6.0)
+    assert measured.ram_usable_gb != assumed.ram_usable_gb
+    assert measured.ram_usable_gb == pytest.approx(5.0)  # 6.0 minus safety
+
+
+def test_a_busy_machine_is_correctly_seen_as_smaller():
+    """Something else eating RAM must shrink the budget, not be ignored."""
+    idle = Hardware(8.0, 16.0, measured_ram_available_gb=11.0)
+    busy = Hardware(8.0, 16.0, measured_ram_available_gb=4.0)
+    assert busy.ram_usable_gb < idle.ram_usable_gb
+
+
+def test_busy_machine_can_flip_a_verdict_to_refuse():
+    """The whole point: a plan that fits on an idle box may not fit on a busy one."""
+    idle = solve(Hardware(8.0, 16.0, measured_ram_available_gb=11.0), GPT_OSS_20B, Plan(32_768, 1))
+    busy = solve(Hardware(8.0, 16.0, measured_ram_available_gb=4.0), GPT_OSS_20B, Plan(32_768, 1))
+    assert idle.status is not Fit.REFUSE
+    assert busy.status is Fit.REFUSE
+
+
+def test_measured_vram_overrides_the_driver_reserve():
+    assert Hardware(8.0, 16.0, measured_vram_free_gb=5.5).vram_usable_gb == pytest.approx(5.5)
+
+
+def test_falls_back_to_assumptions_when_unmeasured():
+    hw = Hardware(8.0, 16.0)
+    assert not hw.budget_is_measured
+    assert hw.ram_usable_gb == pytest.approx(10.5)
+    assert hw.vram_usable_gb == pytest.approx(7.0)
+
+
+def test_measured_flag_reports_honestly():
+    assert Hardware(8.0, 16.0, measured_ram_available_gb=9.0).budget_is_measured
+    assert not Hardware(8.0, 16.0).budget_is_measured
+
+
+def test_measured_values_never_go_negative():
+    assert Hardware(8.0, 16.0, measured_ram_available_gb=0.2).ram_usable_gb == 0.0
+
+
+def test_measurement_cannot_exceed_the_stated_total():
+    """An explicit --ram must not be silently overridden by a stale measurement."""
+    hw = Hardware(8.0, 16.0, measured_ram_available_gb=41.9)
+    assert hw.ram_usable_gb <= 16.0
+
+
+def test_measured_vram_cannot_exceed_installed_vram():
+    assert Hardware(8.0, 16.0, measured_vram_free_gb=99.0).vram_usable_gb <= 8.0
