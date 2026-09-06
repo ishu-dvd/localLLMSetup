@@ -621,3 +621,44 @@ class TestExplicitNoGpuWarning:
     def test_the_report_quotes_the_warning(self) -> None:
         c = compare(verdict_for(), parse_server_log(self.LOG))
         assert "no usable GPU" in c.report()
+
+
+class TestMultipleBuffersPerBucket:
+    """Real logs report several buffers per bucket, and they must be summed.
+
+    A single-buffer fixture cannot tell summing from replacing, so this is the
+    only thing standing between `+=` and `=` in the accumulators.
+    """
+
+    def test_two_device_model_buffers_are_summed(self) -> None:
+        o = parse_server_log(
+            "load_tensors:      Vulkan0 model buffer size =  3000.00 MiB\n"
+            "load_tensors:      Vulkan1 model buffer size =  2000.00 MiB\n"
+        )
+        assert o.vram_model_gb == pytest.approx(5000 * 1024 * 1024 / 1e9, rel=0.01)
+
+    def test_mapped_and_anonymous_host_buffers_are_summed(self) -> None:
+        """A partially-mmap'd load reports both `CPU_Mapped` and `CPU`."""
+        o = parse_server_log(
+            "load_tensors:   CPU_Mapped model buffer size =  4000.00 MiB\n"
+            "load_tensors:          CPU model buffer size =  2000.00 MiB\n"
+        )
+        assert o.ram_model_gb == pytest.approx(6000 * 1024 * 1024 / 1e9, rel=0.01)
+
+    def test_two_device_compute_buffers_are_summed(self) -> None:
+        o = parse_server_log(
+            "llama_context:      Vulkan0 compute buffer size =   300.00 MiB\n"
+            "llama_context:      Vulkan1 compute buffer size =   200.00 MiB\n"
+        )
+        assert o.compute_gb == pytest.approx(500 * 1024 * 1024 / 1e9, rel=0.01)
+
+    def test_the_output_buffer_never_reaches_any_total(self) -> None:
+        """It is well under a megabyte and belongs to no budget here, but it
+        matches the same `... buffer size = N MiB` shape as the rest."""
+        o = parse_server_log(
+            "llama_context:      Vulkan0  output buffer size =     0.77 MiB\n"
+            "llama_context:   CPU_Mapped  output buffer size =     0.77 MiB\n"
+        )
+        assert o.compute_gb is None
+        assert o.vram_model_gb is None and o.ram_model_gb is None
+        assert o.total_vram_gb == 0.0
