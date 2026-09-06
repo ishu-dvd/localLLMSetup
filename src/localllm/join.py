@@ -25,6 +25,20 @@ from pathlib import Path
 
 SUPPORTED = ("cline", "aider", "octofriend")
 
+SIDECAR = "localllm-client.json"
+"""Where `join` records what it configured, in one place for every client.
+
+The three clients keep their settings in three shapes, and two of them put the
+base URL in an *environment variable* rather than a file. So reading a client's
+own config back is not enough to know where it points: on a fresh shell, Aider's
+`.aider.conf.yml` names a model and nothing else.
+
+This file closes that hole. It holds no secret — the key stays in the client's
+own file or in the environment, exactly where the client itself looks for it.
+"""
+
+SIDECAR_VERSION = 1
+
 
 @dataclass
 class ClientConfig:
@@ -35,6 +49,26 @@ class ClientConfig:
     notes: list[str] = field(default_factory=list)
     extra_files: dict[str, str] = field(default_factory=dict)
     """Additional files this client needs, keyed by filename."""
+
+    key_env_var: str = ""
+    """The variable this client reads its key from, when it is not in the file."""
+
+    def sidecar(self, base_url: str, model: str, context: int) -> str:
+        """What was configured, in a form every client shares."""
+        return (
+            json.dumps(
+                {
+                    "version": SIDECAR_VERSION,
+                    "client": self.client,
+                    "base_url": normalise_base_url(base_url, want_v1=False),
+                    "model": model,
+                    "context": context,
+                    "key_env_var": self.key_env_var,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
 
     def write(self, directory: Path | str) -> Path:
         d = Path(directory)
@@ -111,6 +145,7 @@ def _aider(base_url: str, api_key: str, model: str, context: int) -> ClientConfi
             "OPENAI_API_KEY": api_key,
         },
         extra_files={".aider.model.metadata.json": json.dumps(metadata, indent=2) + "\n"},
+        key_env_var="OPENAI_API_KEY",
         notes=[
             "Install with: py -3.12 -m pip install aider-install && aider-install "
             "(Python 3.12, NOT 3.13+).",
@@ -148,6 +183,7 @@ def _octofriend(base_url: str, api_key: str, model: str, context: int) -> Client
         filename="octofriend.json5",
         content=body,
         env={"LOCAL_LLM_KEY": api_key},
+        key_env_var="LOCAL_LLM_KEY",
         notes=[
             "Place at ~/.config/octofriend/octofriend.json5.",
             "Its fix-json and diff-apply repair models run locally on this laptop "
@@ -174,7 +210,11 @@ def build_client_config(
         raise ValueError("an API key is required - issue one with `localllm key add <device>`")
     if context <= 0:
         raise ValueError("context must be positive")
-    return _BUILDERS[key](base_url, api_key, model, context)
+    config = _BUILDERS[key](base_url, api_key, model, context)
+    # Always alongside the client's own file, so the doctor can find out where
+    # this laptop points without depending on the shell's environment.
+    config.extra_files[SIDECAR] = config.sidecar(base_url, model, context)
+    return config
 
 
 def recommend_client(*, model_is_tool_call_trained: bool) -> str:
@@ -309,6 +349,45 @@ _READERS = (
 )
 
 
+def _read_sidecar(path: Path) -> DiscoveredClient | None:
+    """The record `join` leaves, which every client shares.
+
+    Preferred over the client's own file because two of the three keep their
+    base URL in the environment: on a fresh shell those configs name a model
+    and nothing else, which is not enough to check anything.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != SIDECAR_VERSION:
+        return None
+    url = data.get("base_url")
+    if not isinstance(url, str) or not url:
+        return None
+
+    client = str(data.get("client") or "")
+    env_var = str(data.get("key_env_var") or "")
+    # The secret deliberately is not here. It stays where the client itself
+    # looks for it: in the client's own file, or in the environment.
+    api_key = os.environ.get(env_var, "") if env_var else ""
+    if not api_key:
+        own = next((r(path.parent / f) for f, r in _READERS if (path.parent / f).exists()), None)
+        if own is not None:
+            api_key = own.api_key
+
+    context = data.get("context")
+    return DiscoveredClient(
+        client=client,
+        path=path,
+        base_url=url,
+        model=str(data.get("model") or ""),
+        api_key=api_key,
+        context=context if isinstance(context, int) and not isinstance(context, bool) else None,
+        key_env_var=env_var,
+    )
+
+
 def read_client_config(directory: Path | str = ".") -> DiscoveredClient | None:
     """Find a config this tool wrote and recover what the doctor needs.
 
@@ -317,6 +396,14 @@ def read_client_config(directory: Path | str = ".") -> DiscoveredClient | None:
     give than this function does.
     """
     d = Path(directory)
+    sidecar = d / SIDECAR
+    if sidecar.exists():
+        found = _read_sidecar(sidecar)
+        if found is not None:
+            return found
+
+    # Falls back to the client's own file, which covers a config written before
+    # the sidecar existed, or one a user assembled by hand.
     for filename, reader in _READERS:
         path = d / filename
         if path.exists():

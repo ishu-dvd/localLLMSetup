@@ -341,3 +341,98 @@ class TestReadingAConfigBack:
         assert found.model == "something-else"
         assert found.context == 4096
         assert found.api_key == "sk-mine"
+
+
+class TestTheSidecarMakesEveryClientReadable:
+    """Two of the three clients keep the base URL in an environment variable.
+
+    Reading their own config back is therefore not enough to know where a
+    laptop points: on a fresh shell, `.aider.conf.yml` names a model and
+    nothing else. `check` found the file, recovered no URL, and reported
+    "nothing to check ... run this from the directory join wrote its config
+    into" - to a user who was standing in exactly that directory.
+    """
+
+    def _join(self, tmp_path, client):
+        build_client_config(
+            client=client,
+            base_url="http://msi:8080",
+            api_key="sk-localllm-secret",
+            model="claude-local-coder",
+            context=8192,
+        ).write(tmp_path)
+        return tmp_path
+
+    @pytest.mark.parametrize("client", ["cline", "aider", "octofriend"])
+    def test_every_client_records_where_it_points(self, client, tmp_path, monkeypatch):
+        from localllm.join import read_client_config
+
+        for var in ("OPENAI_API_BASE", "OPENAI_API_KEY", "LOCAL_LLM_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        self._join(tmp_path, client)
+
+        found = read_client_config(tmp_path)
+        assert found is not None, client
+        assert "msi:8080" in found.base_url, client
+        assert found.model == "claude-local-coder", client
+        assert found.context == 8192, client
+
+    def test_the_sidecar_holds_no_secret(self, tmp_path):
+        """It sits next to a client config in a working directory that may well
+        be a git repository. The key belongs where the client already looks."""
+        from localllm.join import SIDECAR
+
+        self._join(tmp_path, "aider")
+        assert "sk-localllm-secret" not in (tmp_path / SIDECAR).read_text(encoding="utf-8")
+
+    def test_the_key_still_reaches_the_doctor_from_the_environment(self, tmp_path, monkeypatch):
+        from localllm.join import read_client_config
+
+        self._join(tmp_path, "octofriend")
+        monkeypatch.setenv("LOCAL_LLM_KEY", "sk-from-env")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.api_key == "sk-from-env"
+
+    def test_the_key_is_recovered_from_the_client_file_when_it_lives_there(self, tmp_path):
+        """Cline stores its own key, so no environment variable is involved."""
+        from localllm.join import read_client_config
+
+        self._join(tmp_path, "cline")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.api_key == "sk-localllm-secret"
+
+    def test_the_sidecar_records_the_origin_not_the_v1_suffix(self, tmp_path):
+        """The clients disagree about the /v1 suffix - Octofriend wants the
+        bare origin, the others want /v1. Storing one canonical form keeps the
+        doctor from having to guess which convention wrote it."""
+        from localllm.join import read_client_config
+
+        self._join(tmp_path, "cline")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert not found.base_url.endswith("/v1")
+
+    def test_a_config_without_a_sidecar_still_reads(self, tmp_path):
+        """Covers a laptop joined before the sidecar existed, and one a user
+        assembled by hand."""
+        from localllm.join import SIDECAR, read_client_config
+
+        self._join(tmp_path, "cline")
+        (tmp_path / SIDECAR).unlink()
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.client == "cline"
+
+    def test_a_sidecar_from_a_future_version_falls_back_rather_than_misreading(self, tmp_path):
+        from localllm.join import SIDECAR, read_client_config
+
+        self._join(tmp_path, "cline")
+        path = tmp_path / SIDECAR
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["version"] = 99
+        path.write_text(json.dumps(data), encoding="utf-8")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.path.name == "cline-settings.json"

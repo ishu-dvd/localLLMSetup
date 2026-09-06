@@ -408,10 +408,19 @@ def cmd_check(args: argparse.Namespace) -> int:
             api_key = api_key or found.api_key
             model = model or found.model
             expected_context = found.context
+            if not server:
+                print(
+                    f"error: found {found.path}, but it does not record a server "
+                    f"URL - this client keeps it in the environment. Re-run "
+                    f"`localllm join` to write one, or pass --server.",
+                    file=sys.stderr,
+                )
+                return 1
             if not api_key and found.key_env_var:
                 print(
                     f"note: {found.client} reads its key from ${found.key_env_var}, "
-                    f"which is not set in this shell. Pass --api-key to check anyway.\n"
+                    f"which is not set in this shell. Checking reachability only; "
+                    f"pass --api-key to test the key too.\n"
                 )
     if not server:
         print(
