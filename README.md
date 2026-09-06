@@ -99,7 +99,7 @@ llama.cpp, llama-swap and gguf-parser. Not a new inference stack.
 git clone https://github.com/ishu-dvd/localLLMSetup
 cd localLLMSetup
 $env:PYTHONPATH="src"
-python -m pytest tests          # 645 tests
+python -m pytest tests          # 654 tests
 python -m localllm next         # says what to do first
 ```
 
@@ -280,7 +280,7 @@ On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
 | 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**645 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
+**654 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
 
 ---
 
