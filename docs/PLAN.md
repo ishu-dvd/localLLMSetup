@@ -146,43 +146,78 @@ not a server — say so in the README rather than pretend.
 
 ---
 
-## Phase 4 — Per-device keys 🔑 *differentiator #1*
+## Phase 4 — Per-device keys 🔑 *differentiator #1* — ✅ **DONE**
 
-**Tests first:**
+Implemented in `src/localllm/keys.py`, 24 tests in `tests/test_keys.py`.
 
 ```
-test_key_add_creates_unique_revocable_key
-test_request_with_valid_key_is_proxied
-test_request_with_revoked_key_is_401
-test_revocation_does_not_interrupt_other_clients_streams   # caddy reload, not restart
-test_access_log_attributes_request_to_device
-test_proxy_does_not_mutate_request_body_or_prompt_head     # §6 cache-fragility guard
-test_sse_streaming_survives_the_proxy                      # 5-min stream, unbuffered
+localllm key add laptop-1          # issue
+localllm key revoke laptop-2       # revoke (history preserved)
+localllm key list                  # audit trail
+localllm key export --out keys.txt # llama-server --api-key-file
+localllm key caddyfile ai.tailnet.ts.net
 ```
 
-The last two are the ones that bite in production: a proxy that buffers SSE breaks streaming,
-and a proxy that touches the prompt head silently destroys prefix caching.
+**Tests written first:**
 
-**Exit gate:** three keys issued; revoke one mid-stream; the other two are undisturbed; the
-access log attributes every request to a device.
+```
+test_keys_are_unique
+test_cannot_double_issue_to_one_device
+test_revoke_deactivates_only_that_device
+test_revocation_preserves_the_audit_trail      # revoked != deleted
+test_device_can_be_reissued_after_revocation
+test_api_key_file_excludes_revoked_keys
+test_caddyfile_attributes_requests_to_a_device
+test_caddyfile_disables_buffering_for_streaming  # buffered SSE breaks streaming
+test_caddyfile_does_not_rewrite_the_request_body # mutating the prompt head
+                                                 # destroys the prefix cache
+test_caddyfile_bounds_request_size
+test_caddyfile_handles_device_names_with_spaces
+```
+
+Two design points taken from the research rather than invented:
+
+* **Revocation is not deletion.** A revoked key stays in the store so past log
+  lines remain attributable.
+* **The proxy authenticates, logs and proxies — nothing else.** No body rewriting,
+  no header injection into the prompt. llama.cpp matches its prompt cache on
+  longest-common-prefix; perturbing the prompt head silently costs a full cold
+  prefill on every turn.
+
+**Exit gate:** ⏳ three keys issued and one revoked mid-stream on real hardware,
+with the other two undisturbed. Logic is done; the live check needs the server.
 
 ---
 
-## Phase 5 — Client onboarding 🚀 *differentiator #2*
+## Phase 5 — Client onboarding 🚀 *differentiator #2* — ✅ **DONE**
 
-`localllm join <server> <key>` writes the right config for the chosen client, from
-`DECISIONS.md` §6.
+Implemented in `src/localllm/join.py`, 33 tests in `tests/test_join.py`.
 
 ```
-test_join_writes_valid_cline_config       # incl. contextWindow pinned to real per-slot budget
-test_join_writes_valid_aider_env
-test_join_writes_valid_octofriend_json5
-test_join_is_idempotent
-test_joined_client_completes_round_trip   # Tier 3, on a real second laptop
+localllm join --client cline --device laptop-1 --url http://msi.tailnet.ts.net:8080
 ```
 
-**Exit gate:** on a laptop that has never seen the server, one command → a working coding
-session over Tailscale.
+Writes ready-to-use config for **Cline**, **Aider** or **Octofriend**, with the
+device's key already in it.
+
+**A bug the tests caught during implementation:** Aider was being handed a base
+URL and model but never told the **context limit**. It would have guessed, over-sent,
+and been silently truncated server-side. Fixed by emitting a
+`.aider.model.metadata.json` pinning `max_input_tokens` to the real per-slot budget.
+That is exactly the class of failure that is invisible until you are debugging
+"why does it forget things".
+
+```
+test_every_client_is_told_the_real_context     # the one that caught it
+test_cline_pins_context_window_to_the_slot_budget
+test_aider_declares_the_context_limit_in_model_metadata
+test_octofriend_base_url_has_no_v1_suffix      # asymmetry: silent 404 otherwise
+test_aider_passes_credentials_via_env_not_the_config_file
+test_writing_is_idempotent
+```
+
+**Exit gate:** ⏳ a laptop that has never seen the server gets a working session
+in one command. Config generation is done; the round trip needs the server.
 
 ---
 
