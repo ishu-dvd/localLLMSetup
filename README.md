@@ -78,11 +78,15 @@ Mostly **no** — and that shaped the scope. Verified via the GitHub API:
 **The unclaimed gap is the _fleet_ story** — every one of those is single-user:
 
 1. **Per-device API keys** with attribution and revocation
-2. **Client onboarding** — `join` a laptop and its CLI is configured and keyed
+2. **Client onboarding** — one paste-able invite carries the URL, the device's key, the
+   model id and the real per-slot context, so nothing is retyped between machines
 3. **Windows + AMD as a first-class always-on target**
 4. **A joint VRAM + RAM + KV + context solver that hard-refuses** — every existing tool
    reasons about VRAM *alone*; none reason about *"7 GB VRAM **and** 10 GB host RAM **and**
    no paging"*. On a machine that can't be upgraded, a wrong choice is unrecoverable.
+5. **The plan reaches the clients.** The solver decides how much context each laptop gets;
+   nothing else carries that number to the laptop, so clients are configured with a
+   default that is right only by coincidence.
 
 So: **a thin Windows-first orchestrator + key broker (~2,000 lines)** depending on
 llama.cpp, llama-swap and gguf-parser. Not a new inference stack.
@@ -95,7 +99,8 @@ llama.cpp, llama-swap and gguf-parser. Not a new inference stack.
 git clone https://github.com/ishu-dvd/localLLMSetup
 cd localLLMSetup
 $env:PYTHONPATH="src"
-python -m pytest tests          # 548 tests
+python -m pytest tests          # 645 tests
+python -m localllm next         # says what to do first
 ```
 
 **Point it at a real model file** and it reads the facts from the file rather than
@@ -164,26 +169,91 @@ something that would page.
 **Issue a key per laptop, and revoke one:**
 
 ```powershell
-python -m localllm.cli key add laptop-1
-python -m localllm.cli key revoke laptop-2      # history preserved for attribution
-python -m localllm.cli key export --out keys.txt      # llama-server --api-key-file
-python -m localllm.cli key caddyfile ai.tailnet.ts.net  # per-device attribution
+python -m localllm key add laptop-1
+python -m localllm key revoke laptop-2      # history preserved for attribution
+python -m localllm key export --out keys.txt      # llama-server --api-key-file
+python -m localllm key caddyfile ai.tailnet.ts.net  # per-device attribution
 ```
 
-**Onboard a client laptop in one command:**
+**Never wonder what to run next.** The order is not obvious — `up` refuses until
+llama.cpp *and* a GGUF are both present, `invite` refuses until `up` has written a
+plan — so one command reads the machine and says where you are:
 
 ```powershell
-python -m localllm.cli join --client cline --device laptop-1 `
-  --url http://msi-alpha.tailnet.ts.net:8080 --context 65536
+python -m localllm next --devices 2
 ```
 
-Writes ready-to-use config for **Cline**, **Aider** or **Octofriend**, with that device's
-key already in it and the context window pinned to the real per-slot budget.
+```
+Setting up the server:
+
+  [x] Install llama.cpp (Vulkan build)
+  [>] Download the model (gpt-oss-20b:MXFP4)
+      no .gguf in C:\ai
+  [ ] Generate the service definition and the plan
+  [ ] Install and start the Windows service
+  [ ] Invite each laptop
+
+Next: Download the model (gpt-oss-20b:MXFP4)
+  hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-MXFP4.gguf --local-dir .
+```
+
+Every download source is verified against the Hugging Face API rather than guessed.
+That matters more than it sounds: `unsloth/gpt-oss-20b-GGUF` publishes every quant of
+that model **except** MXFP4, so the obvious repo/file pair 404s.
+
+**Onboard a client laptop with one paste.** On the server:
+
+```powershell
+python -m localllm invite laptop-1 --url http://msi-alpha.tailnet.ts.net:8080
+```
+
+```
+issued a new key for laptop-1
+
+  llmi1_eyJjIjo4MTkyLCJkIjoibGFwdG9wLTEiLCJrIjoic2st...._ec1535a7
+
+This is a password. It contains laptop-1's API key - send it over
+something private, and revoke it with `localllm key revoke` if it leaks.
+
+On laptop-1, run:
+  localllm join --invite llmi1_... --client cline
+
+That pins 8,192 tokens of context - the share this server actually gives each of its 2 slot(s).
+```
+
+On the laptop, that single token is the entire handoff — URL, key, model id and the real
+per-slot context, none of it retyped:
+
+```powershell
+python -m localllm join --invite llmi1_... --client cline
+```
+
+Writes ready-to-use config for **Cline**, **Aider** or **Octofriend**. The token is
+checksummed, because these get pasted through chat apps that wrap long lines — and a
+silently truncated token becomes a wrong key that surfaces as a 401 hours later and gets
+blamed on authentication:
+
+```
+error: the invite is damaged or was cut short in transit. Chat apps wrap
+long lines - copy the whole token as one piece
+```
+
+**The context each laptop is given is never a guess.** `up` records what the solver
+decided; `join` reads it, and asks the running server to confirm it. Reality outranks the
+plan, and asking for more than a slot holds is refused rather than warned about:
+
+```
+error: --context 32,768 exceeds the 8,192 tokens the running server gives each slot.
+The client would build prompts the server rejects with 400 exceed_context_size_error.
+```
+
+That failure is otherwise completely silent at setup time: it only appears later, as a
+coding agent that works on small files and dies on large ones.
 
 **Set it up to run 24/7** (refuses to generate anything until preflight passes):
 
 ```powershell
-python -m localllm.cli up --llama-server C:\ai\llama-server.exe
+python -m localllm up --llama-server C:\ai\llama-server.exe
 ```
 
 ```
@@ -206,10 +276,10 @@ On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
 | 2 — resolve open questions | ⏳ needs the MSI |
 | 3 — server as a service | ✅ done, 38 tests (reboot gate needs the MSI) |
 | 4 — per-device keys | ✅ done, 24 tests |
-| 5 — client onboarding | ✅ done, 33 tests |
+| 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**548 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
+**645 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
 
 ---
 
