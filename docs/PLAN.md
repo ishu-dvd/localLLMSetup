@@ -51,33 +51,57 @@ thrashing, **stop**. The premise is wrong and no amount of software fixes it.
 
 ---
 
-## Phase 1 — The budget solver 🎯 *the actual product; pure TDD*
+## Phase 1 — The budget solver 🎯 *the actual product; pure TDD* — ✅ **DONE**
 
 **Goal:** given hardware + a candidate model + context + client count, decide **FITS /
 TIGHT / REFUSE** — and **refuse loudly** rather than let the user discover the page file.
 
-**Write these tests first — they encode everything the panel learned:**
+**Status:** implemented in `src/localllm/budget.py`, 27 tests in `tests/test_budget.py`, all
+passing. Verified with a 9-mutation check — every mutation was caught, so the tests have teeth:
+
+| Mutation | Result |
+|---|---|
+| `-c` becomes per-slot (the trap) | CAUGHT |
+| KV ignores slot count | CAUGHT |
+| No-paging invariant removed | CAUGHT |
+| TIGHT threshold ignored | CAUGHT |
+| REFUSE verdict becomes truthy | CAUGHT |
+| q4_0 KV warning removed | CAUGHT |
+| `-cram` not charged to RAM | CAUGHT |
+| Windows idle RAM not reserved | CAUGHT |
+| Native quant not preferred | CAUGHT |
+
+**The tests that encode the research:**
 
 ```
-test_c_is_total_pool_not_per_slot        # -c 32768 -np 3 => 10.9K each, NOT 32K.  §5
+test_c_flag_is_total_pool_not_per_slot     # -c 32768 -np 3 => 10.9K each, NOT 32K
 test_32k_for_three_clients_needs_c_98304
-test_kv_scales_with_slot_count           # KAT 0.33GB x3 = 0.98GB @32K
-test_dense_14b_refused_at_three_slots    # Qwen2.5-Coder-14B: 9.44GB KV => REFUSE
-test_moe_accepted_where_dense_refused    # same budget, MoE passes
-test_refuses_when_plan_requires_paging   # the no-paging invariant
-test_windows_idle_ram_is_reserved        # 16GB total != 16GB usable
-test_cram_counted_against_ram_budget     # -cram 2048 is real memory
-test_single_client_frees_budget_for_better_quant   # §5: 1 client => IQ3 reachable
-test_vram_from_qwMemorySize_not_adapterram          # see below
+test_kv_scales_linearly_with_slot_count
+test_kv_matches_researched_figures         # 0.39GB / 9.44GB anchors
+test_dense_14b_refused_at_three_slots      # KV alone (9.44GB) > the whole card
+test_moe_accepted_where_dense_refused      # same budget, MoE passes
+test_refuses_when_plan_requires_paging     # the no-paging invariant
+test_refuse_is_not_reachable_by_ignoring_it  # REFUSE is falsy
+test_windows_idle_ram_is_reserved          # 16GB total != 16GB usable
+test_cram_counted_against_ram_budget
+test_default_cram_of_8192_is_flagged_as_a_trap
+test_single_client_frees_budget_versus_three
+test_gpt_oss_reaches_128k_on_a_single_client
+test_kat_coder_iq3_is_tight_not_comfortable_at_one_slot
+test_recommends_gpt_oss_for_single_client
+test_flags_never_emit_q4_kv
+test_flags_omit_slot_affinity_for_single_client
 ```
 
-> 🚨 **A trap I verified empirically:** `Win32_VideoController.AdapterRAM` is a **`uint32`** —
-> it caps at ~4 GB and would report your 8 GB RX 6600M as ~4095 MB. True VRAM on Windows must
-> come from the registry `HardwareInformation.qwMemorySize` (REG_QWORD) or DXGI
-> `DedicatedVideoMemory`. A silent 2× under-read here would corrupt every downstream decision.
+> 🚨 **A trap verified empirically during research:** `Win32_VideoController.AdapterRAM` is a
+> **`uint32`** — it caps at ~4 GB and would report an 8 GB RX 6600M as ~4095 MB. True VRAM on
+> Windows must come from the registry `HardwareInformation.qwMemorySize` (REG_QWORD) or DXGI
+> `DedicatedVideoMemory`. A silent 2× under-read would corrupt every downstream decision.
+> **This lands in Phase 3's detection code, and needs a golden fixture from the real machine.**
 
-**Exit gate:** solver reproduces every FITS/TIGHT/REFUSE verdict in `DECISIONS.md` §3 from
-first principles, and Phase-0's *measured* footprint lands inside its predicted range.
+**Exit gate:** ✅ solver reproduces every FITS/TIGHT/REFUSE verdict in `DECISIONS.md` §3 from
+first principles. ⏳ Still to confirm: that Phase 0's *measured* footprint lands inside the
+predicted range.
 
 ---
 

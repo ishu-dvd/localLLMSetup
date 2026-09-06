@@ -80,10 +80,40 @@ llama.cpp, llama-swap and gguf-parser. Not a new inference stack.
 
 ---
 
+## Try it now — the budget solver works today
+
+Phase 1 is built and tested. It needs no GPU, so you can run it anywhere:
+
+```powershell
+git clone https://github.com/ishu-dvd/localLLMSetup
+cd localLLMSetup
+$env:PYTHONPATH="src"
+python -m localllm.cli plan --slots 1 --context 32768
+```
+
+```
+Hardware : 8 GB VRAM, 16 GB RAM (windows)
+Usable   : 7.00 GB VRAM, 10.50 GB RAM (after driver/display and OS idle)
+
+model                     quant         wts     KV   VRAM    RAM   free  verdict
+KAT-Coder-V2.5-Dev        Q2_K_L      13.11   0.33   7.00   8.34  +2.16  OK
+KAT-Coder-V2.5-Dev        IQ3_XXS     14.87   0.33   7.00  10.10  +0.40  TIGHT
+gpt-oss-20b               MXFP4       12.11   0.39   7.00   7.40  +3.10  OK
+Qwen3-Coder-30B-A3B       Q3_K_M      14.71   1.57   0.00  11.18  -0.68  NO
+```
+
+Add `--slots 3` and it recomputes for three laptops — and tells you that 32K each needs
+`-c 98304`, not `-c 32768`. An impossible plan exits non-zero rather than recommending
+something that would page.
+
+Run the tests with `python -m pytest tests`.
+
+---
+
 ## Next step
 
-Phase 0 in [`docs/PLAN.md`](docs/PLAN.md) — an afternoon of measurement that can kill or
-redirect the whole project before any code is written. Highest-risk-first, deliberately.
+Phase 0 in [`docs/PLAN.md`](docs/PLAN.md) — an afternoon of measurement on the MSI that can
+kill or redirect the project. Highest-risk-first, deliberately.
 
 ---
 
