@@ -29,6 +29,8 @@ from localllm.verify import (
     Observed,
     Severity,
     compare,
+    parse_server_log,
+    read_server_log,
 )
 
 
@@ -330,3 +332,155 @@ class TestCalibrationValue:
     def test_the_report_prints_it_ready_to_paste(self) -> None:
         text = compare(verdict_for(), observed(compute_gb=0.82)).report()
         assert "COMPUTE_BUFFER_GB = 0.82" in text
+
+
+# --- Log parsing -----------------------------------------------------------
+# Every format string below was read from llama.cpp master rather than guessed:
+#
+#   src/llama-model.cpp     "%s: %12s model buffer size = %8.2f MiB\n"
+#                           "%s: offloaded %d/%d layers to GPU\n"
+#                           "%s: offloading %d repeating layers to GPU\n"
+#   src/llama-kv-cache.cpp  "%s: %10s KV buffer size = %8.2f MiB\n"
+#   src/llama-context.cpp   "%s: %10s compute buffer size = %8.2f MiB\n"
+#                           "%s: %10s  output buffer size = %8.2f MiB\n"
+#
+# Note the last two share a suffix, so anchoring on "buffer size" alone would
+# conflate them - and would also swallow the model and KV lines.
+
+VULKAN_LOG = """\
+build: 10819 (c7bda030) with MSVC 19.44 for x64
+llama_model_loader: loaded meta data with 36 key-value pairs and 459 tensors
+load_tensors: offloading 24 repeating layers to GPU
+load_tensors: offloading output layer to GPU
+load_tensors: offloaded 25/25 layers to GPU
+load_tensors:      Vulkan0 model buffer size =  5980.00 MiB
+load_tensors:   CPU_Mapped model buffer size =  6130.00 MiB
+llama_context: n_ctx = 32768
+llama_kv_cache:    Vulkan0 KV buffer size =   220.00 MiB
+llama_kv_cache_iswa:    Vulkan0 KV buffer size =   210.00 MiB
+llama_context:    Vulkan0 compute buffer size =   500.00 MiB
+llama_context:  CPU_Mapped  output buffer size =     0.77 MiB
+srv    load_model: loading model
+"""
+
+CPU_ONLY_LOG = """\
+build: 10819 (c7bda030) with MSVC 19.44 for x64
+load_tensors: offloaded 0/25 layers to GPU
+load_tensors:          CPU model buffer size = 12110.00 MiB
+llama_kv_cache:        CPU KV buffer size =   430.00 MiB
+llama_context:        CPU compute buffer size =   500.00 MiB
+"""
+
+
+class TestParseServerLog:
+    def test_splits_model_weights_by_device(self) -> None:
+        o = parse_server_log(VULKAN_LOG)
+        assert o.vram_model_gb == pytest.approx(5980 * 1024 * 1024 / 1e9, rel=0.01)
+        assert o.ram_model_gb == pytest.approx(6130 * 1024 * 1024 / 1e9, rel=0.01)
+
+    def test_converts_mib_to_gb_not_gib(self) -> None:
+        """llama.cpp prints MiB; the solver works in GB. Conflating the two is a
+        7% error in the unsafe direction."""
+        o = parse_server_log(VULKAN_LOG)
+        assert o.vram_model_gb == pytest.approx(6.270, abs=0.01)
+
+    def test_sums_both_kv_caches(self) -> None:
+        """gpt-oss interleaves sliding-window and global attention, so llama.cpp
+        keeps two caches and prints one line each, in the same format. Taking
+        only the first halves the observed KV."""
+        o = parse_server_log(VULKAN_LOG)
+        assert o.total_kv_gb == pytest.approx(430 * 1024 * 1024 / 1e9, rel=0.01)
+
+    def test_compute_buffer_is_not_confused_with_output_buffer(self) -> None:
+        """Both lines end '...buffer size = N MiB'. The output buffer is ~0.77
+        MiB, so mixing them up is silently almost-right."""
+        o = parse_server_log(VULKAN_LOG)
+        assert o.compute_gb == pytest.approx(500 * 1024 * 1024 / 1e9, rel=0.01)
+
+    def test_reads_the_offload_counts(self) -> None:
+        o = parse_server_log(VULKAN_LOG)
+        assert o.layers_offloaded == 25
+        assert o.layers_total == 25
+
+    def test_names_the_device_from_the_buffer_type(self) -> None:
+        """The Vulkan enumeration line is GGML_LOG_DEBUG, so it is absent at
+        default verbosity. The buffer type name is INFO and always present."""
+        o = parse_server_log(VULKAN_LOG)
+        assert o.device == "Vulkan0"
+        assert o.backend == "Vulkan"
+
+    def test_recognises_the_gpu_is_in_use(self) -> None:
+        assert parse_server_log(VULKAN_LOG).gpu_in_use is True
+
+
+class TestParseCpuFallback:
+    def test_no_gpu_device_is_detected(self) -> None:
+        o = parse_server_log(CPU_ONLY_LOG)
+        assert o.device is None
+        assert o.gpu_in_use is False
+
+    def test_all_weights_land_in_ram(self) -> None:
+        o = parse_server_log(CPU_ONLY_LOG)
+        assert o.vram_model_gb is None
+        assert o.ram_model_gb == pytest.approx(12110 * 1024 * 1024 / 1e9, rel=0.01)
+
+    def test_zero_offloaded_layers_is_read(self) -> None:
+        assert parse_server_log(CPU_ONLY_LOG).layers_offloaded == 0
+
+    def test_a_parsed_cpu_log_fails_comparison(self) -> None:
+        """End to end: the log a user would paste in, through to a refusal."""
+        c = compare(verdict_for(), parse_server_log(CPU_ONLY_LOG))
+        assert c.severity is Severity.FAIL
+        assert not c
+
+
+class TestParserRobustness:
+    def test_empty_log_yields_nothing_rather_than_zeroes(self) -> None:
+        """Zeroes would look like a real measurement of nothing."""
+        o = parse_server_log("")
+        assert o.vram_model_gb is None and o.layers_offloaded is None
+
+    def test_unrelated_text_is_ignored(self) -> None:
+        assert parse_server_log("hello\nworld\n").device is None
+
+    def test_tolerates_timestamp_prefixes(self) -> None:
+        """Some setups prefix every line; anchoring at line start would fail."""
+        prefixed = "\n".join(f"2026-09-06 12:00:00 | {ln}" for ln in VULKAN_LOG.splitlines())
+        o = parse_server_log(prefixed)
+        assert o.layers_offloaded == 25
+        assert o.vram_model_gb is not None
+
+    def test_is_case_insensitive_on_device_names(self) -> None:
+        o = parse_server_log("load_tensors:      vulkan0 model buffer size =  100.00 MiB\n")
+        assert o.backend == "Vulkan"
+
+    def test_cuda_and_rocm_are_recognised_as_gpus(self) -> None:
+        for name, backend in (("CUDA0", "CUDA"), ("ROCm0", "ROCm"), ("Metal", "Metal")):
+            o = parse_server_log(f"load_tensors: {name} model buffer size =  100.00 MiB\n")
+            assert o.backend == backend, name
+            assert o.vram_model_gb is not None
+
+    def test_cpu_variants_all_count_as_host_memory(self) -> None:
+        for name in ("CPU", "CPU_Mapped", "CPU_REPACK"):
+            o = parse_server_log(f"load_tensors: {name} model buffer size =  100.00 MiB\n")
+            assert o.ram_model_gb is not None, name
+            assert o.vram_model_gb is None, name
+
+    def test_expert_overrides_are_none_when_not_logged(self) -> None:
+        """Not yet confirmed against source, so it reports unknown rather than
+        a plausible guess - the comparison already tolerates None."""
+        assert parse_server_log(VULKAN_LOG).expert_layers_on_cpu is None
+
+
+class TestParseFile:
+    def test_reads_a_log_from_disk(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        p = tmp_path / "startup.log"
+        p.write_text(VULKAN_LOG, encoding="utf-8")
+        assert read_server_log(p).layers_offloaded == 25
+
+    def test_tolerates_undecodable_bytes(self, tmp_path) -> None:  # type: ignore[no-untyped-def]
+        """Windows console output is not reliably UTF-8, and a stray byte must
+        not lose an otherwise perfectly readable log."""
+        p = tmp_path / "startup.log"
+        p.write_bytes(VULKAN_LOG.encode("utf-8") + b"\xff\xfe bad bytes\n")
+        assert read_server_log(p).layers_offloaded == 25

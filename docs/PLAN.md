@@ -49,6 +49,42 @@ thrashing, **stop**. The premise is wrong and no amount of software fixes it.
 **Capture as golden fixtures** (these become Tier-1 test data, checked into the repo):
 `rx6600m_win11_devices.stderr.txt`, `llama-bench` output, `/props` JSON, startup log.
 
+**Automated by `localllm verify`** (Phase 1b). Rather than reading those logs by hand,
+save the startup log and run:
+
+```powershell
+llama-server ... 2> startup.log
+python -m localllm.cli verify --log startup.log --vram 8 --ram 16 --context 32768
+```
+
+It reports every prediction against what the server actually did, fails loudly on CPU
+fallback, and prints corrected constants ready to paste into `budget.py`. That turns
+Phase 0 from an afternoon of squinting at logs into one command with an exit code.
+
+---
+
+## Phase 1b — Verify the plan against reality 🔍 — ✅ **DONE** (needs a real log)
+
+**Goal:** stop every constant in `budget.py` being an unchecked assumption.
+
+The solver asserts a driver reserve, a Windows idle footprint, a compute buffer and a KV
+derivation. Nothing had ever compared one against a real run — and a solver that is
+confidently wrong is worse than none, because the user trusts the plan.
+
+llama.cpp states all of it in its own startup log, so the loop closes: predict, run, diff.
+
+| Property | Why it is built this way |
+|---|---|
+| **Asymmetric** | Over-predicting is safe — the plan ran with headroom left. Under-predicting is how a load fails or a machine pages. So over warns, under fails. |
+| **Absolute *and* relative thresholds** | An absolute rule alone is blind to small quantities being badly wrong. This project already shipped a KV derivation out by exactly 2×, and KV is under a gigabyte, so that bug moves it ~0.5 GB and slips past any sensible absolute threshold. |
+| **CPU fallback fails regardless of numbers** | The one outcome that looks like success from every other angle: starts, answers correctly, ~10× slower. Most guides recommend `HSA_OVERRIDE_GFX_VERSION`, a Linux variable and a silent no-op on Windows. |
+| **No calibration from a CPU run** | GPU reserves measured from a CPU run are nonsense; emitting them would bake it into the solver. |
+| **Pure comparison** | Testable without a GPU — the same split that made the GGUF parser verifiable without a model file. |
+
+**Exit gate (needs the MSI):** run it against a real startup log. Either the assumptions
+hold, or it prints the corrected constants — both are wins, and the second is the more
+valuable.
+
 ---
 
 ## Phase 1 — The budget solver 🎯 *the actual product; pure TDD* — ✅ **DONE**

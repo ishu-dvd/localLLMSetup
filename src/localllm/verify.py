@@ -28,8 +28,10 @@ everything decision-making is testable with a synthetic observation.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 
 from .budget import COMPUTE_BUFFER_GB, Verdict
 
@@ -178,6 +180,111 @@ class Comparison:
             lines += ["", "  Measured values to replace the assumptions in budget.py:"]
             lines += [f"    {k} = {v:.2f}" for k, v in sorted(self.calibration.items())]
         return "\n".join(lines)
+
+
+GPU_BUFFER_PREFIXES = ("Vulkan", "CUDA", "ROCm", "HIP", "Metal", "SYCL", "CANN", "OpenCL")
+"""Buffer-type name prefixes that mean device memory.
+
+The device is identified from the buffer-type name rather than from the Vulkan
+enumeration line, because that line is `GGML_LOG_DEBUG` and so absent at default
+verbosity — while `load_tensors: Vulkan0 model buffer size = ...` is INFO and
+always present. Reading the wrong one makes a working GPU look like a fallback.
+"""
+
+_MIB = 1024 * 1024
+
+
+def _classify(buftype: str) -> str | None:
+    """'Vulkan0' -> 'Vulkan', 'CPU_Mapped' -> None (host memory)."""
+    name = buftype.strip()
+    for prefix in GPU_BUFFER_PREFIXES:
+        if name.lower().startswith(prefix.lower()):
+            return prefix
+    return None
+
+
+def _mib_to_gb(mib: str) -> float:
+    return float(mib) * _MIB / 1_000_000_000
+
+
+_BUFFER = re.compile(
+    r"([A-Za-z0-9_]+)\s+(model|KV|compute|output)\s+buffer size\s*=\s*([0-9.]+)\s*MiB",
+    re.IGNORECASE,
+)
+"""One pattern for all four buffer lines.
+
+Capturing the *kind* is what keeps `compute buffer size` and `output buffer size`
+apart — they share a suffix, and the output buffer is under a megabyte, so
+conflating them is silently almost-right.
+"""
+
+_OFFLOADED = re.compile(r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers to GPU", re.IGNORECASE)
+
+
+def parse_server_log(text: str) -> Observed:
+    """Read what llama.cpp reported about its own allocations.
+
+    Pure: takes the log text, returns an observation. Anything it cannot find is
+    left as None rather than defaulted to zero, because zero is indistinguishable
+    from a real measurement of nothing.
+    """
+    vram_model = ram_model = kv = compute = 0.0
+    seen: set[str] = set()
+    device: str | None = None
+    backend: str | None = None
+
+    for raw in text.splitlines():
+        for buftype, kind, value in _BUFFER.findall(raw):
+            gpu = _classify(buftype)
+            size = _mib_to_gb(value)
+            kind = kind.lower()
+            if kind == "output":
+                continue  # tiny, and not part of any budget this project makes
+            if kind == "model":
+                if gpu:
+                    vram_model += size
+                    seen.add("vram_model")
+                    if device is None:
+                        device, backend = buftype, gpu
+                else:
+                    ram_model += size
+                    seen.add("ram_model")
+            elif kind == "kv":
+                # Sum every KV line: interleaved sliding-window models keep two
+                # caches and print one line each, in the same format.
+                kv += size
+                seen.add("kv")
+            elif kind == "compute" and gpu:
+                compute += size
+                seen.add("compute")
+
+        m = _OFFLOADED.search(raw)
+        if m:
+            seen.add("layers")
+            offloaded, total = int(m.group(1)), int(m.group(2))
+
+    return Observed(
+        device=device,
+        backend=backend,
+        vram_model_gb=vram_model if "vram_model" in seen else None,
+        ram_model_gb=ram_model if "ram_model" in seen else None,
+        kv_gb=kv if "kv" in seen else None,
+        compute_gb=compute if "compute" in seen else None,
+        layers_offloaded=offloaded if "layers" in seen else None,
+        layers_total=total if "layers" in seen else None,
+        # Tensor-override lines have not been confirmed against source, so this
+        # reports unknown rather than a plausible guess.
+        expert_layers_on_cpu=None,
+    )
+
+
+def read_server_log(path: str | Path) -> Observed:
+    """Parse a saved startup log.
+
+    Decoded leniently: Windows console output is not reliably UTF-8, and one
+    stray byte must not lose an otherwise perfectly readable log.
+    """
+    return parse_server_log(Path(path).read_text(encoding="utf-8", errors="replace"))
 
 
 def _compare_memory(
