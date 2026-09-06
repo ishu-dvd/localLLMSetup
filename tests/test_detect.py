@@ -26,7 +26,9 @@ MSI_RAM = 17_179_869_184  # 16 GiB
 
 # Real output captured from this session's Hyper-V VM on 2026-09-06.
 VM_REGISTRY = ""
-VM_CIM = "Name=Microsoft Hyper-V Video|AdapterRAM=\nName=Microsoft Remote Display Adapter|AdapterRAM=\n"
+VM_CIM = (
+    "Name=Microsoft Hyper-V Video|AdapterRAM=\nName=Microsoft Remote Display Adapter|AdapterRAM=\n"
+)
 
 
 # --- The uint32 trap --------------------------------------------------------

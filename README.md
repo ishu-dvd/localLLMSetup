@@ -128,15 +128,36 @@ python -m localllm.cli join --client cline --device laptop-1 `
 Writes ready-to-use config for **Cline**, **Aider** or **Octofriend**, with that device's
 key already in it and the context window pinned to the real per-slot budget.
 
+**Set it up to run 24/7** (refuses to generate anything until preflight passes):
+
+```powershell
+python -m localllm.cli up --llama-server C:\ai\llama-server.exe
+```
+
+```
+[PASS] budget: gpt-oss-20b:MXFP4 fits with 3.10 GB spare
+[FAIL] gpu: no physical GPU detected - llama.cpp would silently fall back to CPU
+       -> check the Vulkan build names your card in its startup log
+[FAIL] llama build: build unknown predates b10816 (commit c7bda030, 2026-09-03)
+       -> older builds silently take a slow Vulkan path with Q8_0 KV + flash
+          attention, costing ~45% of prefill - download a current release
+```
+
+On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
+`02-install-service.ps1` (NSSM, boot-start, restart-on-failure) and `03-watchdog.ps1`
+(alerts on page-file thrash, which is otherwise completely silent).
+
 | Phase | Status |
 |---|---|
 | 0 — prove the hardware | ⏳ **needs the MSI** |
 | 1 — budget solver | ✅ done, 27 tests, 9/9 mutations caught |
 | 2 — resolve open questions | ⏳ needs the MSI |
-| 3 — server as a service | 🚧 detection done (34 tests); service pending |
+| 3 — server as a service | ✅ done, 38 tests (reboot gate needs the MSI) |
 | 4 — per-device keys | ✅ done, 24 tests |
 | 5 — client onboarding | ✅ done, 33 tests |
 | 6 — prove under load | ⏳ needs the MSI |
+
+**157 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
 
 ---
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import secrets
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 KEY_PREFIX = "sk-localllm-"
@@ -31,7 +31,7 @@ _KEY_BYTES = 24
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def generate_key() -> str:
@@ -150,9 +150,9 @@ class KeyStore:
         for entry in active:
             safe = entry.device.replace(" ", "_")
             blocks += [
-                f"\t@{safe} header Authorization \"Bearer {entry.key}\"",
+                f'\t@{safe} header Authorization "Bearer {entry.key}"',
                 f"\thandle @{safe} {{",
-                f"\t\theader_up X-Device \"{entry.device}\"",
+                f'\t\theader_up X-Device "{entry.device}"',
                 "\t\treverse_proxy " + upstream + " {",
                 "\t\t\t# SSE must stream; never buffer an LLM response.",
                 "\t\t\tflush_interval -1",
@@ -164,7 +164,7 @@ class KeyStore:
         blocks += [
             "\t# Anything without a recognised device key is rejected.",
             "\thandle {",
-            "\t\trespond \"unauthorized\" 401",
+            '\t\trespond "unauthorized" 401',
             "\t}",
             "}",
         ]

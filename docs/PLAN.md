@@ -122,27 +122,59 @@ Each item in `DECISIONS.md` §9 becomes an experiment with a pre-registered deci
 
 ---
 
-## Phase 3 — Server as a service 🔌
+## Phase 3 — Server as a service 🔌 — ✅ **DONE** (live gates pending)
 
-**Tests first:**
+Implemented in `src/localllm/detect.py` and `src/localllm/serve.py`, 20 + 18 tests.
 
 ```
-test_service_autostarts_after_reboot
-test_service_restarts_after_kill
-test_preflight_refuses_when_model_exceeds_budget     # Phase 1 solver wired in
-test_preflight_asserts_lock_pages_privilege
-test_health_endpoint_returns_200
-test_startup_log_asserts_gpu_not_cpu                 # catch silent CPU fallback
-test_startup_log_asserts_n_ctx_slot_matches_intent   # catch the -c/-np trap
+localllm doctor                    # probe, and say what it can run
+localllm up --llama-server C:\ai\llama-server.exe
 ```
 
-Wire in: NSSM service, `powercfg` never-sleep + lid-close-do-nothing, `--metrics`,
-and the thrash watchdog (`\Memory\Pages Input/sec` > 50 sustained ⇒ Windows event log).
+`up` refuses to generate anything until preflight passes, then writes:
 
-**Exit gate:** reboot the MSI; without touching it, a client gets a completion within 2 min.
+| File | Purpose |
+|---|---|
+| `01-powercfg.ps1` | never sleep on AC; **lid close = do nothing** |
+| `02-install-service.ps1` | NSSM service, boot-start, restart-on-failure, log rotation |
+| `03-watchdog.ps1` | alerts on page-file thrash via `\Memory\Pages Input/sec` |
+| `llama-server-flags.txt` | the exact invocation from the solver |
 
-**🔴 Kill criterion:** if the service cannot survive reboot unattended, this is a manual tool,
-not a server — say so in the README rather than pretend.
+**Preflight gates the four silent failure modes:**
+
+| Check | Catches |
+|---|---|
+| budget | a plan that would page — REFUSE blocks startup, TIGHT warns |
+| gpu | **silent CPU fallback that looks like success** |
+| llama build | a build predating `c7bda030` — costs ~45% of prefill, warns about nothing |
+| lock pages | `SeLockMemoryPrivilege` missing, so `-lm mmap+mlock` degrades silently |
+| disk | insufficient space for the model |
+
+**Tests written first:**
+
+```
+test_stale_build_fails_preflight
+test_missing_gpu_fails_preflight
+test_missing_privilege_warns_when_weights_spill
+test_privilege_irrelevant_when_nothing_spills
+test_refused_plan_fails_preflight
+test_tight_plan_warns_but_starts
+test_preflight_is_falsy_on_failure          # `if preflight:` cannot start a bad server
+test_powercfg_makes_lid_close_a_no_op
+test_nssm_starts_on_boot_and_restarts_on_failure
+test_watchdog_monitors_hard_faults_not_the_memory_bar
+test_disk_probe_handles_a_path_that_does_not_exist_yet
+```
+
+That last one came from a real bug: `up` probes its own output directory *before*
+creating it, so the disk check reported "unknown" every time. It now walks up to
+the nearest existing ancestor.
+
+**Verified live on this GPU-less VM:** `up` failed preflight on `gpu` and
+`llama build`, printed actionable remedies, exited non-zero, and wrote nothing.
+
+**Exit gate:** ⏳ reboot the MSI and have a client get a completion within 2 min.
+Generation is done; the reboot test needs the machine.
 
 ---
 

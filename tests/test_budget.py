@@ -16,8 +16,8 @@ from localllm.catalogue import (
     GPT_OSS_20B,
     KAT_CODER_IQ3_XXS,
     KAT_CODER_Q2_K_L,
-    QWEN25_CODER_14B,
     QWEN3_CODER_30B_A3B,
+    QWEN25_CODER_14B,
 )
 
 # The reference machine: MSI Alpha, stock, no upgrades possible.
@@ -59,7 +59,9 @@ def test_kv_matches_researched_figures():
     # gpt-oss-20b: 12.0 KB/token/slot at q8_0 -> 0.39 GB at 32K, 1 slot.
     assert solve(MSI_ALPHA, GPT_OSS_20B, Plan(32_768, 1)).kv_gb == pytest.approx(0.39, abs=0.02)
     # Qwen2.5-Coder-14B: 96 KB/token -> 9.44 GB at 3x32K.
-    assert solve(MSI_ALPHA, QWEN25_CODER_14B, Plan(32_768, 3)).kv_gb == pytest.approx(9.44, abs=0.05)
+    assert solve(MSI_ALPHA, QWEN25_CODER_14B, Plan(32_768, 3)).kv_gb == pytest.approx(
+        9.44, abs=0.05
+    )
 
 
 def test_q4_kv_halves_cost_but_is_flagged():

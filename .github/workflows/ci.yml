@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Tier 0 + 1 from docs/PLAN.md: pure logic and golden fixtures.
+  # No GPU, no model files, no network - so these run everywhere.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest ruff
+
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Test
+        run: python -m pytest tests -v
+
+  # Tiers 2 and 3 (tiny-model E2E, and the real model on the MSI's GPU) are
+  # deliberately absent: they need hardware CI cannot provide. See docs/PLAN.md.

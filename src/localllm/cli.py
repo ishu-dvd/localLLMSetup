@@ -20,6 +20,15 @@ from .catalogue import CATALOGUE
 from .detect import detect
 from .join import SUPPORTED, build_client_config
 from .keys import DeviceExistsError, DeviceNotFoundError, KeyStore
+from .serve import (
+    preflight,
+    probe_free_disk_gb,
+    probe_llama_build,
+    probe_lock_pages_privilege,
+    render_nssm_script,
+    render_powercfg_script,
+    render_watchdog_script,
+)
 
 _MARK = {Fit.FITS: "OK  ", Fit.TIGHT: "TIGHT", Fit.REFUSE: "NO  "}
 DEFAULT_STORE = Path.home() / ".localllm" / "keys.json"
@@ -131,6 +140,70 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_up(args: argparse.Namespace) -> int:
+    """Preflight, then emit everything needed to run this 24/7."""
+    hw, notes = _hardware_from(args)
+    plan = Plan(
+        context_per_slot=args.context,
+        n_slots=args.slots,
+        kv_quant=args.kv_quant,
+        cram_mib=args.cram,
+    )
+    for n in notes:
+        print(f"note     : {n}")
+
+    verdict = recommend(hw, plan)
+    if verdict is None:
+        print("No model fits this plan. Reduce --context or --slots.", file=sys.stderr)
+        return 1
+
+    det = detect()
+    gpu_ok = any(not g.is_virtual and g.vram_gb for g in det.gpus)
+    build = probe_llama_build(args.llama_server) if args.llama_server else None
+
+    pf = preflight(
+        verdict,
+        llama_build=build,
+        free_disk_gb=probe_free_disk_gb(args.out),
+        has_lock_pages=probe_lock_pages_privilege(),
+        gpu_detected=gpu_ok,
+    )
+
+    print(f"Model    : {verdict.model.id}\n")
+    print(pf.report())
+    print()
+
+    if not pf:
+        print("Preflight failed - not generating a service definition.", file=sys.stderr)
+        print("Fix the FAIL items above and re-run.", file=sys.stderr)
+        return 1
+
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    flags = verdict.llama_server_flags()
+
+    written = {
+        "01-powercfg.ps1": render_powercfg_script(),
+        "02-install-service.ps1": render_nssm_script(
+            service_name=args.service_name,
+            exe_path=args.llama_server or r"C:\ai\llama-server.exe",
+            flags=flags,
+            working_dir=str(out.resolve()),
+            log_dir=str((out / "logs").resolve()),
+        ),
+        "03-watchdog.ps1": render_watchdog_script(),
+        "llama-server-flags.txt": flags + "\n",
+    }
+    for name, body in written.items():
+        (out / name).write_text(body, encoding="utf-8")
+        print(f"wrote {out / name}")
+
+    print("\nRun these as Administrator, in order:")
+    for name in ("01-powercfg.ps1", "02-install-service.ps1", "03-watchdog.ps1"):
+        print(f"  .\\{name}")
+    return 0
+
+
 def cmd_key(args: argparse.Namespace) -> int:
     store = KeyStore(args.store)
 
@@ -232,6 +305,13 @@ def main(argv: list[str] | None = None) -> int:
     plan = sub.add_parser("plan", help="show which models fit and how to run the best one")
     _add_plan_args(plan)
     plan.set_defaults(func=cmd_plan)
+
+    up = sub.add_parser("up", help="preflight, then generate the 24/7 service definition")
+    _add_plan_args(up)
+    up.add_argument("--llama-server", default=None, help="path to llama-server.exe")
+    up.add_argument("--service-name", default="localllm")
+    up.add_argument("--out", type=Path, default=Path("./deploy"))
+    up.set_defaults(func=cmd_up)
 
     key = sub.add_parser("key", help="issue, list and revoke per-device API keys")
     key.add_argument("--store", type=Path, default=DEFAULT_STORE)
