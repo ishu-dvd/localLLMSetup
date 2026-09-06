@@ -123,3 +123,94 @@ class TestKeyLifecycle:
     ) -> None:
         store = str(tmp_path / "keys.json")  # type: ignore[operator]
         assert run(["key", "--store", store, "revoke", "nobody"], capsys)[0] != 0
+
+
+class TestCheckCommandWiring:
+    """The argparse wiring for `check` had no test, and a missing `--api`
+    argument crashed the command while 522 unit tests stayed green.
+
+    Unit tests covered the diagnosis logic thoroughly and the plumbing not at
+    all. These monkeypatch the network layer so the wiring is exercised without
+    a socket.
+    """
+
+    @staticmethod
+    def _fake_probe(responses: dict[str, object]):  # type: ignore[no-untyped-def]
+        from localllm.client import Probe
+
+        def fake(url: str, api_key: str | None = None, timeout: float = 10.0, json_body=None):  # type: ignore[no-untyped-def]
+            for fragment, body in responses.items():
+                if fragment in url:
+                    return Probe(url=url, status=200, body=body)
+            return Probe(url=url, status=404)
+
+        return fake
+
+    def _patch(self, monkeypatch: pytest.MonkeyPatch, alias: str = "claude-local-coder") -> None:
+        monkeypatch.setattr(
+            "localllm.cli.probe",
+            self._fake_probe(
+                {
+                    "/health": {"status": "ok"},
+                    "/v1/models": {"data": [{"id": alias}]},
+                    "/slots": [{"id": 0}],
+                    "/v1/chat/completions": {"choices": [{"message": {"content": "ok"}}]},
+                    "/v1/messages": {"content": [{"type": "text", "text": "ok"}]},
+                }
+            ),
+        )
+
+    def test_a_healthy_server_passes(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._patch(monkeypatch)
+        code, out = run(["check", "--server", "http://s:8080", "--api-key", "k"], capsys)
+        assert code == 0
+        assert "All checks passed" in out
+
+    def test_the_api_flag_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The exact wiring that was missing."""
+        self._patch(monkeypatch)
+        code, out = run(
+            ["check", "--server", "http://s:8080", "--api-key", "k", "--api", "anthropic"],
+            capsys,
+        )
+        assert code == 0
+        assert "anthropic" in out
+
+    def test_openai_is_the_default(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._patch(monkeypatch)
+        _, out = run(["check", "--server", "http://s:8080", "--api-key", "k"], capsys)
+        assert "openai" in out
+
+    def test_a_non_claude_alias_passes_on_openai_but_fails_on_anthropic(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The same server, opposite verdicts - and both correct."""
+        self._patch(monkeypatch, alias="gpt-oss-20b")
+        args = ["check", "--server", "http://s:8080", "--api-key", "k", "--model", "gpt-oss-20b"]
+        assert run(args, capsys)[0] == 0
+        assert run([*args, "--api", "anthropic"], capsys)[0] == 1
+
+    def test_no_inference_skips_the_generation_step(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._patch(monkeypatch)
+        _, out = run(
+            ["check", "--server", "http://s:8080", "--api-key", "k", "--no-inference"], capsys
+        )
+        assert "generates a completion" not in out
+
+    def test_a_v1_suffix_in_the_server_url_is_stripped(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Clients are configured with the /v1 base, so users will paste it -
+        and doubling it would make every path 404."""
+        self._patch(monkeypatch)
+        _, out = run(["check", "--server", "http://s:8080/v1", "--api-key", "k"], capsys)
+        assert "/v1/v1" not in out
+        assert "All checks passed" in out

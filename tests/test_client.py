@@ -19,6 +19,7 @@ import pytest
 
 from localllm.client import (
     PUBLIC_ENDPOINTS,
+    Api,
     Outcome,
     Probe,
     ProbeError,
@@ -168,9 +169,11 @@ class TestModelVisibility:
         assert f.outcome is Outcome.MODEL_NOT_FOUND
         assert "claude-local-coder" in f.detail
 
-    def test_an_alias_without_claude_warns_even_when_it_matches(self) -> None:
+    def test_an_alias_without_claude_is_only_a_problem_on_the_anthropic_path(self) -> None:
+        """The rule is not universal, and applying it everywhere failed a
+        perfectly good OpenAI setup. See TestAliasRuleIsApiSpecific."""
         listing = {"data": [{"id": "local-coder"}]}
-        f = check_model_visibility(listing, wanted="local-coder")
+        f = check_model_visibility(listing, wanted="local-coder", api=Api.ANTHROPIC)
         assert f.outcome is Outcome.ALIAS_NOT_CLAUDE_COMPATIBLE
         assert "claude" in f.fix.lower()
 
@@ -427,3 +430,102 @@ class TestInferenceProbe:
         returns 500 rather than 400."""
         f = check_inference(Probe(url="http://s/v1/chat/completions", status=500))
         assert f.outcome is Outcome.SERVER_ERROR
+
+
+# --- Which API is the client actually speaking? ----------------------------
+# The alias rule is NOT universal. docs/DECISIONS.md recommends Cline, Aider and
+# Octofriend, all of which speak the OpenAI API and match the model id exactly -
+# they do not care what it is called. The `claude` substring only matters to
+# Claude-compatible tooling on the Anthropic path, which the decision record
+# explicitly does NOT recommend.
+#
+# So failing an OpenAI setup because its alias lacks `claude` fails a perfectly
+# good configuration for a rule that does not apply to it.
+
+
+class TestAliasRuleIsApiSpecific:
+    OPENAI_LIST = {"data": [{"id": "gpt-oss-20b"}]}
+
+    def test_an_openai_client_does_not_need_a_claude_alias(self) -> None:
+        f = check_model_visibility(self.OPENAI_LIST, wanted="gpt-oss-20b", api=Api.OPENAI)
+        assert f.outcome is Outcome.OK
+        assert f
+
+    def test_an_anthropic_client_does(self) -> None:
+        f = check_model_visibility(self.OPENAI_LIST, wanted="gpt-oss-20b", api=Api.ANTHROPIC)
+        assert f.outcome is Outcome.ALIAS_NOT_CLAUDE_COMPATIBLE
+        assert not f
+
+    def test_openai_is_the_default_because_it_is_the_recommended_path(self) -> None:
+        assert check_model_visibility(self.OPENAI_LIST, wanted="gpt-oss-20b").outcome is Outcome.OK
+
+    def test_a_missing_model_still_fails_on_either_api(self) -> None:
+        for api in (Api.OPENAI, Api.ANTHROPIC):
+            f = check_model_visibility(self.OPENAI_LIST, wanted="nope", api=api)
+            assert f.outcome is Outcome.MODEL_NOT_FOUND, api
+
+    def test_an_openai_pass_still_names_the_model(self) -> None:
+        f = check_model_visibility(self.OPENAI_LIST, wanted="gpt-oss-20b", api=Api.OPENAI)
+        assert "gpt-oss-20b" in f.detail
+
+
+class TestAnthropicInference:
+    """`/v1/messages` is a translation shim: Anthropic JSON in, converted to
+    OpenAI chat-completions, inferred, and returned Anthropic-shaped. So the
+    response has `content`, not `choices` - checking for the wrong one would
+    call a working Anthropic endpoint broken.
+    """
+
+    GOOD = {"role": "assistant", "content": [{"type": "text", "text": "ok"}]}
+
+    def test_an_anthropic_shaped_response_is_accepted(self) -> None:
+        p = Probe(url="http://s/v1/messages", status=200, body=self.GOOD)
+        assert check_inference(p, api=Api.ANTHROPIC)
+
+    def test_an_openai_shaped_response_on_the_anthropic_path_is_rejected(self) -> None:
+        p = Probe(url="http://s/v1/messages", status=200, body={"choices": [{"message": {}}]})
+        assert not check_inference(p, api=Api.ANTHROPIC)
+
+    def test_an_empty_content_list_is_a_failure(self) -> None:
+        p = Probe(url="http://s/v1/messages", status=200, body={"content": []})
+        assert not check_inference(p, api=Api.ANTHROPIC)
+
+    def test_the_openai_check_is_unaffected(self) -> None:
+        p = Probe(url="http://s/v1/chat/completions", status=200, body={"choices": [{}]})
+        assert check_inference(p, api=Api.OPENAI)
+
+    def test_a_no_jinja_server_is_diagnosed_precisely(self) -> None:
+        """500 'tools param requires --jinja flag'. Rare, since jinja defaults
+        on - but only reachable via --no-jinja, so the fix is exact rather than
+        a generic 'read the server log'."""
+        p = Probe(
+            url="http://s/v1/messages",
+            status=500,
+            body={
+                "error": {
+                    "code": 500,
+                    "message": "tools param requires --jinja flag",
+                    "type": "server_error",
+                }
+            },
+        )
+        d = diagnose(p)
+        assert d.outcome is Outcome.NOT_ENABLED
+        assert "--no-jinja" in d.fix or "jinja" in d.fix.lower()
+
+    def test_an_ordinary_500_is_still_generic(self) -> None:
+        d = diagnose(Probe(url="http://s/v1/messages", status=500, body={"error": {}}))
+        assert d.outcome is Outcome.SERVER_ERROR
+
+
+class TestApiEndpoints:
+    def test_each_api_knows_its_own_completion_path(self) -> None:
+        assert Api.OPENAI.completion_path == "/v1/chat/completions"
+        assert Api.ANTHROPIC.completion_path == "/v1/messages"
+
+    def test_each_api_builds_its_own_request_shape(self) -> None:
+        """Anthropic requires max_tokens; OpenAI treats it as optional."""
+        oai = Api.OPENAI.probe_body("m")
+        ant = Api.ANTHROPIC.probe_body("m")
+        assert "messages" in oai and "messages" in ant
+        assert "max_tokens" in ant, "the Anthropic API rejects a request without it"

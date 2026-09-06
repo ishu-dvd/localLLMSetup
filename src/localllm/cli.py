@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .budget import Fit, Hardware, Plan, recommend, solve
 from .catalogue import CATALOGUE, model_from_gguf
-from .client import Outcome, check_inference, check_model_visibility, diagnose, probe
+from .client import Api, Outcome, check_inference, check_model_visibility, diagnose, probe
 from .detect import detect
 from .gguf import GgufError, read_gguf_file, read_gguf_url
 from .join import SUPPORTED, build_client_config
@@ -305,8 +305,9 @@ def cmd_check(args: argparse.Namespace) -> int:
     base = args.server.rstrip("/")
     if base.endswith("/v1"):
         base = base[: -len("/v1")]
+    api = Api(args.api)
 
-    print(f"Checking {base} from this laptop\n")
+    print(f"Checking {base} from this laptop, as a {api.value} client\n")
     steps = [
         ("reachable and healthy", f"{base}/health", False),
         ("API key accepted", f"{base}/v1/models", True),
@@ -331,7 +332,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             listing = result.body
 
     if listing is not None:
-        finding = check_model_visibility(listing, wanted=args.model)
+        finding = check_model_visibility(listing, wanted=args.model, api=api)
         mark = "ok  " if finding else "FAIL"
         print(f"  [{mark}] model is visible to the client")
         print(f"         {finding.detail}")
@@ -355,17 +356,12 @@ def cmd_check(args: argparse.Namespace) -> int:
     if worst == 0 and not args.no_inference:
         # The only check that exercises the path a coding agent actually uses.
         result = probe(
-            f"{base}/v1/chat/completions",
+            f"{base}{api.completion_path}",
             api_key=args.api_key,
-            json_body={
-                "model": args.model,
-                "messages": [{"role": "user", "content": "Reply with the word ok."}],
-                "max_tokens": 8,
-                "stream": False,
-            },
+            json_body=api.probe_body(args.model),
             timeout=args.inference_timeout,
         )
-        finding = check_inference(result)
+        finding = check_inference(result, api=api)
         mark = "ok  " if finding else "FAIL"
         print(f"  [{mark}] the server generates a completion")
         print(f"         {finding.detail}")
@@ -593,6 +589,12 @@ def main(argv: list[str] | None = None) -> int:
         "--model",
         default="claude-local-coder",
         help="the model id the client is configured for",
+    )
+    check.add_argument(
+        "--api",
+        choices=[a.value for a in Api],
+        default=Api.OPENAI.value,
+        help="which API the client speaks; openai is the recommended path",
     )
     check.add_argument(
         "--no-inference",

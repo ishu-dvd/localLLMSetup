@@ -66,6 +66,47 @@ class ProbeError(Enum):
     OTHER = "other"
 
 
+class Api(Enum):
+    """Which HTTP dialect the client speaks — and it changes what "working" means.
+
+    `docs/DECISIONS.md` recommends Cline, Aider and Octofriend, all of which use
+    the **OpenAI** API and match the model id exactly. It explicitly does *not*
+    recommend Claude Code. So the `claude` alias rule applies only to the
+    Anthropic path, and enforcing it on an OpenAI setup would fail a perfectly
+    good configuration for a rule that does not apply to it.
+
+    The two paths also differ in response shape: `/v1/messages` is a translation
+    shim that returns Anthropic-shaped output, so it answers with `content`
+    rather than `choices`. Checking for the wrong key calls a working endpoint
+    broken.
+    """
+
+    OPENAI = "openai"
+    ANTHROPIC = "anthropic"
+
+    @property
+    def completion_path(self) -> str:
+        return "/v1/messages" if self is Api.ANTHROPIC else "/v1/chat/completions"
+
+    @property
+    def response_key(self) -> str:
+        return "content" if self is Api.ANTHROPIC else "choices"
+
+    @property
+    def requires_claude_alias(self) -> bool:
+        return self is Api.ANTHROPIC
+
+    def probe_body(self, model: str) -> dict[str, Any]:
+        """The smallest request that exercises generation on this API."""
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply with the word ok."}],
+            "max_tokens": 8,
+            "stream": False,
+        }
+        return body
+
+
 class Outcome(Enum):
     OK = "OK"
     UNREACHABLE = "UNREACHABLE"
@@ -198,6 +239,16 @@ def diagnose(probe: Probe) -> Finding:
         )
 
     if status >= 500:
+        message = str(_error_field(probe.body, "message") or "")
+        if "jinja" in message.lower():
+            return Finding(
+                Outcome.NOT_ENABLED,
+                f"{probe.url} rejected the request because tool calling needs the "
+                f"chat template: '{message}'",
+                "the server was started with --no-jinja. Jinja is on by default, "
+                "so remove that flag - without it the Anthropic path cannot pass "
+                "tools, which is most of what a coding agent does",
+            )
         return Finding(
             Outcome.SERVER_ERROR,
             f"{probe.url} returned {status}",
@@ -242,7 +293,7 @@ def _diagnose_transport(probe: Probe) -> Finding:
     )
 
 
-def check_model_visibility(listing: Any, wanted: str | None) -> Finding:
+def check_model_visibility(listing: Any, wanted: str | None, api: Api = Api.OPENAI) -> Finding:
     """Will the client actually see a usable model?
 
     This check carries more weight than it looks, because **the server will not
@@ -251,11 +302,9 @@ def check_model_visibility(listing: Any, wanted: str | None) -> Finding:
     config produces correct-looking output from a differently-named model, and
     nothing anywhere reports a problem.
 
-    Two separate failures wear the same disguise — an empty model picker:
-
-    * the id the client asks for is not served
-    * the id is served but lacks ``claude``, so a Claude-compatible client
-      filters it out before showing it to anyone
+    The `claude` alias rule is applied only on the Anthropic path. OpenAI-style
+    clients — which is all three this project recommends — match the id exactly
+    and do not care what it is called.
     """
     if not isinstance(listing, dict) or not isinstance(listing.get("data"), list):
         return Finding(
@@ -282,7 +331,7 @@ def check_model_visibility(listing: Any, wanted: str | None) -> Finding:
         )
 
     checked = wanted if wanted is not None else ids[0]
-    if CLAUDE_ALIAS_SUBSTRING not in checked.lower():
+    if api.requires_claude_alias and CLAUDE_ALIAS_SUBSTRING not in checked.lower():
         return Finding(
             Outcome.ALIAS_NOT_CLAUDE_COMPATIBLE,
             f"the model is served as '{checked}', which does not contain "
@@ -295,13 +344,16 @@ def check_model_visibility(listing: Any, wanted: str | None) -> Finding:
     return Finding(Outcome.OK, f"the server offers '{checked}'")
 
 
-def check_inference(result: Probe) -> Finding:
+def check_inference(result: Probe, api: Api = Api.OPENAI) -> Finding:
     """Did the server actually generate something?
 
     A listed model proves llama-server started. It does not prove a request will
     succeed — the chat template can throw, the prompt can exceed the slot, or a
     proxy can return a cheerful 200 containing an HTML error page. This is the
     only check that exercises the path a coding agent actually uses.
+
+    The expected shape depends on the API: `/v1/messages` returns Anthropic
+    output (`content`), `/v1/chat/completions` returns OpenAI output (`choices`).
     """
     finding = diagnose(result)
     if not finding:
@@ -316,13 +368,14 @@ def check_inference(result: Probe) -> Finding:
             "check the base URL points at llama-server itself",
         )
 
-    choices = body.get("choices")
-    if not isinstance(choices, list) or not choices:
+    generated = body.get(api.response_key)
+    if not isinstance(generated, list) or not generated:
         return Finding(
             Outcome.SERVER_ERROR,
-            "the server answered 200 but generated no completion",
-            "check the server log - the model is loaded but produced nothing, "
-            "which usually means the chat template rejected the request",
+            f"the server answered 200 but the response has no '{api.response_key}' "
+            f"content, which is what the {api.value} API returns",
+            "check the server log, and that the base URL matches the API the "
+            "client speaks - the two endpoints return different shapes",
         )
 
     return Finding(Outcome.OK, "the server generated a completion")
