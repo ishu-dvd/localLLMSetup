@@ -330,4 +330,3 @@ class TestCalibrationValue:
     def test_the_report_prints_it_ready_to_paste(self) -> None:
         text = compare(verdict_for(), observed(compute_gb=0.82)).report()
         assert "COMPUTE_BUFFER_GB = 0.82" in text
-
