@@ -35,13 +35,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-CLAUDE_ALIAS_SUBSTRING = "claude"
-"""What Claude-compatible clients filter model IDs on.
-
-Not a convention this project invented — it is why `-a claude-local-coder`
-exists. An alias without it produces a client that connects perfectly and offers
-no models.
-"""
+from .constants import CLAUDE_ALIAS_SUBSTRING
 
 PUBLIC_ENDPOINTS = ("/health", "/v1/health", "/")
 """The only paths exempt from the API key check.

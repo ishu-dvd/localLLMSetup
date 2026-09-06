@@ -18,6 +18,7 @@ from pathlib import Path
 from .budget import Fit, Hardware, Plan, recommend, solve
 from .catalogue import CATALOGUE, model_from_gguf
 from .client import Api, Outcome, check_inference, check_model_visibility, diagnose, probe
+from .constants import MODEL_ALIAS
 from .detect import detect
 from .gguf import GgufError, read_gguf_file, read_gguf_url
 from .join import SUPPORTED, build_client_config
@@ -541,7 +542,14 @@ def _add_plan_args(p: argparse.ArgumentParser) -> None:
     )
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI without running anything.
+
+    Separate from `main` so the wiring can be inspected and tested on its own.
+    It was previously built inline, which meant every subcommand's arguments
+    could only be exercised by executing that subcommand — and a missing `--api`
+    argument once crashed a command while the whole unit suite stayed green.
+    """
     parser = argparse.ArgumentParser(
         prog="localllm",
         description="Run one coding model on one laptop; use it from the others.",
@@ -634,13 +642,17 @@ def main(argv: list[str] | None = None) -> int:
     join.add_argument("--client", required=True, choices=list(SUPPORTED))
     join.add_argument("--device", required=True)
     join.add_argument("--url", required=True, help="e.g. http://msi.tailnet.ts.net:8080")
-    join.add_argument("--model", default="claude-local-coder")
+    join.add_argument("--model", default=MODEL_ALIAS)
     join.add_argument("--context", type=int, default=32768)
     join.add_argument("--out", type=Path, default=Path("."))
     join.add_argument("--store", type=Path, default=DEFAULT_STORE)
     join.set_defaults(func=cmd_join)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     return int(args.func(args))
 
 

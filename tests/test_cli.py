@@ -14,7 +14,11 @@ from __future__ import annotations
 
 import pytest
 
+from localllm.budget import Hardware, Plan, solve
+from localllm.catalogue import GPT_OSS_20B
 from localllm.cli import main
+from localllm.constants import CLAUDE_ALIAS_SUBSTRING, MODEL_ALIAS
+from localllm.join import build_client_config
 
 
 def run(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str]:
@@ -214,3 +218,132 @@ class TestCheckCommandWiring:
         _, out = run(["check", "--server", "http://s:8080/v1", "--api-key", "k"], capsys)
         assert "/v1/v1" not in out
         assert "All checks passed" in out
+
+
+class TestModelAliasIsStatedOnce:
+    """The alias appeared verbatim in three places: the server flag in
+    budget.py, and the defaults for both `join` and `check`.
+
+    Nothing kept them consistent, and drift would be near-undetectable: in
+    single-model mode llama.cpp never validates the requested model name - it
+    accepts anything and echoes it back (docs/research/http-api.md). So a client
+    configured for a stale alias gets correct-looking output and no error, from
+    a server that was never asked for that model at all.
+    """
+
+    def test_the_server_flag_uses_the_shared_constant(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        flags = solve(hw, GPT_OSS_20B, Plan(8192)).llama_server_flags()
+        assert f"-a {MODEL_ALIAS}" in flags
+
+    def test_join_defaults_to_the_same_alias(self) -> None:
+        parser_default = _default_for("join", "--model")
+        assert parser_default == MODEL_ALIAS
+
+    def test_check_defaults_to_the_same_alias(self) -> None:
+        assert _default_for("check", "--model") == MODEL_ALIAS
+
+    def test_the_alias_satisfies_the_anthropic_filter(self) -> None:
+        """It only earns its awkward name by containing the substring that
+        Claude-compatible clients filter on. If it ever stops doing so, the
+        reason for choosing it has gone."""
+        assert CLAUDE_ALIAS_SUBSTRING in MODEL_ALIAS.lower()
+
+    def test_a_client_configured_from_the_defaults_matches_the_server(self) -> None:
+        """End to end on the thing that actually matters: the id the generated
+        client config asks for must be the id the generated server flags serve."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        flags = solve(hw, GPT_OSS_20B, Plan(8192)).llama_server_flags()
+        served = flags.split("-a ")[1].split()[0]
+        config = build_client_config(
+            client="cline", base_url="http://s:8080", api_key="k", model=MODEL_ALIAS, context=8192
+        )
+        assert served == MODEL_ALIAS
+        assert MODEL_ALIAS in config.content
+
+
+def _default_for(command: str, flag: str) -> object:
+    """Read a subcommand's declared default without invoking it."""
+    import argparse
+
+    from localllm.cli import build_parser
+
+    parser = build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction)).choices[
+        command
+    ]
+    return next(a for a in sub._actions if flag in a.option_strings).default
+
+
+class TestEverySubcommandIsWired:
+    """The `--api` crash happened because argparse wiring had no test at all.
+
+    That was not a one-off gap: four of eight commands had none. This checks the
+    structural invariants for every subcommand at once, so a new one cannot be
+    added with a handler that does not exist or arguments nothing reads.
+    """
+
+    @staticmethod
+    def _subparsers() -> dict[str, object]:
+        import argparse
+
+        from localllm.cli import build_parser
+
+        parser = build_parser()
+        action = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        return dict(action.choices)
+
+    def test_every_command_has_a_handler(self) -> None:
+        for name, sub in self._subparsers().items():
+            assert callable(sub.get_default("func")), f"{name} has no func"
+
+    def test_every_command_offers_help(self) -> None:
+        """A command with no help text is invisible in `--help`.
+
+        Key's sub-actions are nested under `key` and documented there, so only
+        the top-level surface is checked.
+        """
+        import argparse
+
+        from localllm.cli import build_parser
+
+        action = next(
+            a for a in build_parser()._actions if isinstance(a, argparse._SubParsersAction)
+        )
+        documented = {c.dest for c in action._choices_actions if c.help}
+        for name in ("doctor", "plan", "speed", "verify", "up", "key", "join", "check"):
+            assert name in documented, f"{name} has no help text"
+
+    def test_the_expected_commands_all_exist(self) -> None:
+        """Pins the surface, so a command cannot silently disappear."""
+        expected = {"doctor", "plan", "speed", "verify", "up", "key", "join", "check"}
+        assert expected <= set(self._subparsers())
+
+    def test_every_command_parses_its_own_help(self) -> None:
+        """Exercises each subparser's full argument construction - the exact
+        step that was never run for `check`."""
+        for name, sub in self._subparsers().items():
+            with pytest.raises(SystemExit) as exc:
+                sub.parse_args(["--help"])
+            assert exc.value.code == 0, name
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["doctor", "--vram", "8", "--ram", "16"],
+            ["plan", "--vram", "8", "--ram", "16"],
+            ["speed", "--vram", "8", "--ram", "16"],
+            ["verify", "--vram", "8", "--ram", "16", "--log", "x.log"],
+            ["up", "--vram", "8", "--ram", "16"],
+            ["check", "--server", "http://s:8080"],
+            ["join", "--client", "cline", "--device", "d", "--url", "http://s:8080"],
+            ["key", "add", "d"],
+        ],
+    )
+    def test_a_representative_invocation_parses(self, argv: list[str]) -> None:
+        """Parsing only - no handler runs. Catches a required argument that the
+        handler reads but the parser never declared."""
+        from localllm.cli import build_parser
+
+        args = build_parser().parse_args(argv)
+        assert callable(args.func)

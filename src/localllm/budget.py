@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .catalogue import CATALOGUE, Model
+from .constants import MODEL_ALIAS
 from .speed import DecodeEstimate, estimate_decode
 
 # --- Reserves, derived from the research -----------------------------------
@@ -279,7 +280,7 @@ class Verdict:
         )
         parts = [
             f"-m {model_path}",
-            "-a claude-local-coder",  # clients filter IDs lacking "claude"
+            f"-a {MODEL_ALIAS}",  # Anthropic-path clients filter IDs lacking "claude"
             "--host 0.0.0.0 --port 8080",
             "--device Vulkan0",
             self._offload_flags(),
