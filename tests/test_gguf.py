@@ -211,6 +211,20 @@ def test_kv_head_count_ignores_the_zeros():
     assert parse_gguf_header(HYBRID).n_kv_heads == 2
 
 
+def test_kv_head_count_takes_the_largest_not_the_first():
+    """If layers differ, the largest is the safe choice - it overstates KV.
+    Taking the first entry would understate it on a model like this."""
+    raw = build_gguf(
+        "x",
+        {
+            "x.block_count": 4,
+            "x.attention.head_count_kv": [0, 2, 8, 0],
+            "x.attention.key_length": 64,
+        },
+    )
+    assert parse_gguf_header(raw).n_kv_heads == 8
+
+
 def test_hybrid_kv_is_far_cheaper_than_if_all_layers_counted():
     md = parse_gguf_header(HYBRID)
     naive = 2 * md.n_layers * md.n_kv_heads * md.head_dim
@@ -305,6 +319,26 @@ def test_dense_gb_is_measured_not_estimated():
 def test_dense_plus_expert_accounts_for_all_tensor_bytes():
     md = parse_gguf_header(MOE_TENSORS, file_size_bytes=20_000)
     assert sum(md.tensor_sizes().values()) == 20_000 - md.data_offset
+
+
+def test_tensor_data_starts_at_an_aligned_offset():
+    """GGUF pads between the header and the tensor data. Ignoring that padding
+    silently misattributes those bytes to the last tensor."""
+    md = parse_gguf_header(MOE_TENSORS, file_size_bytes=20_000)
+    alignment = 32
+    assert md.data_offset > 0
+    assert md.data_offset % alignment == 0
+    assert md.data_offset >= len(MOE_TENSORS) - alignment
+
+
+def test_alignment_key_is_honoured():
+    raw = build_gguf(
+        "x",
+        {"x.block_count": 1, "x.attention.head_count_kv": 8, "general.alignment": 64},
+        tensors=[("a.weight", 0), ("b.weight", 100)],
+    )
+    md = parse_gguf_header(raw, file_size_bytes=10_000)
+    assert md.data_offset % 64 == 0
 
 
 def test_dense_gb_unavailable_without_file_size():
