@@ -167,6 +167,17 @@ class TestModelVisibility:
         f = check_model_visibility({"data": []}, wanted="anything")
         assert f.outcome is Outcome.MODEL_NOT_FOUND
 
+    def test_an_empty_list_with_no_requested_model_does_not_crash(self) -> None:
+        """The path with no other branch to fall through to.
+
+        With a `wanted` set, an empty list is caught by the not-served check. With
+        none, the code would reach for the first advertised id — of which there
+        is none.
+        """
+        f = check_model_visibility({"data": []}, wanted=None)
+        assert f.outcome is Outcome.MODEL_NOT_FOUND
+        assert not f
+
     def test_a_malformed_listing_is_not_a_crash(self) -> None:
         """A proxy returning HTML instead of JSON must produce a diagnosis, not
         a traceback."""
