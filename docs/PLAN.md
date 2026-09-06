@@ -81,7 +81,20 @@ llama.cpp states all of it in its own startup log, so the loop closes: predict, 
 | **No calibration from a CPU run** | GPU reserves measured from a CPU run are nonsense; emitting them would bake it into the solver. |
 | **Pure comparison** | Testable without a GPU — the same split that made the GGUF parser verifiable without a model file. |
 
-**Exit gate (needs the MSI):** run it against a real startup log. Either the assumptions
+**Already paid for itself, before ever seeing the MSI.** Run against a real Vulkan log of
+gpt-oss-20b (`tests/fixtures/gpt-oss-20b-vulkan-ncmoe.log`, from the log-format research),
+every parsed field matched the log exactly — and it immediately refuted a solver constant:
+
+| | assumed | measured |
+|---|---|---|
+| compute buffer | 0.50 GB, flat | **1.03 GB at `-ub 512`**, and linear in `-ub` |
+
+Twice the assumption, in the direction that under-reserves VRAM. `KAT-Coder IQ3_XXS` now
+**refuses** where it was offered as TIGHT — a plan that would have paged. `gpt-oss-20b`
+still fits at 32K with 1.48 GB spare, which is the check on over-conservatism: a reserve
+raised until nothing fits is a broken solver, not a careful one.
+
+**Exit gate (needs the MSI):** run it against a log from that machine. Either the assumptions
 hold, or it prints the corrected constants — both are wins, and the second is the more
 valuable.
 
