@@ -43,13 +43,17 @@ exists. An alias without it produces a client that connects perfectly and offers
 no models.
 """
 
-PUBLIC_ENDPOINTS = ("/health", "/v1/health")
+PUBLIC_ENDPOINTS = ("/health", "/v1/health", "/")
 """The only paths exempt from the API key check.
 
 Verified in `tools/server/server-http.cpp` (`get_public_endpoints`), which holds
-exactly these two plus the embedded UI assets. That is what lets reachability be
+exactly these plus the embedded UI assets. That is what lets reachability be
 tested separately from authentication: a `/health` probe needs no key, so a
 failure there is unambiguously the network rather than the credentials.
+
+Note the ordering constraint that follows from it — `middleware_server_state`
+runs **before** the key check, so while the model is loading *every* path
+answers 503 regardless of the key. Auth cannot be tested until `/health` is 200.
 """
 
 DEFAULT_TIMEOUT_S = 10.0
@@ -124,15 +128,16 @@ def diagnose(probe: Probe) -> Finding:
     if status in (401, 403):
         return Finding(
             Outcome.UNAUTHORISED,
-            f"{probe.url} rejected the API key ({status}). llama.cpp reads "
-            f"'Authorization', and falls back to 'X-Api-Key' ONLY when "
-            f"'Authorization' is empty - so a client that sends a wrong or "
-            f"blank 'Authorization' alongside a correct 'x-api-key' still fails, "
-            f"because the fallback never fires",
-            r"check the key matches a line in --api-key-file exactly. The server "
-            r"compares whole strings with no trimming, so a stray '\r' from a file "
-            r"written on Windows and read elsewhere registers 'key\r', which matches "
-            r"nothing and logs no reason",
+            f"{probe.url} rejected the API key ({status}). The server answers "
+            f"'Invalid API Key' even when NO key was sent, so this does not tell "
+            f"you which of the two happened. llama.cpp reads 'Authorization' and "
+            f"falls back to 'X-Api-Key' ONLY when 'Authorization' is empty - so a "
+            f"client sending a placeholder 'Authorization' alongside a correct "
+            f"'x-api-key' still fails, because the fallback never fires",
+            r"first confirm the client is sending a key at all, then that it matches "
+            r"a line in --api-key-file exactly. The server compares whole strings with "
+            r"no trimming, so a stray '\r' from a file written on Windows and read on "
+            r"Linux registers 'key\r', which matches nothing and logs no reason",
         )
 
     if status == 404:
@@ -147,7 +152,9 @@ def diagnose(probe: Probe) -> Finding:
         return Finding(
             Outcome.NOT_ENABLED,
             f"{probe.url} exists but is not enabled (501)",
-            "restart the server with the flag that exposes it, such as --metrics or --slots",
+            "restart the server with --metrics if this was /metrics. Note /slots is "
+            "enabled by DEFAULT - it is --no-slots that turns it off - so a 501 there "
+            "means someone disabled it deliberately",
         )
 
     if status >= 500:
@@ -197,6 +204,12 @@ def _diagnose_transport(probe: Probe) -> Finding:
 
 def check_model_visibility(listing: Any, wanted: str | None) -> Finding:
     """Will the client actually see a usable model?
+
+    This check carries more weight than it looks, because **the server will not
+    do it for you**: in single-model mode llama.cpp never validates the requested
+    model name — it accepts anything and echoes it back. So a typo in the client
+    config produces correct-looking output from a differently-named model, and
+    nothing anywhere reports a problem.
 
     Two separate failures wear the same disguise — an empty model picker:
 

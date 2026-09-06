@@ -13,6 +13,8 @@ finding with a fix. No network in any of these tests.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from localllm.client import (
@@ -97,6 +99,17 @@ class TestAuthentication:
         """`std::find` over whole strings: no trimming, no normalisation."""
         d = diagnose(Probe(url="http://s/v1/models", status=401))
         assert "no trimming" in d.fix.lower()
+
+    def test_auth_failure_says_missing_and_wrong_are_indistinguishable(self) -> None:
+        """Verified in server-http.cpp: both take a single exit path, and the
+        body says "Invalid API Key" even when no key was sent at all.
+
+        Left unsaid, that actively misleads someone who simply forgot to
+        configure a key — they go hunting for a typo in a key they never set.
+        """
+        d = diagnose(Probe(url="http://s/v1/models", status=401))
+        assert "no key was sent" in d.detail.lower()
+        assert "sending a key at all" in d.fix.lower()
 
     def test_auth_failure_warns_about_stray_carriage_returns(self) -> None:
         """The failure mode that leaves no trace: a key file written on Windows
@@ -248,3 +261,38 @@ class TestPublicEndpoints:
         demands a key, saying so beats reporting a puzzling generic failure."""
         d = diagnose(Probe(url="http://s/health", status=401))
         assert d.outcome is Outcome.UNAUTHORISED
+
+
+class TestSlotsIsEnabledByDefault:
+    def test_the_501_advice_does_not_invent_a_slots_flag(self) -> None:
+        """`endpoint_slots` defaults to true (common/common.h) - `--no-slots`
+        turns it off. Telling someone to add `--slots` sends them looking for a
+        flag whose absence was never the problem."""
+        d = diagnose(Probe(url="http://s/slots", status=501))
+        assert "--no-slots" in d.fix
+        assert "--slots " not in d.fix
+
+
+class TestNoBomInTheKeyFile:
+    """PowerShell 5.1's `Out-File -Encoding utf8` prepends a UTF-8 BOM, which
+    would attach to the FIRST key only - breaking exactly one laptop while every
+    other one works. Python's `encoding="utf-8"` does not add one; this pins it.
+    """
+
+    def test_the_key_file_has_no_byte_order_mark(self, tmp_path: Path) -> None:
+        from localllm.keys import KeyStore
+
+        store = KeyStore(tmp_path / "keys.json")
+        store.add("laptop-a")
+        raw = store.write_api_key_file(tmp_path / "keys.txt").read_bytes()
+        assert not raw.startswith(b"\xef\xbb\xbf")
+
+    def test_the_first_line_is_the_comment_header(self, tmp_path: Path) -> None:
+        """A BOM would make llama.cpp see `\ufeff#...` - still a comment, so the
+        damage lands on the first real key instead, silently."""
+        from localllm.keys import KeyStore
+
+        store = KeyStore(tmp_path / "keys.json")
+        store.add("laptop-a")
+        raw = store.write_api_key_file(tmp_path / "keys.txt").read_bytes()
+        assert raw.split(b"\n")[0].startswith(b"#")

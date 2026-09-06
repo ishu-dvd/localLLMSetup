@@ -95,7 +95,7 @@ llama.cpp, llama-swap and gguf-parser. Not a new inference stack.
 git clone https://github.com/ishu-dvd/localLLMSetup
 cd localLLMSetup
 $env:PYTHONPATH="src"
-python -m pytest tests          # 490 tests
+python -m pytest tests          # 494 tests
 ```
 
 **Point it at a real model file** and it reads the facts from the file rather than
@@ -209,7 +209,7 @@ On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
 | 5 — client onboarding | ✅ done, 33 tests |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**490 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
+**494 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
 
 ---
 
@@ -223,6 +223,7 @@ kill or redirect the project. Highest-risk-first, deliberately.
 ## Licence
 
 TBD (MIT or Apache-2.0 — all chosen dependencies are MIT / Apache-2.0 / BSD-3, so either works).
+
 
 
 
