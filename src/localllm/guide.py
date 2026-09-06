@@ -215,12 +215,15 @@ def client_guide(*, config_written: bool, url: str = "") -> Guide:
             "Write this laptop's client config",
             State.DONE if config_written else State.NEXT,
             command="localllm join --invite <token> --client cline",
+            detail=f"pointed at {url}" if config_written and url else "",
         ),
         Step(
             "check",
             "Confirm the server answers this laptop",
             State.NEXT if config_written else State.WAITING,
-            command=f"localllm check --server {url or '<url>'} --api-key <key>",
+            # No arguments: `join` wrote the URL, key and model to this
+            # directory, and `check` reads them back.
+            command="localllm check",
         ),
     ]
     return Guide(steps=tuple(steps), where="client laptop")

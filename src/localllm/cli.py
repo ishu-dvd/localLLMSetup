@@ -49,7 +49,7 @@ from .handoff import (
 )
 from .invite import Invite, InviteError
 from .invite import decode as decode_invite
-from .join import SUPPORTED, build_client_config, normalise_base_url
+from .join import SUPPORTED, build_client_config, normalise_base_url, read_client_config
 from .keys import DeviceExistsError, DeviceNotFoundError, KeyStore
 from .serve import (
     preflight,
@@ -123,9 +123,13 @@ def cmd_next(args: argparse.Namespace) -> int:
     told it drifts from the machine the moment anything is moved by hand.
     """
     if args.client:
-        candidates = ("cline-settings.json", ".aider.conf.yml", "octofriend.json5")
-        written = any((Path(args.out) / n).exists() for n in candidates)
-        print(client_guide(config_written=written, url=args.url or "").render())
+        found = read_client_config(args.out)
+        print(
+            client_guide(
+                config_written=found is not None,
+                url=args.url or (found.base_url if found else ""),
+            ).render()
+        )
         return 0
 
     hw, _ = _hardware_from(args)
@@ -392,8 +396,29 @@ def cmd_check(args: argparse.Namespace) -> int:
         api_key = api_key or inv.api_key
         model = model or inv.model
         expected_context = inv.context_per_slot
+    elif not server:
+        # Nothing was supplied, but `join` wrote all of it to a file moments
+        # ago. Reading that back makes the natural "did it work?" step a
+        # zero-argument command, and checks the config the client will really
+        # use rather than one described on the command line.
+        found = read_client_config(args.config_dir)
+        if found is not None:
+            print(f"Using {found.path} ({found.client})\n")
+            server = found.base_url
+            api_key = api_key or found.api_key
+            model = model or found.model
+            expected_context = found.context
+            if not api_key and found.key_env_var:
+                print(
+                    f"note: {found.client} reads its key from ${found.key_env_var}, "
+                    f"which is not set in this shell. Pass --api-key to check anyway.\n"
+                )
     if not server:
-        print("error: --server is required without --invite", file=sys.stderr)
+        print(
+            "error: nothing to check. Pass --invite, or --server, or run this "
+            "from the directory `localllm join` wrote its config into.",
+            file=sys.stderr,
+        )
         return 1
     model = model or MODEL_ALIAS
 
@@ -809,7 +834,7 @@ def cmd_join(args: argparse.Namespace) -> int:
     print("\nNotes:")
     for n in config.notes:
         print(f"  - {n}")
-    print(f"\nConfirm it works:\n  localllm check --server {url} --api-key <the key above>")
+    print("\nConfirm it works, from this directory:\n  localllm check")
     return 0
 
 
@@ -917,6 +942,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="the same token used to join - supplies the URL, key and model, so "
         "verifying a join needs nothing re-typed",
+    )
+    check.add_argument(
+        "--config-dir",
+        type=Path,
+        default=Path("."),
+        help="where `localllm join` wrote its config (default: the current directory)",
     )
     check.add_argument(
         "--model",
