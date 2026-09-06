@@ -11,20 +11,18 @@ Three failure modes drive this module, all of which are invisible at runtime:
 * **A stale llama.cpp build.** Before commit `c7bda030` (2026-09-03), the Vulkan
   backend silently took a slow path with Q8_0 KV + flash attention. Measured cost:
   ~45% of prefill. Nothing warns you.
-* **`mlock` without privilege.** `-lm mmap+mlock` is the only thing that
-  guarantees residency, but locking pages needs `SeLockMemoryPrivilege`, which
-  Windows does not grant by default. Without it, mlock degrades rather than
-  protects — again, silently.
+* **Weights in system RAM can be evicted.** `mlock` would pin them, but pinning
+  12.11 GB into ~10.5 GB of usable RAM cannot succeed, so the invocation uses
+  `-lm auto`. Residency is instead a consequence of the budget refusing plans
+  that would page — which nothing enforces at runtime, so it is monitored
+  rather than assumed.
 """
 
 from __future__ import annotations
 
-import os
 import re
 import shutil
 import subprocess
-import sys
-import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -97,16 +95,6 @@ def build_is_recent_enough(build: int | None) -> bool:
     return build is not None and build >= MIN_LLAMA_BUILD
 
 
-def parse_lock_pages_privilege(secedit_text: str, account: str) -> bool:
-    """Check whether an account holds SeLockMemoryPrivilege in exported policy."""
-    for line in secedit_text.splitlines():
-        if line.strip().startswith("SeLockMemoryPrivilege"):
-            _, _, values = line.partition("=")
-            holders = [v.strip().lstrip("*") for v in values.split(",") if v.strip()]
-            return any(account.lower() in h.lower() for h in holders)
-    return False
-
-
 # --- Preflight --------------------------------------------------------------
 
 
@@ -115,7 +103,6 @@ def preflight(
     *,
     llama_build: int | None,
     free_disk_gb: float | None,
-    has_lock_pages: bool,
     gpu_detected: bool,
 ) -> Preflight:
     """Everything that must be true before an unattended server is allowed to start."""
@@ -176,24 +163,43 @@ def preflight(
             )
         )
 
-    # 4. mlock privilege, only relevant when weights live in system RAM.
+    # 4. Residency of the weights that live in system RAM.
+    #
+    # This used to check SeLockMemoryPrivilege and advise granting it. That
+    # advice is now wrong: the generated invocation uses `-lm auto`, not
+    # `-lm mmap+mlock`, because pinning 12.11 GB of weights into ~10.5 GB of
+    # usable RAM cannot succeed. Telling the user to edit security policy and
+    # reboot to enable a mode this project deliberately does not use is worse
+    # than saying nothing.
+    #
+    # The underlying risk is real and unchanged — mmap'd pages can be evicted,
+    # and Windows absorbs the overflow into the page file silently. But the
+    # mitigation is the budget refusing over-committed plans, plus monitoring;
+    # not a privilege grant.
     if verdict.weights_spilled_gb > 0:
-        if has_lock_pages:
-            checks.append(Check("lock pages", Level.PASS, "SeLockMemoryPrivilege granted"))
-        else:
-            checks.append(
-                Check(
-                    "lock pages",
-                    Level.WARN,
-                    "SeLockMemoryPrivilege not granted - `-lm mmap+mlock` will degrade silently",
-                    "secpol.msc > Local Policies > User Rights Assignment > "
-                    "'Lock pages in memory' > add this account, then reboot",
-                )
-            )
-    else:
+        # The budget already refused anything that would page, so this is a PASS
+        # with something to watch — not a warning. Warning on every spilling
+        # plan would nag about the normal case and train the user to ignore it.
+        # It becomes a warning only when the margin is thin enough that one
+        # background service could take it.
+        tight = verdict.status is not Fit.FITS
         checks.append(
-            Check("lock pages", Level.PASS, "not needed - no weights spill to system RAM")
+            Check(
+                "residency",
+                Level.WARN if tight else Level.PASS,
+                f"{verdict.weights_spilled_gb:.1f} GB of weights live in system RAM under "
+                f"`-lm auto`; the budget leaves {verdict.headroom_gb:.1f} GB spare, and "
+                f"`\\Memory\\Pages Input/sec` should sit near 0 once warm",
+                (
+                    "margin is thin - watch for paging, and reduce context or slots if "
+                    "`Pages Input/sec` stays high"
+                )
+                if tight
+                else "",
+            )
         )
+    else:
+        checks.append(Check("residency", Level.PASS, "not needed - no weights spill to system RAM"))
 
     # 5. Disk.
     if free_disk_gb is None:
@@ -345,28 +351,3 @@ def probe_free_disk_gb(path: str | Path) -> float | None:
             except OSError:
                 return None
     return None
-
-
-def probe_lock_pages_privilege(account: str | None = None) -> bool:
-    """Export the local security policy and look for SeLockMemoryPrivilege."""
-    if sys.platform != "win32":
-        return False
-    account = account or os.environ.get("USERNAME", "")
-    if not account:
-        return False
-    tmp = Path(tempfile.gettempdir()) / "localllm-secpol.inf"
-    try:
-        subprocess.run(
-            ["secedit", "/export", "/areas", "USER_RIGHTS", "/cfg", str(tmp)],
-            capture_output=True,
-            timeout=60,
-            check=False,
-        )
-        if not tmp.exists():
-            return False
-        text = tmp.read_text(encoding="utf-16", errors="ignore")
-        return parse_lock_pages_privilege(text, account)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    finally:
-        tmp.unlink(missing_ok=True)

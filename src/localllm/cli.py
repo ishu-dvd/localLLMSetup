@@ -27,7 +27,6 @@ from .serve import (
     preflight,
     probe_free_disk_gb,
     probe_llama_build,
-    probe_lock_pages_privilege,
     render_nssm_script,
     render_powercfg_script,
     render_watchdog_script,
@@ -402,7 +401,6 @@ def cmd_up(args: argparse.Namespace) -> int:
         verdict,
         llama_build=build,
         free_disk_gb=probe_free_disk_gb(args.out),
-        has_lock_pages=probe_lock_pages_privilege(),
         gpu_detected=gpu_ok,
     )
 
