@@ -97,6 +97,14 @@ class Observed:
     layers_offloaded: int | None = None
     layers_total: int | None = None
     expert_layers_on_cpu: int | None = None
+    no_usable_gpu: bool = False
+    """llama.cpp said outright that it found no usable GPU.
+
+    `warning: no usable GPU found, --gpu-layers option will be ignored` is a raw
+    `fprintf(stderr)` and **not subject to verbosity**, so it survives a
+    default-verbosity log where every other GPU signal has been filtered out. It
+    is the most direct statement llama.cpp ever makes about this failure.
+    """
 
     @property
     def total_kv_gb(self) -> float | None:
@@ -111,7 +119,13 @@ class Observed:
 
     @property
     def gpu_in_use(self) -> bool:
-        """A named device is not proof — it can be found and still left idle."""
+        """A named device is not proof — it can be found and still left idle.
+
+        Contradictory evidence resolves toward `no_usable_gpu`: wrongly claiming
+        the GPU is in use hides the exact failure this check exists to catch.
+        """
+        if self.no_usable_gpu:
+            return False
         return bool(self.device) and bool(self.layers_offloaded)
 
 
@@ -183,7 +197,7 @@ class Comparison:
 
 
 GPU_BUFFER_PREFIXES = ("Vulkan", "CUDA", "ROCm", "HIP", "Metal", "SYCL", "CANN", "OpenCL")
-"""Buffer-type name prefixes that mean device memory.
+"""Buffer-type name prefixes that *may* mean device memory.
 
 The device is identified from the buffer-type name rather than from the Vulkan
 enumeration line, because that line is `GGML_LOG_DEBUG` and so absent at default
@@ -195,11 +209,22 @@ _MIB = 1024 * 1024
 
 
 def _classify(buftype: str) -> str | None:
-    """'Vulkan0' -> 'Vulkan', 'CPU_Mapped' -> None (host memory)."""
+    """'Vulkan0' -> 'Vulkan'; 'Vulkan_Host' and 'CPU_Mapped' -> None.
+
+    The suffix is the discriminator, not the prefix. **`Vulkan_Host` is pinned
+    page-locked HOST memory**, so a naive `/Vulkan/` match pulls it into the VRAM
+    total — inflating the one number this whole budget is tightest on. Device
+    buffers are numbered (`Vulkan0`, `CUDA1`); backends with a single device
+    report a bare name (`Metal`).
+    """
     name = buftype.strip()
     for prefix in GPU_BUFFER_PREFIXES:
-        if name.lower().startswith(prefix.lower()):
+        if not name.lower().startswith(prefix.lower()):
+            continue
+        suffix = name[len(prefix) :]
+        if suffix == "" or suffix.isdigit():
             return prefix
+        return None  # Vulkan_Host and friends: host memory wearing a GPU name
     return None
 
 
@@ -218,7 +243,25 @@ apart — they share a suffix, and the output buffer is under a megabyte, so
 conflating them is silently almost-right.
 """
 
+_NO_GPU = re.compile(r"no usable GPU found", re.IGNORECASE)
+
 _OFFLOADED = re.compile(r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers to GPU", re.IGNORECASE)
+
+_EXPERT_OVERRIDE = re.compile(
+    r"^tensor\s+blk\.(\d+)\.ffn_\w+_exps\.weight\b.*buffer type overridden to\s+(\S+)",
+    re.IGNORECASE,
+)
+"""`-ncmoe N` is sugar over `--override-tensor`, and logs one line per expert
+TENSOR, not per layer.
+
+gpt-oss has three expert tensors in each MoE layer (gate, up, down), so
+`-ncmoe 15` emits about 45 of these. Counting lines would report 45 offloaded
+layers for a 24-layer model. Distinct `blk.<i>` indices are the actual count.
+
+Note also this line has no `__func__` prefix — it begins literally with
+`tensor `, unlike every other line parsed here — and it is `GGML_LOG_DEBUG`, so
+a default-verbosity log contains none at all.
+"""
 
 
 def parse_server_log(text: str) -> Observed:
@@ -232,8 +275,17 @@ def parse_server_log(text: str) -> Observed:
     seen: set[str] = set()
     device: str | None = None
     backend: str | None = None
+    expert_layers: set[int] = set()
+    no_usable_gpu = bool(_NO_GPU.search(text))
 
     for raw in text.splitlines():
+        line = raw.strip()
+        override = _EXPERT_OVERRIDE.match(line)
+        if override and _classify(override.group(2)) is None:
+            # Only CPU-bound overrides are the -ncmoe split; an override onto
+            # another GPU is a different thing entirely.
+            expert_layers.add(int(override.group(1)))
+
         for buftype, kind, value in _BUFFER.findall(raw):
             gpu = _classify(buftype)
             size = _mib_to_gb(value)
@@ -272,9 +324,8 @@ def parse_server_log(text: str) -> Observed:
         compute_gb=compute if "compute" in seen else None,
         layers_offloaded=offloaded if "layers" in seen else None,
         layers_total=total if "layers" in seen else None,
-        # Tensor-override lines have not been confirmed against source, so this
-        # reports unknown rather than a plausible guess.
-        expert_layers_on_cpu=None,
+        expert_layers_on_cpu=len(expert_layers) or None,
+        no_usable_gpu=no_usable_gpu,
     )
 
 
@@ -334,15 +385,20 @@ def compare(verdict: Verdict, observed: Observed) -> Comparison:
 
     if not observed.gpu_in_use:
         where = observed.backend or "CPU"
-        findings.append(
-            Finding(
-                Severity.FAIL,
+        if observed.no_usable_gpu:
+            detail = (
+                "llama.cpp reported 'no usable GPU found, --gpu-layers option will be "
+                "ignored' - it is running entirely on the CPU. That warning is printed "
+                "regardless of log level, so it is the one signal that survives a quiet log"
+            )
+        else:
+            detail = (
                 f"the model is running on the CPU, not the GPU (backend {where}, "
                 f"{observed.layers_offloaded or 0} layers offloaded) - it will answer "
                 f"correctly and roughly an order of magnitude slower, which is why this "
-                f"failure is so easy to miss",
+                f"failure is so easy to miss"
             )
-        )
+        findings.append(Finding(Severity.FAIL, detail))
         # Calibrating GPU reserves from a CPU run would bake nonsense into the
         # solver, so stop here rather than emit confident garbage.
         return Comparison(verdict, observed, tuple(findings), {})

@@ -484,3 +484,140 @@ class TestParseFile:
         p = tmp_path / "startup.log"
         p.write_bytes(VULKAN_LOG.encode("utf-8") + b"\xff\xfe bad bytes\n")
         assert read_server_log(p).layers_offloaded == 25
+
+
+class TestDeviceMemoryVsPinnedHostMemory:
+    """`Vulkan_Host` is pinned HOST memory despite the prefix.
+
+    A naive /Vulkan/ match pulls it into the VRAM total, inflating the one
+    number the whole budget is tightest on. Device memory is `Vulkan0`,
+    `CUDA1`, etc - the digit suffix is the discriminator.
+    """
+
+    def test_vulkan_host_counts_as_ram(self) -> None:
+        o = parse_server_log(
+            "llama_context:  Vulkan_Host compute buffer size =   300.00 MiB\n"
+            "load_tensors:      Vulkan0 model buffer size =  1000.00 MiB\n"
+        )
+        assert o.compute_gb is None, "pinned host memory is not GPU compute"
+        assert o.vram_model_gb is not None
+
+    def test_vulkan_host_model_weights_count_as_ram(self) -> None:
+        o = parse_server_log("load_tensors:  Vulkan_Host model buffer size =  500.00 MiB\n")
+        assert o.ram_model_gb is not None
+        assert o.vram_model_gb is None
+
+    def test_a_backend_with_no_digit_suffix_still_counts(self) -> None:
+        """Metal is reported as bare `Metal`, not `Metal0`."""
+        o = parse_server_log("load_tensors:        Metal model buffer size =  500.00 MiB\n")
+        assert o.vram_model_gb is not None
+        assert o.backend == "Metal"
+
+
+class TestDoubleCountingTraps:
+    def test_the_kv_summary_line_is_not_added_again(self) -> None:
+        """`llama_kv_cache: size = X MiB ... K (q8_0): Y, V (q8_0): Z` restates
+        the same bytes as that cache's `KV buffer size` line - three ways to
+        express one number."""
+        o = parse_server_log(
+            "llama_kv_cache:    Vulkan0 KV buffer size =   220.00 MiB\n"
+            "llama_kv_cache: size =  220.00 MiB (  4096 cells,  12 layers,  1/1 seqs), "
+            "K (q8_0):  110.00 MiB, V (q8_0):  110.00 MiB\n"
+        )
+        assert o.total_kv_gb == pytest.approx(220 * 1024 * 1024 / 1e9, rel=0.01)
+
+    def test_the_compute_buffer_expectation_lines_are_not_added(self) -> None:
+        """`compute buffer size is X, matches expectation of Y` would otherwise
+        be counted twice more. Requiring a literal `=` excludes them."""
+        o = parse_server_log(
+            "llama_context:    Vulkan0 compute buffer size =   500.00 MiB\n"
+            "llama_context: Vulkan0 compute buffer size is 500.0000 MiB, "
+            "matches expectation of 500.0000 MiB\n"
+        )
+        assert o.compute_gb == pytest.approx(500 * 1024 * 1024 / 1e9, rel=0.01)
+
+
+class TestExpertOverrides:
+    """`-ncmoe N` is sugar over --override-tensor and emits one line per expert
+    TENSOR, not per layer. gpt-oss has three (gate/up/down) per MoE layer, so
+    `-ncmoe 15` produces about 45 lines. Counting lines gives 45, not 15.
+    """
+
+    OVERRIDES = "\n".join(
+        f"tensor blk.{i}.ffn_{part}_exps.weight (162 MiB mxfp4) buffer type overridden to CPU"
+        for i in range(15)
+        for part in ("gate", "up", "down")
+    )
+
+    def test_counts_distinct_layers_not_lines(self) -> None:
+        o = parse_server_log(self.OVERRIDES)
+        assert o.expert_layers_on_cpu == 15
+
+    def test_the_line_has_no_function_prefix(self) -> None:
+        """It begins literally with `tensor `, unlike every other line here."""
+        o = parse_server_log(
+            "tensor blk.7.ffn_up_exps.weight (162 MiB mxfp4) buffer type overridden to CPU"
+        )
+        assert o.expert_layers_on_cpu == 1
+
+    def test_overrides_to_a_gpu_are_not_counted(self) -> None:
+        o = parse_server_log(
+            "tensor blk.3.ffn_up_exps.weight (162 MiB mxfp4) buffer type overridden to Vulkan0"
+        )
+        assert o.expert_layers_on_cpu is None
+
+    def test_absent_overrides_remain_unknown(self) -> None:
+        """The line is GGML_LOG_DEBUG, so a default-verbosity log has none -
+        which is unknown, not zero."""
+        assert parse_server_log(VULKAN_LOG).expert_layers_on_cpu is None
+
+    def test_a_matching_count_passes_comparison(self) -> None:
+        v = verdict_for()
+        log = "\n".join(
+            f"tensor blk.{i}.ffn_gate_exps.weight (162 MiB mxfp4) buffer type overridden to CPU"
+            for i in range(v.n_cpu_moe)
+        )
+        o = parse_server_log(VULKAN_LOG + "\n" + log)
+        assert o.expert_layers_on_cpu == v.n_cpu_moe
+        assert not any("ncmoe" in f.detail.lower() for f in compare(v, o).findings)
+
+
+class TestExplicitNoGpuWarning:
+    """`warning: no usable GPU found, --gpu-layers option will be ignored` is a
+    raw fprintf(stderr) and NOT subject to verbosity, so it survives a
+    default-verbosity log where every other GPU signal has been filtered out.
+    It is the most direct statement llama.cpp ever makes about this failure.
+    """
+
+    LOG = (
+        "warning: no usable GPU found, --gpu-layers option will be ignored\n"
+        "warning: one possible reason is that llama.cpp was compiled without GPU support\n"
+        "load_tensors:          CPU model buffer size = 12110.00 MiB\n"
+    )
+
+    def test_the_warning_is_detected(self) -> None:
+        assert parse_server_log(self.LOG).no_usable_gpu is True
+
+    def test_a_normal_log_does_not_set_it(self) -> None:
+        assert parse_server_log(VULKAN_LOG).no_usable_gpu is False
+
+    def test_it_forces_a_failure_even_without_other_signals(self) -> None:
+        """A log truncated to just this line still fails, rather than passing
+        for lack of contrary evidence."""
+        o = parse_server_log("warning: no usable GPU found, --gpu-layers option will be ignored\n")
+        assert o.gpu_in_use is False
+        assert compare(verdict_for(), o).severity is Severity.FAIL
+
+    def test_it_overrides_a_gpu_looking_buffer(self) -> None:
+        """Contradictory evidence resolves toward the explicit warning, since
+        the cost of wrongly claiming a GPU is in use is far higher."""
+        o = parse_server_log(
+            "warning: no usable GPU found, --gpu-layers option will be ignored\n"
+            "load_tensors:      Vulkan0 model buffer size =  1000.00 MiB\n"
+            "load_tensors: offloaded 25/25 layers to GPU\n"
+        )
+        assert o.gpu_in_use is False
+
+    def test_the_report_quotes_the_warning(self) -> None:
+        c = compare(verdict_for(), parse_server_log(self.LOG))
+        assert "no usable GPU" in c.report()
