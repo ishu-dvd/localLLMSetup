@@ -719,3 +719,215 @@ class TestUpHandsThePlanToTheClients:
         assert code == 0, out
         meta = json.loads((tmp_path / "client" / ".aider.model.metadata.json").read_text())
         assert next(iter(meta.values()))["max_input_tokens"] == 6144
+
+
+class TestTheServerIsNeverPublishedWithoutAuth:
+    """llama.cpp skips key validation entirely when the key list is empty:
+
+        if (api_keys.empty()) { return true; }   // server-http.cpp:613
+
+    So zero keys does not lock the server down - it turns authentication OFF.
+    Combined with the `--host 0.0.0.0` this project emits, that is an open
+    model endpoint on every interface the machine has.
+
+    The failure is invisible, which is why it is a FAIL and not a WARN: a
+    client configured with a key gets correct answers from a server that never
+    looked at it, so nothing in normal use reveals the door is open.
+    """
+
+    def test_the_flags_always_carry_an_api_key_file(self) -> None:
+        """Including when the real path is unknown - a placeholder is visible,
+        a missing flag is not."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        flags = solve(hw, GPT_OSS_20B, Plan(8192)).llama_server_flags()
+        assert "--api-key-file" in flags
+
+    def test_the_flags_bind_every_interface_which_is_why_auth_is_required(self) -> None:
+        """Pins the pairing. If the bind address were ever narrowed to
+        localhost the auth requirement could be revisited - but while it is
+        0.0.0.0, it cannot."""
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        flags = solve(hw, GPT_OSS_20B, Plan(8192)).llama_server_flags()
+        assert "--host 0.0.0.0" in flags
+        assert "--api-key-file" in flags
+
+    def test_a_real_path_replaces_the_placeholder(self) -> None:
+        hw = Hardware(vram_total_gb=8, ram_total_gb=16)
+        flags = solve(hw, GPT_OSS_20B, Plan(8192)).llama_server_flags(
+            api_key_file=r"C:\deploy\keys.txt"
+        )
+        assert r"--api-key-file C:\deploy\keys.txt" in flags
+        assert "<path-to>/keys.txt" not in flags
+
+    def test_up_refuses_when_no_keys_have_been_issued(self, tmp_path, capsys) -> None:
+        code, out = run(
+            [
+                "up",
+                "--vram",
+                "8",
+                "--ram",
+                "16",
+                "--context",
+                "8192",
+                "--out",
+                str(tmp_path / "deploy"),
+                "--store",
+                str(tmp_path / "empty.json"),
+            ],
+            capsys,
+        )
+        assert code == 1
+        assert "no device keys" in out
+        assert not (tmp_path / "deploy" / "keys.txt").exists()
+
+    def test_up_writes_the_key_file_and_points_the_flags_at_it(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        from localllm.keys import KeyStore
+
+        store_path = tmp_path / "keys.json"
+        entry = KeyStore(store_path).add("laptop-1")
+        monkeypatch.setattr(
+            "localllm.cli.preflight",
+            lambda *a, **k: __import__("localllm.serve", fromlist=["Preflight"]).Preflight(
+                checks=()
+            ),
+        )
+        code, out = run(
+            [
+                "up",
+                "--vram",
+                "8",
+                "--ram",
+                "16",
+                "--context",
+                "8192",
+                "--out",
+                str(tmp_path / "deploy"),
+                "--store",
+                str(store_path),
+            ],
+            capsys,
+        )
+        assert code == 0, out
+        key_file = tmp_path / "deploy" / "keys.txt"
+        assert key_file.exists()
+        assert entry.key in key_file.read_text(encoding="utf-8")
+
+        flags = (tmp_path / "deploy" / "llama-server-flags.txt").read_text(encoding="utf-8")
+        assert "--api-key-file" in flags
+        assert "<path-to>" not in flags.split("--api-key-file")[1].split()[0]
+
+    def test_the_key_file_uses_lf_so_it_survives_a_non_windows_server(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        """llama.cpp reads it with std::getline and does not strip \\r; a CRLF
+        file read on Linux makes every key end in a carriage return, and every
+        request 401s with nothing to explain it."""
+        from localllm.keys import KeyStore
+
+        store_path = tmp_path / "keys.json"
+        KeyStore(store_path).add("laptop-1")
+        monkeypatch.setattr(
+            "localllm.cli.preflight",
+            lambda *a, **k: __import__("localllm.serve", fromlist=["Preflight"]).Preflight(
+                checks=()
+            ),
+        )
+        run(
+            [
+                "up",
+                "--vram",
+                "8",
+                "--ram",
+                "16",
+                "--out",
+                str(tmp_path / "deploy"),
+                "--store",
+                str(store_path),
+            ],
+            capsys,
+        )
+        raw = (tmp_path / "deploy" / "keys.txt").read_bytes()
+        assert b"\r\n" not in raw
+
+
+class TestInviteKeepsTheServerKeyFileCurrent:
+    """A key added to the store is inert until llama-server restarts: the file
+    is parsed once, at startup (common/arg.cpp:3520).
+
+    Without this, inviting a second laptop produced a token that could not
+    work, and the resulting 401 looked like a bad token rather than a server
+    that had never been told about the key.
+    """
+
+    def _plan(self, tmp_path):
+        from localllm.handoff import ServerPlan
+
+        return ServerPlan(
+            context_per_slot=8192,
+            n_slots=2,
+            model_alias=MODEL_ALIAS,
+            model_id="m",
+            kv_quant="q8_0",
+            ctx_size_flag=16384,
+        ).write(tmp_path / "deploy")
+
+    def test_inviting_a_device_rewrites_the_servers_key_file(self, tmp_path, capsys) -> None:
+        plan = self._plan(tmp_path)
+        code, out = run(
+            [
+                "invite",
+                "laptop-1",
+                "--url",
+                "http://msi:8080",
+                "--plan",
+                str(plan),
+                "--store",
+                str(tmp_path / "keys.json"),
+            ],
+            capsys,
+        )
+        assert code == 0, out
+        key_file = tmp_path / "deploy" / "keys.txt"
+        assert key_file.exists()
+        assert "laptop-1" in key_file.read_text(encoding="utf-8")
+
+    def test_a_newly_issued_key_comes_with_the_restart_instruction(self, tmp_path, capsys) -> None:
+        plan = self._plan(tmp_path)
+        _, out = run(
+            [
+                "invite",
+                "laptop-1",
+                "--url",
+                "http://msi:8080",
+                "--plan",
+                str(plan),
+                "--store",
+                str(tmp_path / "keys.json"),
+            ],
+            capsys,
+        )
+        assert "Restart-Service" in out
+
+    def test_re_inviting_an_existing_device_does_not_demand_a_restart(
+        self, tmp_path, capsys
+    ) -> None:
+        """Re-issuing a token for a laptop that already has a key changes
+        nothing the server needs to reload, and telling the user to restart a
+        service for no reason trains them to ignore the message."""
+        plan = self._plan(tmp_path)
+        argv = [
+            "invite",
+            "laptop-1",
+            "--url",
+            "http://msi:8080",
+            "--plan",
+            str(plan),
+            "--store",
+            str(tmp_path / "keys.json"),
+        ]
+        run(argv, capsys)
+        _, out = run(argv, capsys)
+        assert "reusing the existing key" in out
+        assert "Restart-Service" not in out

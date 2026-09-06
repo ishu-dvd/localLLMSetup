@@ -66,6 +66,9 @@ _MARK = {Fit.FITS: "OK  ", Fit.TIGHT: "TIGHT", Fit.REFUSE: "NO  "}
 DEFAULT_STORE = Path.home() / ".localllm" / "keys.json"
 DEFAULT_DEPLOY_DIR = Path("./deploy")
 DEFAULT_PLAN_PATH = DEFAULT_DEPLOY_DIR / PLAN_FILENAME
+KEY_FILENAME = "keys.txt"
+"""The `--api-key-file` llama-server is started with, written beside the plan
+so the two cannot drift apart."""
 PROBE_TIMEOUT_S = 5.0
 """Shorter than the doctor's: confirming a plan is advisory and has a fallback."""
 
@@ -142,7 +145,7 @@ def cmd_next(args: argparse.Namespace) -> int:
 
     invited = 0
     if Path(args.store).exists():
-        invited = len(KeyStore(args.store).active)
+        invited = len(KeyStore(args.store).active())
 
     guide = server_guide(
         llama_server=Path(args.llama_server) if args.llama_server else None,
@@ -553,12 +556,14 @@ def cmd_up(args: argparse.Namespace) -> int:
     det = detect(getattr(args, "llama_server", None))
     gpu_ok = any(not g.is_virtual and g.vram_gb for g in det.gpus)
     build = probe_llama_build(args.llama_server) if args.llama_server else None
+    store = KeyStore(args.store)
 
     pf = preflight(
         verdict,
         llama_build=build,
         free_disk_gb=probe_free_disk_gb(args.out),
         gpu_detected=gpu_ok,
+        active_keys=len(store.active()),
     )
 
     print(f"Model    : {verdict.model.id}\n")
@@ -572,7 +577,12 @@ def cmd_up(args: argparse.Namespace) -> int:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    flags = verdict.llama_server_flags()
+    # The key file must exist before the service starts: llama.cpp throws at
+    # startup if --api-key-file names a file it cannot open, so a missing one
+    # is a service that never comes up rather than one that runs unprotected.
+    key_file = out / KEY_FILENAME
+    store.write_api_key_file(key_file)
+    flags = verdict.llama_server_flags(api_key_file=str(key_file.resolve()))
 
     written = {
         "01-powercfg.ps1": render_powercfg_script(),
@@ -593,6 +603,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     for name, body in written.items():
         (out / name).write_text(body, encoding="utf-8")
         print(f"wrote {out / name}")
+    print(f"wrote {key_file}")
 
     print("\nRun these as Administrator, in order:")
     for name in ("01-powercfg.ps1", "02-install-service.ps1", "03-watchdog.ps1"):
@@ -727,11 +738,19 @@ def cmd_invite(args: argparse.Namespace) -> int:
 
     store = KeyStore(args.store)
     entry = store.for_device(args.device)
+    issued = entry is None
     if entry is None:
         entry = store.add(args.device)
         print(f"issued a new key for {args.device}")
     else:
         print(f"reusing the existing key for {args.device}")
+
+    # The server parses --api-key-file once, at startup (common/arg.cpp:3520),
+    # so a key added here is not live until the service restarts. Rewriting the
+    # file now means the restart is the only remaining step - and forgetting it
+    # produces a 401 the new laptop cannot explain.
+    key_file = plan_path.parent / KEY_FILENAME
+    store.write_api_key_file(key_file)
 
     token = Invite(
         url=args.url,
@@ -751,6 +770,15 @@ def cmd_invite(args: argparse.Namespace) -> int:
         f"That pins {plan.context_per_slot:,} tokens of context - the share this "
         f"server actually gives each of its {plan.n_slots} slot(s)."
     )
+    if issued:
+        # llama.cpp reads the key file once, at startup. A key issued now is
+        # inert until then, and the resulting 401 looks like a bad token.
+        print(
+            f"\nThe new key is not live yet. {key_file} has been rewritten, but "
+            f"llama-server reads it only at startup - restart the service before "
+            f"{args.device} tries to connect:"
+        )
+        print(f"  Restart-Service {args.service_name}")
     return 0
 
 
@@ -985,13 +1013,19 @@ def build_parser() -> argparse.ArgumentParser:
     up = sub.add_parser("up", help="preflight, then generate the 24/7 service definition")
     _add_plan_args(up)
     up.add_argument("--service-name", default="localllm")
-    up.add_argument("--out", type=Path, default=Path("./deploy"))
+    up.add_argument("--out", type=Path, default=DEFAULT_DEPLOY_DIR)
+    up.add_argument(
+        "--store",
+        type=Path,
+        default=DEFAULT_STORE,
+        help="the device-key store whose keys are baked into the server's key file",
+    )
     up.set_defaults(func=cmd_up)
 
     key = sub.add_parser("key", help="issue, list and revoke per-device API keys")
     key.add_argument("--store", type=Path, default=DEFAULT_STORE)
     ksub = key.add_subparsers(dest="key_command")
-    ksub.add_parser("list", help="list all keys, including revoked")
+    k_list = ksub.add_parser("list", help="list all keys, including revoked")
     k_add = ksub.add_parser("add", help="issue a key for a device")
     k_add.add_argument("device")
     k_rev = ksub.add_parser("revoke", help="revoke a device's key")
@@ -1001,6 +1035,13 @@ def build_parser() -> argparse.ArgumentParser:
     k_cad = ksub.add_parser("caddyfile", help="print a Caddyfile with per-device attribution")
     k_cad.add_argument("hostname")
     k_cad.add_argument("--upstream", default="127.0.0.1:8080")
+    # argparse binds a parent flag only *before* the subcommand, so
+    # `key add laptop-1 --store X` was a usage error - which is the order every
+    # example, including this tool's own guidance, naturally writes. Repeating
+    # the flag on each child with SUPPRESS accepts both positions: when it is
+    # absent the child sets nothing and the parent's value survives.
+    for child in (k_list, k_add, k_rev, k_exp, k_cad):
+        child.add_argument("--store", type=Path, default=argparse.SUPPRESS)
     key.set_defaults(func=cmd_key)
 
     join = sub.add_parser("join", help="write client config for a laptop")
@@ -1055,6 +1096,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"the {PLAN_FILENAME} written by `localllm up` (default: {DEFAULT_PLAN_PATH})",
     )
     invite.add_argument("--store", type=Path, default=DEFAULT_STORE)
+    invite.add_argument(
+        "--service-name",
+        default="localllm",
+        help="the Windows service to restart after a new key is issued",
+    )
     invite.set_defaults(func=cmd_invite)
 
     return parser

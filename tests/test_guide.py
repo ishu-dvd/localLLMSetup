@@ -53,8 +53,16 @@ def test_with_llama_present_the_model_is_next(tmp_path):
     assert guide.next_step.key == "model"
 
 
-def test_with_both_present_up_is_next(tmp_path):
+def test_with_both_present_the_keys_come_before_up(tmp_path):
+    """`up` refuses to generate a service definition with an empty key file,
+    because llama.cpp reads that as "authentication off"."""
     guide = guide_for(tmp_path, llama=True, gguf=True)
+    assert guide.next_step is not None
+    assert guide.next_step.key == "keys"
+
+
+def test_up_is_next_once_a_key_exists(tmp_path):
+    guide = guide_for(tmp_path, llama=True, gguf=True, invited=1)
     assert guide.next_step is not None
     assert guide.next_step.key == "up"
 
@@ -89,15 +97,21 @@ def test_the_service_step_is_honest_that_it_cannot_be_checked(tmp_path):
 
 
 def test_exactly_one_step_is_next_at_a_time(tmp_path):
-    for i, kwargs in enumerate(({}, {"llama": True}, {"llama": True, "gguf": True})):
+    cases = (
+        {},
+        {"llama": True},
+        {"llama": True, "gguf": True},
+        {"llama": True, "gguf": True, "invited": 1},
+    )
+    for i, kwargs in enumerate(cases):
         sub = tmp_path / f"case{i}"
         sub.mkdir()
         guide = guide_for(sub, **kwargs)
-        assert sum(1 for s in guide.steps if s.state is State.NEXT) == 1
+        assert sum(1 for s in guide.steps if s.state is State.NEXT) == 1, kwargs
 
 
 def test_the_rendered_guide_names_the_next_command(tmp_path):
-    rendered = guide_for(tmp_path, llama=True, gguf=True).render()
+    rendered = guide_for(tmp_path, llama=True, gguf=True, invited=1).render()
     assert "Next:" in rendered
     assert "localllm up" in rendered
 

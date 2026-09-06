@@ -63,6 +63,22 @@ down as 4096 context. It will quietly discard a carefully computed plan and give
 much smaller context than you asked for, with nothing in the output to say so. This repo
 emits `-fit off`.
 
+**5. An empty key file turns authentication OFF, not on.** `server-http.cpp:613`:
+
+```cpp
+if (api_keys.empty()) { return true; }   // skip validation
+```
+
+So `--api-key-file` pointing at a file with no keys in it does not lock the server down —
+it publishes the model on `0.0.0.0:8080` with no auth at all. And it is **invisible**: a
+client configured with a key gets perfectly correct answers from a server that never
+looked at it. `localllm up` refuses to generate a service definition until at least one
+device key exists.
+
+Related: llama-server parses that file **once, at startup**. A key issued later is inert
+until the service restarts, and the resulting `401` looks like a bad token rather than a
+server that was never told about it — so `localllm invite` rewrites the file and says so.
+
 ---
 
 ## Does this repo need to exist?

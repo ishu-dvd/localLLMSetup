@@ -159,11 +159,30 @@ def server_guide(
     )
 
     ready_to_plan = have_llama and gguf is not None
+    # Before `up`, not after: llama.cpp treats an empty key list as
+    # "authentication off" rather than "deny everything", so `up` refuses to
+    # generate a service definition until at least one key exists.
+    steps.append(
+        Step(
+            "keys",
+            "Issue a key for each laptop",
+            State.DONE if invited_devices else (State.NEXT if ready_to_plan else State.WAITING),
+            command="localllm key add <laptop-name>",
+            detail=(
+                f"{invited_devices} key(s) issued"
+                if invited_devices
+                else "an empty key file would publish the model with no auth at all"
+            ),
+        )
+    )
+
     steps.append(
         Step(
             "up",
             "Generate the service definition and the plan",
-            State.DONE if have_plan else (State.NEXT if ready_to_plan else State.WAITING),
+            State.DONE
+            if have_plan
+            else (State.NEXT if ready_to_plan and invited_devices else State.WAITING),
             command=(
                 f"localllm up --llama-server {llama_server or '<path>'} "
                 f"--gguf {gguf if gguf else '<model.gguf>'} "
@@ -187,7 +206,7 @@ def server_guide(
     steps.append(
         Step(
             "invite",
-            "Invite each laptop",
+            "Send each laptop its invite",
             (State.DONE if everyone_invited else State.NEXT) if have_plan else State.WAITING,
             command="localllm invite <laptop-name> --url http://<this-machine>:8080",
             detail=(
