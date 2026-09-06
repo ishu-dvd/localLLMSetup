@@ -8,9 +8,10 @@ On the server:
 
     localllm doctor    probe this machine and say what it can run
     localllm plan      show which models fit; emit the llama-server invocation
+    localllm key       issue / list / revoke per-device API keys
     localllm up        preflight, then write the service definition and the plan
     localllm invite    one token that joins a laptop: URL, key, model, context
-    localllm key       issue / list / revoke per-device API keys
+    localllm status    the fleet: who has keys, and is the server serving them?
     localllm verify    check a real startup log against what was predicted
 
 On each client laptop:
@@ -163,6 +164,79 @@ def cmd_next(args: argparse.Namespace) -> int:
             f"{args.context:,} context x {max(args.devices, 1)} slot(s). "
             "Run `localllm plan` to see why."
         )
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """The fleet, from the server: who has keys, and is the server serving them?
+
+    The valuable part is not the listing — it is the comparison between the key
+    store and the key file the running server actually parsed. Those drift
+    apart silently the moment a device is added or revoked, because llama-server
+    reads the file once at startup. A newly invited laptop then gets a 401 that
+    looks like a bad token, and a *revoked* laptop keeps working.
+    """
+    store = KeyStore(args.store)
+    entries = store.all()
+    key_file = Path(args.plan).parent / KEY_FILENAME
+
+    print(f"Devices  : {len(store.active())} active, {len(entries)} issued in total")
+    for e in entries:
+        state = "active " if e.is_active else "REVOKED"
+        print(f"  [{state}] {e.device:<20} issued {e.created_at}")
+    if not entries:
+        print("  (none - issue one with `localllm key add <laptop-name>`)")
+
+    current = store.file_is_current(key_file)
+    print()
+    if current is None:
+        print(f"Key file : {key_file} does not exist")
+        print("           llama-server throws at startup if --api-key-file names a")
+        print("           missing file, so the service would not come up. Run `localllm up`.")
+    elif current:
+        print(f"Key file : {key_file} matches the store")
+    else:
+        in_file = store.keys_in_file(key_file) or []
+        active = {k.key for k in store.active()}
+        pending = [k.device for k in store.active() if k.key not in set(in_file)]
+        stale = len([k for k in in_file if k not in active])
+        print(f"Key file : {key_file} is OUT OF DATE")
+        if pending:
+            print(f"           {', '.join(pending)} cannot connect yet")
+        if stale:
+            print(f"           {stale} revoked key(s) would still be accepted")
+        print(f"           -> localllm key export --out {key_file}")
+        print(f"              Restart-Service {args.service_name}")
+
+    if args.no_probe:
+        return 0
+
+    origin = normalise_base_url(args.url, want_v1=False)
+    health = probe(f"{origin}/health", timeout=PROBE_TIMEOUT_S)
+    print()
+    if health.status != 200:
+        print(f"Server   : not answering at {origin} ({diagnose(health).detail})")
+        return 0
+
+    key = next((k.key for k in store.active()), None)
+    props = probe(f"{origin}/props", api_key=key, timeout=PROBE_TIMEOUT_S)
+    facts = read_props(props.body) if props.status == 200 else None
+    if facts is None:
+        print(f"Server   : up at {origin}, but /props did not answer as expected")
+        return 0
+    print(f"Server   : up at {origin}")
+    print(f"           serving '{facts.model_alias or 'unknown'}'")
+    print(f"           {facts.n_slots} slot(s) x {facts.context_per_slot:,} tokens each")
+
+    slots = probe(f"{origin}/slots?fail_on_no_slot=1", api_key=key, timeout=PROBE_TIMEOUT_S)
+    finding = diagnose(slots)
+    if finding.outcome is Outcome.NO_CAPACITY:
+        print("           every slot is busy right now")
+    elif finding.outcome is Outcome.NOT_ENABLED:
+        print("           slot usage unknown (/slots is disabled)")
+    elif slots.status == 200 and isinstance(slots.body, list):
+        busy = sum(1 for s in slots.body if isinstance(s, dict) and s.get("is_processing"))
+        print(f"           {busy} of {len(slots.body)} slot(s) busy")
     return 0
 
 
@@ -934,6 +1008,17 @@ def build_parser() -> argparse.ArgumentParser:
     nxt.add_argument("--out", type=Path, default=Path("."))
     nxt.add_argument("--url", default="")
     nxt.set_defaults(func=cmd_next)
+
+    status = sub.add_parser(
+        "status",
+        help="the fleet, from the server: who has keys, and is the server serving them?",
+    )
+    status.add_argument("--store", type=Path, default=DEFAULT_STORE)
+    status.add_argument("--plan", type=Path, default=DEFAULT_PLAN_PATH)
+    status.add_argument("--url", default="http://127.0.0.1:8080")
+    status.add_argument("--service-name", default="localllm")
+    status.add_argument("--no-probe", action="store_true", help="do not contact the server")
+    status.set_defaults(func=cmd_status)
 
     doctor = sub.add_parser("doctor", help="probe this machine and say what it can run")
     _add_plan_args(doctor)

@@ -327,12 +327,27 @@ class TestEverySubcommandIsWired:
             a for a in build_parser()._actions if isinstance(a, argparse._SubParsersAction)
         )
         documented = {c.dest for c in action._choices_actions if c.help}
-        for name in ("doctor", "plan", "speed", "verify", "up", "key", "join", "check"):
-            assert name in documented, f"{name} has no help text"
+        # Derived from the registered subparsers, not a hardcoded list: a
+        # hardcoded one silently stops covering every command added after it,
+        # which is what happened to `next`, `invite` and `status`.
+        undocumented = set(self._subparsers()) - documented
+        assert not undocumented, f"{sorted(undocumented)} have no help text"
 
     def test_the_expected_commands_all_exist(self) -> None:
         """Pins the surface, so a command cannot silently disappear."""
-        expected = {"doctor", "plan", "speed", "verify", "up", "key", "join", "check"}
+        expected = {
+            "doctor",
+            "plan",
+            "speed",
+            "verify",
+            "up",
+            "key",
+            "join",
+            "check",
+            "next",
+            "invite",
+            "status",
+        }
         assert expected <= set(self._subparsers())
 
     def test_every_command_parses_its_own_help(self) -> None:
@@ -354,6 +369,11 @@ class TestEverySubcommandIsWired:
             ["check", "--server", "http://s:8080"],
             ["join", "--client", "cline", "--device", "d", "--url", "http://s:8080"],
             ["key", "add", "d"],
+            ["key", "add", "d", "--store", "x.json"],
+            ["next"],
+            ["next", "--client"],
+            ["invite", "laptop-1", "--url", "http://s:8080"],
+            ["status"],
         ],
     )
     def test_a_representative_invocation_parses(self, argv: list[str]) -> None:
@@ -931,3 +951,91 @@ class TestInviteKeepsTheServerKeyFileCurrent:
         _, out = run(argv, capsys)
         assert "reusing the existing key" in out
         assert "Restart-Service" not in out
+
+
+class TestStatusShowsTheFleet:
+    """The server was the one place with no view of itself: which laptops have
+    keys, and whether the running server would actually accept them."""
+
+    def _setup(self, tmp_path, devices=("laptop-1",)):
+        from localllm.handoff import ServerPlan
+        from localllm.keys import KeyStore
+
+        store = KeyStore(tmp_path / "keys.json")
+        for d in devices:
+            store.add(d)
+        plan = ServerPlan(
+            context_per_slot=8192,
+            n_slots=2,
+            model_alias=MODEL_ALIAS,
+            model_id="m",
+            kv_quant="q8_0",
+            ctx_size_flag=16384,
+        ).write(tmp_path / "deploy")
+        return store, plan
+
+    def _status(self, tmp_path, plan, capsys):
+        return run(
+            [
+                "status",
+                "--store",
+                str(tmp_path / "keys.json"),
+                "--plan",
+                str(plan),
+                "--no-probe",
+            ],
+            capsys,
+        )
+
+    def test_it_lists_every_device_including_revoked_ones(self, tmp_path, capsys) -> None:
+        store, plan = self._setup(tmp_path, ("laptop-1", "laptop-2"))
+        store.revoke("laptop-2")
+        code, out = self._status(tmp_path, plan, capsys)
+        assert code == 0
+        assert "laptop-1" in out
+        assert "REVOKED" in out
+
+    def test_a_key_file_matching_the_store_is_reported_as_current(self, tmp_path, capsys) -> None:
+        store, plan = self._setup(tmp_path)
+        store.write_api_key_file(tmp_path / "deploy" / "keys.txt")
+        _, out = self._status(tmp_path, plan, capsys)
+        assert "matches the store" in out
+
+    def test_a_device_added_since_the_last_restart_is_named(self, tmp_path, capsys) -> None:
+        """Otherwise this surfaces as a 401 the new laptop cannot explain."""
+        store, plan = self._setup(tmp_path)
+        store.write_api_key_file(tmp_path / "deploy" / "keys.txt")
+        store.add("laptop-2")
+        _, out = self._status(tmp_path, plan, capsys)
+        assert "OUT OF DATE" in out
+        assert "laptop-2 cannot connect yet" in out
+
+    def test_a_revoked_device_that_still_has_access_is_reported(self, tmp_path, capsys) -> None:
+        """The dangerous direction: revocation does not take effect until the
+        service restarts, and nothing else would say so."""
+        store, plan = self._setup(tmp_path, ("laptop-1", "laptop-2"))
+        store.write_api_key_file(tmp_path / "deploy" / "keys.txt")
+        store.revoke("laptop-2")
+        _, out = self._status(tmp_path, plan, capsys)
+        assert "OUT OF DATE" in out
+        assert "revoked key(s) would still be accepted" in out
+
+    def test_a_missing_key_file_says_the_service_would_not_start(self, tmp_path, capsys) -> None:
+        _, plan = self._setup(tmp_path)
+        _, out = self._status(tmp_path, plan, capsys)
+        assert "does not exist" in out
+        assert "would not come up" in out
+
+    def test_no_devices_at_all_says_how_to_issue_one(self, tmp_path, capsys) -> None:
+        from localllm.handoff import ServerPlan
+
+        plan = ServerPlan(
+            context_per_slot=8192,
+            n_slots=1,
+            model_alias=MODEL_ALIAS,
+            model_id="m",
+            kv_quant="q8_0",
+            ctx_size_flag=8192,
+        ).write(tmp_path / "deploy")
+        _, out = self._status(tmp_path, plan, capsys)
+        assert "localllm key add" in out

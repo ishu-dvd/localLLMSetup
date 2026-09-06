@@ -115,7 +115,7 @@ llama.cpp, llama-swap and gguf-parser. Not a new inference stack.
 git clone https://github.com/ishu-dvd/localLLMSetup
 cd localLLMSetup
 $env:PYTHONPATH="src"
-python -m pytest tests          # 654 tests
+python -m pytest tests          # 676 tests
 python -m localllm next         # says what to do first
 ```
 
@@ -190,6 +190,35 @@ python -m localllm key revoke laptop-2      # history preserved for attribution
 python -m localllm key export --out keys.txt      # llama-server --api-key-file
 python -m localllm key caddyfile ai.tailnet.ts.net  # per-device attribution
 ```
+
+**See the fleet, and catch the mistake nothing else reports:**
+
+```powershell
+python -m localllm status
+```
+
+```
+Devices  : 2 active, 3 issued in total
+  [active ] laptop-1             issued 2026-09-05T10:02:11+00:00
+  [active ] laptop-2             issued 2026-09-06T18:44:07+00:00
+  [REVOKED] old-thinkpad         issued 2026-08-30T09:15:00+00:00
+
+Key file : C:\ai\deploy\keys.txt is OUT OF DATE
+           laptop-2 cannot connect yet
+           1 revoked key(s) would still be accepted
+           -> localllm key export --out C:\ai\deploy\keys.txt
+              Restart-Service localllm
+
+Server   : up at http://127.0.0.1:8080
+           serving 'claude-local-coder'
+           2 slot(s) x 8,192 tokens each
+           0 of 2 slot(s) busy
+```
+
+That middle block is the point. llama-server parses its key file **once, at startup**, so
+the store and the file drift apart the moment a device is added or revoked — and neither
+side shows it. A newly invited laptop gets a `401` that looks like a bad token; a
+*revoked* laptop keeps working.
 
 **Never wonder what to run next.** The order is not obvious — `up` refuses until
 llama.cpp *and* a GGUF are both present, `invite` refuses until `up` has written a
@@ -296,7 +325,7 @@ On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
 | 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**654 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
+**676 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
 
 ---
 

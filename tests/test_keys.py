@@ -247,3 +247,75 @@ class TestApiKeyFileLineEndings:
     def test_comments_survive_for_attribution(self, tmp_path: Path) -> None:
         text = self._written(tmp_path).decode("utf-8")
         assert any(ln.startswith("#") and "laptop-a" in ln for ln in text.split("\n"))
+
+
+class TestTheKeyFileDriftsFromTheStore:
+    """llama-server parses --api-key-file once, at startup, so the store and
+    the file diverge the moment a device is added or revoked.
+
+    Neither side shows it. A newly invited laptop gets a 401 that looks like a
+    bad token, and - worse - a laptop whose key was revoked keeps working until
+    someone happens to restart the service.
+    """
+
+    def test_a_file_matching_the_store_is_current(self, tmp_path):
+        store = KeyStore(tmp_path / "keys.json")
+        store.add("laptop-1")
+        path = store.write_api_key_file(tmp_path / "keys.txt")
+        assert store.file_is_current(path) is True
+
+    def test_adding_a_device_makes_the_file_stale(self, tmp_path):
+        store = KeyStore(tmp_path / "keys.json")
+        store.add("laptop-1")
+        path = store.write_api_key_file(tmp_path / "keys.txt")
+        store.add("laptop-2")
+        assert store.file_is_current(path) is False
+
+    def test_revoking_a_device_makes_the_file_stale(self, tmp_path):
+        """The dangerous direction: until a restart, the revoked laptop still
+        has full access and nothing anywhere says so."""
+        store = KeyStore(tmp_path / "keys.json")
+        store.add("laptop-1")
+        store.add("laptop-2")
+        path = store.write_api_key_file(tmp_path / "keys.txt")
+        store.revoke("laptop-2")
+        assert store.file_is_current(path) is False
+
+    def test_a_missing_file_is_distinct_from_an_empty_one(self, tmp_path):
+        """They are different failures: a missing file makes llama-server throw
+        at startup, an empty one makes it skip authentication entirely."""
+        store = KeyStore(tmp_path / "keys.json")
+        store.add("laptop-1")
+        assert store.file_is_current(tmp_path / "absent.txt") is None
+
+        empty = tmp_path / "empty.txt"
+        empty.write_text("# only a comment\n", encoding="utf-8")
+        assert store.keys_in_file(empty) == []
+        assert store.file_is_current(empty) is False
+
+    def test_the_file_is_parsed_the_way_llama_cpp_parses_it(self, tmp_path):
+        """Reimplemented rather than trusting our own writer, because the point
+        is to catch files our writer did not produce.
+
+        Only a `#` in column 0 is a comment (`key[0] != '#'`), and nothing is
+        trimmed - so an indented comment IS a key, and that is what the server
+        will believe too.
+        """
+        store = KeyStore(tmp_path / "keys.json")
+        path = tmp_path / "hand-edited.txt"
+        path.write_text(
+            "# a real comment\nsk-one\n\n  # indented, so NOT a comment\nsk-two \n",
+            encoding="utf-8",
+        )
+        keys = store.keys_in_file(path)
+        assert keys == ["sk-one", "  # indented, so NOT a comment", "sk-two "]
+
+    def test_key_order_does_not_count_as_drift(self, tmp_path):
+        """The server does a flat membership test, so order carries no meaning
+        and reporting it as drift would send users to restart for nothing."""
+        store = KeyStore(tmp_path / "keys.json")
+        a = store.add("laptop-1")
+        b = store.add("laptop-2")
+        path = tmp_path / "reordered.txt"
+        path.write_text(f"{b.key}\n{a.key}\n", encoding="utf-8")
+        assert store.file_is_current(path) is True
