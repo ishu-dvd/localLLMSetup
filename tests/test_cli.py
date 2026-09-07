@@ -883,8 +883,9 @@ class TestInviteKeepsTheServerKeyFileCurrent:
 
     def _plan(self, tmp_path):
         from localllm.handoff import ServerPlan
+        from localllm.keys import KeyStore
 
-        return ServerPlan(
+        plan = ServerPlan(
             context_per_slot=8192,
             n_slots=2,
             model_alias=MODEL_ALIAS,
@@ -892,6 +893,10 @@ class TestInviteKeepsTheServerKeyFileCurrent:
             kv_quant="q8_0",
             ctx_size_flag=16384,
         ).write(tmp_path / "deploy")
+        # `up` writes this; `invite` refreshes it but must never create it,
+        # because its absence is how we know this is not the server machine.
+        KeyStore(tmp_path / "keys.json").write_api_key_file(tmp_path / "deploy" / "keys.txt")
+        return plan
 
     def test_inviting_a_device_rewrites_the_servers_key_file(self, tmp_path, capsys) -> None:
         plan = self._plan(tmp_path)
@@ -1135,8 +1140,9 @@ class TestRotatingALeakedToken:
 
     def _plan(self, tmp_path):
         from localllm.handoff import ServerPlan
+        from localllm.keys import KeyStore
 
-        return ServerPlan(
+        plan = ServerPlan(
             context_per_slot=8192,
             n_slots=1,
             model_alias=MODEL_ALIAS,
@@ -1144,6 +1150,8 @@ class TestRotatingALeakedToken:
             kv_quant="q8_0",
             ctx_size_flag=8192,
         ).write(tmp_path / "deploy")
+        KeyStore(tmp_path / "keys.json").write_api_key_file(tmp_path / "deploy" / "keys.txt")
+        return plan
 
     def _invite(self, tmp_path, plan, capsys, *extra):
         return run(
@@ -1221,3 +1229,73 @@ class TestRotatingALeakedToken:
         after = KeyStore(tmp_path / "keys.json").for_device("laptop-1")
         assert before is not None and after is not None
         assert before.key == after.key
+
+
+class TestInviteDoesNotScatterKeysOutsideTheServer:
+    """`invite` derived the key file from wherever --plan pointed and wrote it
+    unconditionally.
+
+    So `invite --plan Downloads/server-plan.json` wrote every active key into
+    Downloads in plain text - a directory that is not in .gitignore and was
+    never meant to hold secrets - AND told the user that restarting the service
+    would pick it up. The file the server actually parses had never been
+    touched, so the invited laptop got a permanent 401 that looks like a bad
+    token: exactly the failure this command exists to remove.
+    """
+
+    def _plan_only(self, tmp_path, where="elsewhere"):
+        from localllm.handoff import ServerPlan
+
+        return ServerPlan(
+            context_per_slot=8192,
+            n_slots=1,
+            model_alias=MODEL_ALIAS,
+            model_id="m",
+            kv_quant="q8_0",
+            ctx_size_flag=8192,
+        ).write(tmp_path / where)
+
+    def _invite(self, tmp_path, plan, capsys, *extra):
+        return run(
+            [
+                "invite",
+                "laptop-1",
+                "--url",
+                "http://msi:8080",
+                "--plan",
+                str(plan),
+                "--store",
+                str(tmp_path / "keys.json"),
+                *extra,
+            ],
+            capsys,
+        )
+
+    def test_no_key_file_is_created_next_to_a_stray_plan(self, tmp_path, capsys) -> None:
+        plan = self._plan_only(tmp_path, "Downloads")
+        code, out = self._invite(tmp_path, plan, capsys)
+        assert code == 0, out
+        assert not (tmp_path / "Downloads" / "keys.txt").exists()
+
+    def test_it_does_not_claim_a_restart_will_fix_it(self, tmp_path, capsys) -> None:
+        """The dangerous half. Nothing the server reads changed, so telling the
+        user to restart sends them to do something that cannot work and then
+        blame the token."""
+        plan = self._plan_only(tmp_path, "Downloads")
+        _, out = self._invite(tmp_path, plan, capsys)
+        assert "NOT on the server" in out
+        assert "Restart-Service" not in out
+
+    def test_pointing_key_file_at_the_real_one_updates_it(self, tmp_path, capsys) -> None:
+        """The escape hatch: the plan can live anywhere as long as the key file
+        is named explicitly."""
+        from localllm.keys import KeyStore
+
+        plan = self._plan_only(tmp_path, "Downloads")
+        real = KeyStore(tmp_path / "keys.json").write_api_key_file(tmp_path / "deploy" / "keys.txt")
+        code, out = self._invite(tmp_path, plan, capsys, "--key-file", str(real))
+        assert code == 0, out
+        assert "Restart-Service" in out
+        entry = KeyStore(tmp_path / "keys.json").for_device("laptop-1")
+        assert entry is not None
+        assert entry.key in real.read_text(encoding="utf-8")

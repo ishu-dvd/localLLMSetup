@@ -219,6 +219,23 @@ class Plan:
         return self.context_per_slot * self.n_slots
 
 
+def _quoted(path: str) -> str:
+    """Quote a path that contains a space, so the flags survive being joined.
+
+    `llama_server_flags` returns one space-separated string, and the NSSM
+    script interpolates it straight into `AppParameters` with no per-argument
+    quoting. A Windows profile directory called `C:\\Users\\First Last` is the
+    common case, and unquoted it makes llama-server receive
+    `--api-key-file C:\\Users\\First` — a file it cannot open, which per
+    `common/arg.cpp:3523` makes it throw and exit at startup.
+
+    That fails closed rather than open, but `up` reports success and the guide
+    marks the service step unobservable, so nothing surfaces it. Making
+    `--api-key-file` unconditional turned this from latent into likely.
+    """
+    return f'"{path}"' if " " in path and not path.startswith('"') else path
+
+
 @dataclass(frozen=True)
 class Verdict:
     status: Fit
@@ -292,10 +309,10 @@ class Verdict:
             f"<path-to>/{self.model.name}-{self.model.quant}.gguf"
         )
         parts = [
-            f"-m {model_path}",
+            f"-m {_quoted(model_path)}",
             f"-a {MODEL_ALIAS}",  # Anthropic-path clients filter IDs lacking "claude"
             "--host 0.0.0.0 --port 8080",
-            f"--api-key-file {api_key_file or '<path-to>/keys.txt'}",
+            f"--api-key-file {_quoted(api_key_file or '<path-to>/keys.txt')}",
             "--device Vulkan0",
             self._offload_flags(),
             f"-np {self.plan.n_slots}",

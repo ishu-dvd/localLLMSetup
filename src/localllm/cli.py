@@ -485,6 +485,14 @@ def cmd_check(args: argparse.Namespace) -> int:
             api_key = api_key or found.api_key
             model = model or found.model
             expected_context = found.context
+            if found.drift:
+                # Checking the recorded intent instead of the loaded file would
+                # bless a client that is about to overflow the slot.
+                print(
+                    f"note: this config has been edited since `localllm join` wrote "
+                    f"it ({', '.join(found.drift)} differ). Checking what "
+                    f"{found.path.name} actually says.\n"
+                )
             if not server:
                 print(
                     f"error: found {found.path}, but it does not record a server "
@@ -779,14 +787,22 @@ def _load_plan(path: Path, *, named_by_user: bool) -> tuple[ServerPlan | None, l
         return None, [f"error: {exc}"]
 
 
-def _fetch_server_facts(url: str, api_key: str) -> tuple[object | None, list[str]]:
+def _fetch_server_facts(url: str, api_key: str) -> tuple[object | None, list[str], str | None]:
     """Ask the running server what it actually gives each slot.
 
     `/props` is the only authority here — `-c` is a pool divided across slots,
-    so nothing else on the wire reports the per-slot window. A failure is not
-    fatal: we fall back to the artifact and say the number is unconfirmed.
+    so nothing else on the wire reports the per-slot window.
 
-    The timeout is deliberately shorter than the doctor's. This call is
+    Returns `(facts, notes, fatal)`. Most failures are not fatal: an unreachable
+    server means fall back to the artifact and say the number is unconfirmed.
+    **A 401 is different.** It means the server *is* reachable and *did* reject
+    this key — a definite failure, not an inconclusive one. Collapsing it into
+    "not reachable for confirmation" handed the user a config that cannot
+    authenticate, from a command that reported success; and the most likely
+    cause is this project's own documented hazard, a key issued but not yet
+    picked up by a restart.
+
+    The timeout is deliberately shorter than the doctor's. Confirming a plan is
     advisory and has a fallback, so onboarding on a laptop that cannot see the
     server should degrade quickly rather than appear to hang.
     """
@@ -794,11 +810,25 @@ def _fetch_server_facts(url: str, api_key: str) -> tuple[object | None, list[str
     result = probe(f"{origin}/props", api_key=api_key, timeout=PROBE_TIMEOUT_S)
     if result.status != 200:
         finding = diagnose(result)
-        return None, [f"server   : not reachable for confirmation ({finding.detail})"]
+        if finding.outcome is Outcome.UNAUTHORISED:
+            return (
+                None,
+                [],
+                "the server rejected this key. The most likely cause is that it was "
+                "issued after llama-server started - it reads --api-key-file only at "
+                "startup. On the server: Restart-Service, or `localllm invite "
+                "<device> --url <url> --rotate` for a fresh key. Use --no-probe to "
+                "write the config anyway.",
+            )
+        return None, [f"server   : not reachable for confirmation ({finding.detail})"], None
     facts = read_props(result.body)
     if facts is None:
-        return None, ["server   : answered /props in an unexpected shape; using the plan instead"]
-    return facts, [f"server   : confirmed {facts.context_per_slot:,} tokens per slot"]
+        return (
+            None,
+            ["server   : answered /props in an unexpected shape; using the plan instead"],
+            None,
+        )
+    return facts, [f"server   : confirmed {facts.context_per_slot:,} tokens per slot"], None
 
 
 def _plan_from_invite(inv: object) -> ServerPlan:
@@ -861,12 +891,16 @@ def cmd_invite(args: argparse.Namespace) -> int:
     else:
         print(f"reusing the existing key for {args.device}")
 
-    # The server parses --api-key-file once, at startup (common/arg.cpp:3520),
-    # so a key added here is not live until the service restarts. Rewriting the
-    # file now means the restart is the only remaining step - and forgetting it
-    # produces a 401 the new laptop cannot explain.
-    key_file = plan_path.parent / KEY_FILENAME
-    store.write_api_key_file(key_file)
+    # The key file lives beside the plan by default, because `up` writes both
+    # into the same directory. It is NOT created if absent: `_refresh_key_file`
+    # refuses for the same reason, and bypassing that here meant
+    # `invite --plan <some-copy>` wrote every active key into an arbitrary
+    # directory *and* told the user a restart would pick it up - while the file
+    # the server actually parses had never been touched.
+    key_file = Path(args.key_file) if args.key_file else plan_path.parent / KEY_FILENAME
+    refreshed = key_file.exists()
+    if refreshed:
+        store.write_api_key_file(key_file)
 
     token = Invite(
         url=args.url,
@@ -889,14 +923,25 @@ def cmd_invite(args: argparse.Namespace) -> int:
     if issued:
         # llama.cpp reads the key file once, at startup. A key issued now is
         # inert until then, and the resulting 401 looks like a bad token.
-        print(
-            f"\nThe new key is not live yet. {key_file} has been rewritten, but "
-            f"llama-server reads it only at startup - restart the service before "
-            f"{args.device} tries to connect:"
-        )
-        print(f"  Restart-Service {args.service_name}")
-        if rotated:
-            print("  Until that restart, the leaked key still works.")
+        print()
+        if refreshed:
+            print(
+                f"The new key is not live yet. {key_file} has been rewritten, but "
+                f"llama-server reads it only at startup - restart the service before "
+                f"{args.device} tries to connect:"
+            )
+            print(f"  Restart-Service {args.service_name}")
+            if rotated:
+                print("  Until that restart, the leaked key still works.")
+        else:
+            # Claiming a restart would fix this would be false: nothing the
+            # server reads has changed, so the laptop would 401 indefinitely.
+            print(
+                f"The new key is NOT on the server. There is no key file at "
+                f"{key_file}, so nothing the server reads was updated, and a "
+                f"restart alone will not help."
+            )
+            print("Run this on the server machine, or point --key-file at its keys.txt.")
     return 0
 
 
@@ -944,11 +989,17 @@ def cmd_join(args: argparse.Namespace) -> int:
         if any(n.startswith("error:") for n in plan_notes):
             return 1
 
-    # The key came from the invite or the store, so the probe doubles as proof
-    # it works - a wrong key here is found now rather than mid-task.
-    facts, server_notes = (None, []) if args.no_probe else _fetch_server_facts(url, api_key)
+    # The key came from the invite or the store, so a 401 here is a definite
+    # failure rather than an inconclusive one - and it is the failure this
+    # branch's own hazard produces.
+    facts, server_notes, fatal = (
+        (None, [], None) if args.no_probe else _fetch_server_facts(url, api_key)
+    )
     for n in server_notes:
         print(n)
+    if fatal:
+        print(f"error: {fatal}", file=sys.stderr)
+        return 1
 
     choice = resolve_context(
         requested=args.context,
@@ -1234,6 +1285,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"the {PLAN_FILENAME} written by `localllm up` (default: {DEFAULT_PLAN_PATH})",
     )
     invite.add_argument("--store", type=Path, default=DEFAULT_STORE)
+    invite.add_argument(
+        "--key-file",
+        type=Path,
+        default=None,
+        help="the server's --api-key-file (default: keys.txt beside --plan). "
+        "It is never created - its absence means this is not the server machine",
+    )
     invite.add_argument(
         "--rotate",
         action="store_true",

@@ -630,3 +630,51 @@ class TestSpeculationBudget:
         error should stop someone re-adding it from a stale guide."""
         with pytest.raises(ValueError, match="27852"):
             _ = Plan(context_per_slot=16384, speculation="ngram-cache").effective_speculation
+
+
+class TestPathsWithSpacesSurviveTheServiceDefinition:
+    """`llama_server_flags` returns ONE space-separated string, and the NSSM
+    script interpolates it straight into AppParameters with no per-argument
+    quoting.
+
+    `C:\\Users\\First Last` is the common Windows profile shape. Unquoted, it
+    makes llama-server receive `--api-key-file C:\\Users\\First`, which it
+    cannot open - and per common/arg.cpp:3523 that throws and exits at startup.
+    It fails closed rather than open, but `up` reports success and the guide
+    marks the service step unobservable, so nothing surfaces it.
+    """
+
+    def _verdict(self):
+        return solve(Hardware(vram_total_gb=8, ram_total_gb=16), GPT_OSS_20B, Plan(8192))
+
+    def test_a_key_file_path_with_a_space_is_quoted(self) -> None:
+        flags = self._verdict().llama_server_flags(
+            api_key_file=r"C:\Users\First Last\deploy\keys.txt"
+        )
+        assert r'--api-key-file "C:\Users\First Last\deploy\keys.txt"' in flags
+
+    def test_a_path_without_a_space_is_left_alone(self) -> None:
+        """Quoting everything would be harmless for llama-server but noisy in
+        the flags file a human reads and copies."""
+        flags = self._verdict().llama_server_flags(api_key_file=r"C:\ai\keys.txt")
+        assert r"--api-key-file C:\ai\keys.txt" in flags
+        assert '"C:\\ai\\keys.txt"' not in flags
+
+    def test_the_model_path_is_quoted_on_the_same_rule(self) -> None:
+        """Same root cause, and it predates the key file - `-m` has always been
+        interpolated into the same string."""
+        from dataclasses import replace
+
+        model = replace(GPT_OSS_20B, source_path=r"C:\My Models\gpt-oss.gguf")
+        flags = solve(
+            Hardware(vram_total_gb=8, ram_total_gb=16), model, Plan(8192)
+        ).llama_server_flags()
+        assert r'-m "C:\My Models\gpt-oss.gguf"' in flags
+
+    def test_the_flag_count_is_unchanged_by_quoting(self) -> None:
+        """A quote that swallowed a following flag would be worse than the bug
+        it fixes."""
+        plain = self._verdict().llama_server_flags(api_key_file=r"C:\ai\keys.txt")
+        spaced = self._verdict().llama_server_flags(api_key_file=r"C:\a b\keys.txt")
+        assert plain.count("--") == spaced.count("--")
+        assert "--device Vulkan0" in spaced
