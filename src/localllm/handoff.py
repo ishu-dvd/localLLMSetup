@@ -258,6 +258,23 @@ def resolve_context(
         )
 
     if requested is not None:
+        if requested <= 0:
+            # Reaches here as an explicit `--context 0`. Left alone it flows
+            # into the client config and raises out of the builder as an
+            # unhandled ValueError - a traceback where the user should get a
+            # sentence. A window that holds nothing is refused for the same
+            # reason an oversized one is: it cannot work, so guessing at intent
+            # is worse than saying so.
+            return ContextChoice(
+                context=budget or FALLBACK_CONTEXT,
+                source=source,
+                notes=tuple(notes),
+                error=(
+                    f"--context {requested} is not a usable window. Pass a "
+                    f"positive number of tokens, or omit --context to take "
+                    f"whatever the server gives each slot."
+                ),
+            )
         if budget is not None and requested > budget:
             where = "the running server" if server is not None else "the plan"
             return ContextChoice(

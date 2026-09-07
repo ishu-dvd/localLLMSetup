@@ -283,3 +283,28 @@ def test_an_empty_server_alias_does_not_shadow_the_plan():
         "p",
         "plan",
     )
+
+
+@pytest.mark.parametrize("bad", [0, -1, -8192])
+def test_a_non_positive_requested_context_is_refused(bad):
+    """It used to be accepted, reported as "capping at the requested 0", and
+    then raise out of the client-config builder as an unhandled ValueError -
+    a traceback where the user should get a sentence."""
+    choice = resolve_context(requested=bad, plan=a_plan(context_per_slot=8192))
+    assert not choice
+    assert choice.error is not None
+    assert "not a usable window" in choice.error
+
+
+def test_the_refused_choice_still_carries_a_usable_number():
+    """A caller that ignores the error must not then read a zero out of it and
+    write that into a config."""
+    choice = resolve_context(requested=0, plan=a_plan(context_per_slot=8192))
+    assert choice.context > 0
+
+
+def test_a_non_positive_context_is_refused_even_with_nothing_else_known():
+    """The budget is None here, so the check cannot lean on a comparison."""
+    choice = resolve_context(requested=0)
+    assert not choice
+    assert choice.context == FALLBACK_CONTEXT

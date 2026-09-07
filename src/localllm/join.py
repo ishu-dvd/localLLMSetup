@@ -171,7 +171,7 @@ def _octofriend(base_url: str, api_key: str, model: str, context: int) -> Client
             f'      baseUrl: "{origin}",',
             '      apiEnvVar: "LOCAL_LLM_KEY",',
             f'      model: "{model}",',
-            "      context: 999,",
+            f"      context: {context},",
             "    },",
             "  ],",
             "}",
