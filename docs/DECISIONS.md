@@ -804,3 +804,26 @@ not *exist*, and considerably harder to spot.
 Script output appeared **before** the line saying which script was running: Python
 block-buffers stdout when it is a pipe, while a subprocess writes to the console directly.
 `_run` now flushes before spawning, so the transcript reads in the order things happened.
+
+### What the mutation sweep found here
+
+83 mutations, two survivors, and they were different kinds of problem — worth separating,
+because only one of them was a gap in the tests:
+
+1. **A real gap.** Deleting the `sys.platform` guard from `is_elevated` survived the whole
+   suite. `ctypes.windll` does not exist off Windows and the function already catches
+   `AttributeError`, so without the guard it *still* returns `None` on Linux — by accident,
+   through a handler meant for something else. That matters because CI runs on Linux: any
+   future change to that handler would silently change what a non-Windows host reports.
+   Closed by a test that makes `ctypes` raise an uncaught error and asserts it is never
+   reached.
+
+2. **A bad mutation.** The one meant to point NSSM at `cmd.exe` applied `.replace()` to an
+   f-string fragment that never contained `powershell.exe`, so it changed nothing and
+   "survived" a test that would have caught the real thing immediately. Corrected to target
+   the actual string, it is caught by
+   `test_the_installer_runs_the_loop_through_powershell`.
+
+A survivor is a question, not a verdict. Assuming the first kind when it is the second adds
+tests for behaviour already covered; assuming the second when it is the first leaves the
+gap open.

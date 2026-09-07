@@ -250,3 +250,70 @@ class TestOutputReadsInTheOrderThingsHappened:
 class _Completed:
     def __init__(self, returncode: int) -> None:
         self.returncode = returncode
+
+
+class TestThePlatformCheckComesBeforeTheWindowsOnlyCall:
+    """`ctypes.windll` does not exist off Windows, and `is_elevated` catches
+    AttributeError - so removing the `sys.platform` guard leaves a function
+    that still returns None on Linux, by accident, through an exception
+    handler meant for something else.
+
+    A mutation deleting that guard survived the whole suite for exactly that
+    reason. It matters because CI runs on Linux: relying on an exception to
+    stand in for a platform check means any future change to that handler
+    silently changes what a non-Windows host reports.
+    """
+
+    def test_a_non_windows_host_never_touches_the_windows_api(self, monkeypatch) -> None:
+        import localllm.elevate as elevate
+
+        class Forbidden:
+            def __getattr__(self, name: str) -> object:
+                raise RuntimeError(f"ctypes.{name} must not be reached off Windows")
+
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr(elevate, "ctypes", Forbidden())
+        assert elevate.is_elevated() is None
+
+    def test_on_windows_it_does_ask(self, monkeypatch) -> None:
+        import localllm.elevate as elevate
+
+        class Shell:
+            @staticmethod
+            def IsUserAnAdmin() -> int:  # noqa: N802 - the Win32 name
+                return 1
+
+        class Fake:
+            windll = type("W", (), {"shell32": Shell})()
+
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(elevate, "ctypes", Fake())
+        assert elevate.is_elevated() is True
+
+    def test_a_zero_answer_is_not_elevated(self, monkeypatch) -> None:
+        import localllm.elevate as elevate
+
+        class Shell:
+            @staticmethod
+            def IsUserAnAdmin() -> int:  # noqa: N802 - the Win32 name
+                return 0
+
+        class Fake:
+            windll = type("W", (), {"shell32": Shell})()
+
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(elevate, "ctypes", Fake())
+        assert elevate.is_elevated() is False
+
+    def test_a_windows_that_cannot_answer_says_unknown_rather_than_no(self, monkeypatch) -> None:
+        """None and False mean different things to the caller: False promises
+        that re-running elevated will work."""
+        import localllm.elevate as elevate
+
+        class Broken:
+            def __getattr__(self, name: str) -> object:
+                raise OSError("shell32 unavailable")
+
+        monkeypatch.setattr("sys.platform", "win32")
+        monkeypatch.setattr(elevate, "ctypes", Broken())
+        assert elevate.is_elevated() is None

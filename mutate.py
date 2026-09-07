@@ -538,9 +538,9 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "src/localllm/serve.py",
-        'f\'\\\\"{loop_script}\\\\""\',',
-        'f\'\\\\"{loop_script}\\\\""\'.replace("powershell.exe", "cmd.exe"),',
-        "NSSM runs executables, not scripts - the loop needs a shell to host it",
+        '+ \' "powershell.exe" "-NoProfile -ExecutionPolicy Bypass -File \'',
+        '+ \' "cmd.exe" "-NoProfile -ExecutionPolicy Bypass -File \'',
+        "NSSM runs executables, not scripts - the loop needs a shell that can host a .ps1",
     ),
 ]
 

@@ -475,8 +475,8 @@ calls it at the end, asking for Administrator once through UAC.
 | 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup, agent-readiness gate |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**989 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13,
-and 73/73 mutations caught.
+**1026 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13,
+and 83/83 mutations caught.
 
 ---
 
