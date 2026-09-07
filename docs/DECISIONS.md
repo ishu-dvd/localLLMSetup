@@ -654,7 +654,7 @@ llama.cpp + llama-swap + gguf-parser. Not a new inference stack, not a new hardw
 
 | # | Item | Why it must be measured |
 |---|---|---|
-| 1 | **Does low-bit quantisation destroy KAT-Coder's tool-call reliability?** | **The single most decision-relevant unknown.** No measurement of KAT-Coder at *any* quant exists anywhere. Determines whether the coding specialist is usable at all |
+| 1 | **Does low-bit quantisation destroy KAT-Coder's tool-call reliability?** | **The single most decision-relevant unknown.** No measurement of KAT-Coder at *any* quant exists anywhere. Determines whether the coding specialist is usable at all. ✅ **Now instrumented:** `localllm check` sends a real tool and grades the answer — see §10. The measurement still needs the MSI; the *instrument* no longer does |
 | 3 | `--kv-unified` vs `--no-kv-unified` (3 clients only) | ⚠️ `llama.h` contains **two adjacent comments that conflict** → benchmark, don't guess. Moot at `-np 1` |
 | 5 | Vulkan async-load caps | Affects load-time RAM peak (~256 MB vs largest single tensor) |
 | 6 | Octofriend autofix models CPU-only on a client laptop | Inferred from model size, not verified |
@@ -670,3 +670,66 @@ llama.cpp + llama-swap + gguf-parser. Not a new inference stack, not a new hardw
 | Is anything missed by only using Hugging Face? | **No** — HF is the de-facto registry; ModelScope/NGC are the only partial exceptions |
 
 **Nothing in the open table is a guess in the plan — each is an experiment.** See `PLAN.md`.
+
+---
+
+## 10. "Connects" is not "works" — **DECIDED: `check` grades the agent path**
+
+A connectivity check establishes that the server is reachable, that the key is accepted, that
+the model is listed, and that a request returns a completion. **None of that is what a coding
+agent needs.** Agents call tools, and they stream. Both paths fail independently of plain
+generation, and both fail without an error anyone can act on.
+
+| Failure | What the user sees | What `check` now says |
+|---|---|---|
+| Model answers in prose instead of calling the tool | The agent "doesn't do anything" | `the model answered in prose instead of calling the tool it was given` |
+| Tool call arrives with unparseable `arguments` | The agent crashes mid-task | `the model called a tool but the call is unusable` |
+| A proxy buffers the response | The agent appears to hang, then dumps everything at once | `all N frames arrived less than 1 ms apart` |
+| `--no-jinja` on the server | 500 on the first tool request | already diagnosed by `diagnose` — **not given a second name** |
+
+### Why `tool_choice` is left at `auto`
+
+Forcing the call would test a path real clients do not use, and would hide the one failure
+most worth catching: a model that *can* emit tool calls but never decides to. Agents rely on
+`auto`, so `auto` is the honest fidelity.
+
+### Why streaming is judged on arrival times, not content
+
+A buffering proxy returns **valid SSE**. The frames are well-formed, the content is correct,
+and `read()` returns exactly the same bytes it would from a healthy stream. The only thing
+that differs is *when* they arrive — so `check` reads the response line by line and records a
+timestamp per frame. Frames arriving within 20 ms of each other would be over 400 tok/s;
+this hardware is budgeted at 10–40 tok/s, so no genuine stream can land there and a buffered
+one always does. Below 8 frames it declines to judge rather than fail a healthy server.
+
+This is also the only thing that proves the generated Caddyfile's buffering directive is
+actually in force on the deployed proxy.
+
+### The free signal we were discarding
+
+`/props` sets `chat_template_tool_use` only when jinja is on **and** the model ships a
+tool-use template. We already fetch `/props` for the per-slot context. Its absence is
+ambiguous — `--no-jinja`, or simply a model without a dedicated template — so it is reported
+only when present, and the live tool call settles the rest.
+
+### 🚨 Running it found three defects that 966 passing tests did not
+
+1. **Two fix messages named commands that do not exist** — `localllm caddyfile` and
+   `localllm recommend`. Both are plain prose inside a string literal, so nothing was
+   checking them. A doctor that ends with an invalid command is worse than one that says
+   nothing: the user runs it, argparse rejects it, and the diagnosis loses its credibility
+   too. The real names are `localllm key caddyfile` and `localllm plan`.
+   → `TestEveryCommandWeTellUsersToRunExists` now walks every `` `localllm …` `` in the
+   source and asks argparse whether it is real. It found 11 across 7 files.
+
+2. **The product's own next step steered every user to Cline** — the one client that
+   §6 documents as impossible to configure from a file. `key add`, the invite, and the setup
+   guide each ended with `--client cline`. Being right in the table and wrong in the
+   instruction is worse than being consistently wrong, because the table is what a reviewer
+   reads and the instruction is what a user runs.
+   → `TestWeNeverTellUsersToPickTheClientWeCannotConfigure` cross-checks every `--client X`
+   instruction against `CLIENTS[X].writes_config`.
+
+3. **The invite still hand-rolled a `join`** after `localllm client <token>` had replaced it
+   — the longer path, ending at the worst client. Nothing tested the invite's closing
+   instruction, which is how it survived the entire feature that superseded it.

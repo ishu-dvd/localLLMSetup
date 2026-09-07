@@ -33,7 +33,18 @@ from pathlib import Path
 
 from .budget import Fit, Hardware, Plan, recommend, solve
 from .catalogue import CATALOGUE, model_from_gguf
-from .client import Api, Outcome, check_inference, check_model_visibility, diagnose, probe
+from .client import (
+    Api,
+    Finding,
+    Outcome,
+    check_inference,
+    check_model_visibility,
+    check_streaming,
+    check_tool_calling,
+    diagnose,
+    probe,
+    stream_probe,
+)
 from .constants import MODEL_ALIAS
 from .detect import detect
 from .gguf import GgufError, read_gguf_file, read_gguf_url
@@ -617,6 +628,13 @@ def cmd_check(args: argparse.Namespace) -> int:
                 f"{facts.context_per_slot:,} available per slot"
             )
 
+        # Free, and nobody else asks it: llama.cpp only advertises this key when
+        # jinja is on AND the model ships a tool-use template. Absence is
+        # ambiguous - see ServerFacts.tool_template - so only the good news is
+        # worth a line here. The tool-calling check below settles the rest.
+        if facts is not None and facts.tool_template:
+            print("  [ok  ] the model ships a dedicated tool-use template")
+
     if worst == 0:
         # Capacity is informational: a request beyond -np queues rather than
         # failing, so a busy server is not a broken one - but the resulting
@@ -644,6 +662,43 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"         {finding.detail}")
         if not finding:
             print(f"         -> {finding.fix}")
+            worst = 1
+
+    if worst == 0 and not args.no_inference and not args.no_agent_checks:
+        # Everything above proves the server is reachable and will talk. Neither
+        # proves a coding agent will work, because agents do not chat - they call
+        # tools, and they stream. Those two paths fail independently of plain
+        # generation and produce no error a user can act on: the agent connects,
+        # then either answers in prose where a function call was expected or
+        # appears to hang while a proxy holds the whole reply back.
+        def report(label: str, finding: Finding) -> bool:
+            mark = "ok  " if finding else "FAIL"
+            print(f"  [{mark}] {label}")
+            print(f"         {finding.detail}")
+            if not finding:
+                print(f"         -> {finding.fix}")
+            return bool(finding)
+
+        tools = probe(
+            f"{base}{api.completion_path}",
+            api_key=api_key,
+            json_body=api.tool_probe_body(model),
+            timeout=args.inference_timeout,
+        )
+        if not report("the model calls tools", check_tool_calling(tools, api=api)):
+            worst = 1
+
+        streamed, samples = stream_probe(
+            f"{base}{api.completion_path}",
+            api_key=api_key,
+            json_body=api.stream_probe_body(model),
+            timeout=args.inference_timeout,
+        )
+        transport = diagnose(streamed)
+        if not report(
+            "the reply streams as it is generated",
+            transport if not transport else check_streaming(samples),
+        ):
             worst = 1
 
     print("\nAll checks passed." if worst == 0 else "\nSee the suggested fix above.")
@@ -771,7 +826,7 @@ def cmd_key(args: argparse.Namespace) -> int:
             return 1
         print(f"{entry.device}\t{entry.key}")
         print(f"\nStore: {store.path}")
-        print(f"Next: localllm join --client cline --device {entry.device} --url <server-url>")
+        print(f"Next: localllm join --client opencode --device {entry.device} --url <server-url>")
         return 0
 
     if args.key_command == "revoke":
@@ -951,7 +1006,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
     print(f"This is a password. It contains {args.device}'s API key - send it over")
     print("something private, and revoke it with `localllm key revoke` if it leaks.\n")
     print(f"On {args.device}, run:")
-    print(f"  localllm join --invite {token} --client cline\n")
+    print(f"  localllm client {token}\n")
     print(
         f"That pins {plan.context_per_slot:,} tokens of context - the share this "
         f"server actually gives each of its {plan.n_slots} slot(s)."
@@ -1677,6 +1732,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-inference",
         action="store_true",
         help="skip the generation check (which occupies a slot briefly)",
+    )
+    check.add_argument(
+        "--no-agent-checks",
+        action="store_true",
+        help="skip the tool-calling and streaming checks - the two that decide "
+        "whether a coding agent works, rather than merely connects",
     )
     check.add_argument(
         "--inference-timeout",

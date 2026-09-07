@@ -233,7 +233,7 @@ def client_guide(*, config_written: bool, url: str = "") -> Guide:
             "join",
             "Write this laptop's client config",
             State.DONE if config_written else State.NEXT,
-            command="localllm join --invite <token> --client cline",
+            command="localllm client <token>",
             detail=f"pointed at {url}" if config_written and url else "",
         ),
         Step(
