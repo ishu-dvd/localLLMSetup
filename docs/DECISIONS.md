@@ -407,9 +407,37 @@ Diff formatting is hard for almost everyone except Anthropic models — from the
 
 | If the server runs… | Use | Why |
 |---|---|---|
-| **KAT-Coder-V2.5-Dev** | **Cline** | Pin `contextWindow` to the real per-slot budget — **20 K single-client, 8 K at two clients, 4 K at three** (§3); targeted search/replace via **tool calls** (~250 output tokens); explicit function-calling toggle to exercise the path KAT was trained for |
-| **gpt-oss-20b** | **Aider** | Weaker tool calling and no RL-hardened tool training → Aider's no-tool-schema, 1,024-token repo map and manual `/add`·`/drop`·`/clear` control reassert |
-| **Either / one client for both** | **Octofriend** ⭐ | The only client that **refuses the bet** — ships two open-weight repair models, [`fix-json`](https://huggingface.co/syntheticlab/fix-json) and [`diff-apply`](https://huggingface.co/syntheticlab/diff-apply), that auto-repair malformed tool calls *and* near-miss edits, and can switch models mid-conversation. Its one weakness — nowhere to run the repair models — **disappears because your client laptops are unconstrained.** Cost: 1,007★, real bus-factor risk |
+| **KAT-Coder-V2.5-Dev** | **opencode** | Pin the context to the real per-slot budget — **20 K single-client, 8 K at two clients, 4 K at three** (§3); targeted search/replace via **tool calls** (~250 output tokens), which is the path KAT was trained for |
+| **gpt-oss-20b** | **opencode** | `limit.context` is how opencode knows how much of the slot is left and when to compact. For a self-hosted model there is no models.dev entry to fall back on, so omitting it means it never compacts |
+| **Qwen2.5-Coder** | **Aider** | Weaker tool calling and no RL-hardened tool training → Aider's no-tool-schema, 1,024-token repo map and manual `/add`·`/drop`·`/clear` control reassert |
+| **Either / one client for both** | **Octofriend** ⭐ | The only client that **refuses the bet** — ships two open-weight repair models, [`fix-json`](https://huggingface.co/syntheticlab/fix-json) and [`diff-apply`](https://huggingface.co/syntheticlab/diff-apply), that auto-repair malformed tool calls *and* near-miss edits. Its one weakness — nowhere to run the repair models — **disappears because your client laptops are unconstrained.** Cost: 1,007★, real bus-factor risk |
+| **You want VS Code** | **Continue** | The only VS Code extension here with a config file this tool can write. Splits chat from autocomplete, so the every-keystroke FIM requests stay at 1,024 tokens while chat gets the whole slot |
+
+### 🚨 Cline was recommended here, and cannot be configured from a file
+
+The row above used to read **Cline** for KAT-Coder, and `localllm join --client cline` wrote a
+`cline-settings.json` telling the user to place it at `~/.cline/settings.json`.
+
+**There is no such file.** Reading Cline's source
+(`apps/vscode/src/core/storage/state-migrations.ts`) shows settings go to VS Code's own
+`context.globalState` — a SQLite database VS Code holds open and caches in memory — and the API
+key to `context.secrets`, which is OS-encrypted (DPAPI on Windows). Neither can be written from
+outside VS Code.
+
+The field names were wrong too. Cline now scopes them per mode
+(`apps/vscode/src/shared/storage/state-keys.ts`): `planModeOpenAiModelId` /
+`actModeOpenAiModelId`, and the same for `ApiProvider` and `OpenAiModelInfo`. Only
+`openAiBaseUrl` is still flat. The names we wrote survive **only in the migration list**.
+
+So the config was inert, and `check` parsed it back and reported the laptop as configured with
+values the extension had never seen. `--client cline` now emits the values to enter by hand,
+and the recommendation moved to a client that can actually be written. **Roo Code and Kilo Code
+are forks of Cline and inherit the same storage model** — Roo's marketplace id is
+`RooVeterinaryInc.roo-cline`.
+
+**Qwen Code** is supported and carries a warning rather than a context pin: no field for it
+could be verified in its documentation, and inventing a name would look like the limit had been
+applied while the client kept overrunning it.
 
 > Do not copy a context from this table by hand. `localllm invite` carries the number the
 > solver actually chose, and `localllm join` refuses anything larger than the slot holds —

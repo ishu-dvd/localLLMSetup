@@ -342,3 +342,41 @@ class TestResidencySeverity:
         for pf in (run(), run(TIGHT)):
             text = " ".join(c.detail + c.remedy for c in pf.checks)
             assert "mlock" not in text and "secpol" not in text
+
+
+class TestWhetherTheServiceExistsIsATriState:
+    """`sc query` exits non-zero for "no such service" (1060) AND for "access
+    denied" (5). Folding the second into the first tells a user whose service
+    is running perfectly well to install it again."""
+
+    def test_a_registered_service_is_found(self):
+        from localllm.serve import parse_service_query
+
+        out = "SERVICE_NAME: localllm\n        TYPE  : 10  WIN32_OWN_PROCESS\n"
+        assert parse_service_query(out, 0) is True
+
+    def test_a_missing_service_is_reported_as_missing(self):
+        from localllm.serve import parse_service_query
+
+        out = (
+            "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\n\n"
+            "The specified service does not exist as an installed service.\n"
+        )
+        assert parse_service_query(out, 1060) is False
+
+    def test_access_denied_is_reported_as_unknown_not_as_missing(self):
+        from localllm.serve import parse_service_query
+
+        out = "[SC] OpenService FAILED 5:\n\nAccess is denied.\n"
+        assert parse_service_query(out, 5) is None
+
+    def test_an_empty_response_is_unknown(self):
+        from localllm.serve import parse_service_query
+
+        assert parse_service_query("", 1) is None
+
+    def test_a_zero_exit_with_no_service_named_is_not_taken_as_present(self):
+        """Exit code alone is not enough - some shims return 0 for anything."""
+        from localllm.serve import parse_service_query
+
+        assert parse_service_query("done\n", 0) is None

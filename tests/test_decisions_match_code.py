@@ -224,3 +224,41 @@ def test_every_number_in_the_viability_table_is_what_the_solver_says(slot_index,
             assert actual == int(claimed), (
                 f"{key} @ {slots} slot(s): the table says {claimed}, the solver says {actual}"
             )
+
+
+class TestTheClientRecommendationMatchesWhatTheCodeCanActuallyDo:
+    """DECISIONS.md §6 recommended Cline for KAT-Coder, and `join --client
+    cline` wrote a file Cline never reads. The doc and the code were each
+    internally consistent and jointly wrong, which is the failure mode this
+    whole test module exists for."""
+
+    def test_the_doc_records_that_cline_cannot_be_written(self):
+        text = DECISIONS.read_text(encoding="utf-8")
+        assert "cannot be configured from a file" in text
+        assert "globalState" in text
+
+    def test_and_the_code_agrees(self):
+        from localllm.join import CLIENTS
+
+        assert CLIENTS["cline"].writes_config is False
+
+    def test_nothing_recommends_a_client_that_cannot_be_configured(self):
+        """The recommendation is made by a command whose entire job is to write
+        a config file."""
+        from localllm.join import CLIENTS, recommend_client_for
+
+        for model in (*CATALOGUE, "claude-local-coder", "", "something-unknown"):
+            picked = recommend_client_for(model)
+            assert CLIENTS[picked].writes_config, f"{model} -> {picked}"
+
+    def test_every_client_named_in_the_recommendation_table_is_supported(self):
+        """A table row naming a client the CLI does not have is an instruction
+        that cannot be followed."""
+        from localllm.join import SUPPORTED
+
+        text = DECISIONS.read_text(encoding="utf-8")
+        start = text.index("### Recommendation")
+        table = text[start : start + 4000]
+        for name in ("opencode", "Aider", "Octofriend", "Continue"):
+            assert f"**{name}**" in table, name
+            assert name.lower() in SUPPORTED, name

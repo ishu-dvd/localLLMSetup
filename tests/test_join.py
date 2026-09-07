@@ -223,8 +223,15 @@ def test_opencode_selects_the_model_so_it_does_not_have_to_be_picked():
 
 def test_continue_declares_tool_use_explicitly():
     """Continue detects tool support from the model NAME. A self-hosted model
-    is in no such table, so without this Agent mode silently does nothing."""
-    assert "tool_use" in cfg("continue").content
+    is in no such table, so without this Agent mode silently does nothing.
+
+    Asserted as a YAML list item, not as a substring: `# tool_use` contains
+    `tool_use` and configures nothing, and a mutation to exactly that survived
+    the substring version of this test.
+    """
+    lines = [line.rstrip() for line in cfg("continue").content.splitlines()]
+    assert "      - tool_use" in lines
+    assert "    capabilities:" in lines
 
 
 def test_continue_pins_the_chat_context_to_the_slot():

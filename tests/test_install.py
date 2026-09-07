@@ -224,6 +224,13 @@ class TestTheLatestReleaseHasNoBinariesInIt:
     def test_a_real_release_is_not(self):
         assert not needs_nightly_lookup(RELEASE_ASSETS)
 
+    def test_a_release_with_binaries_is_not_a_pointer_even_if_it_also_has_the_tag_file(self):
+        """The mutation that found this gap: dropping the binary check entirely
+        left the suite green, because every other case here happens to have no
+        tag file. A release carrying both must follow its own binaries."""
+        both = (*RELEASE_ASSETS, *self.POINTER)
+        assert not needs_nightly_lookup(both)
+
     def test_a_release_that_is_merely_empty_is_not_treated_as_a_pointer(self):
         """No binaries and no tag file is a broken release, not an indirection."""
         assert not needs_nightly_lookup([Asset("README.md", "https://example.invalid/r")])
@@ -410,6 +417,90 @@ class TestAnArchiveCannotWriteOutsideItsDirectory:
 
         into = unzip(archive, tmp_path / "into")
         assert find_llama_server(into) is not None
+
+
+class TestAnInterruptedDownloadIsNotMistakenForAFinishedOne:
+    """A model is 12 GB over a home connection. A truncated file that landed on
+    the final name would pass every check here - `find_gguf` returns it, `up`
+    accepts it - and fail inside llama-server with a message about the file
+    format."""
+
+    def test_the_file_appears_only_when_it_is_complete(self, tmp_path: Path, monkeypatch):
+        import localllm.install as mod
+
+        dest = tmp_path / "model.gguf"
+        seen: list[bool] = []
+
+        class Response:
+            headers = {"Content-Length": "6"}
+
+            def __init__(self):
+                self.chunks = [b"abc", b"def"]
+
+            def read(self, _n):
+                # Observe the destination mid-download, not after.
+                seen.append(dest.exists())
+                return self.chunks.pop(0) if self.chunks else b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(mod, "_open", lambda url, timeout: Response())
+        mod.download("https://example.invalid/m", dest, expected_size=6)
+        assert seen and not any(seen)
+        assert dest.read_bytes() == b"abcdef"
+
+    def test_a_short_download_is_deleted_rather_than_kept(self, tmp_path: Path, monkeypatch):
+        import localllm.install as mod
+
+        class Response:
+            headers: dict[str, str] = {}
+
+            def __init__(self):
+                self.chunks = [b"abc"]
+
+            def read(self, _n):
+                return self.chunks.pop(0) if self.chunks else b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(mod, "_open", lambda url, timeout: Response())
+        dest = tmp_path / "model.gguf"
+        with pytest.raises(OSError, match="expected 6"):
+            mod.download("https://example.invalid/m", dest, expected_size=6)
+        assert not dest.exists()
+        assert not (tmp_path / "model.gguf.part").exists()
+
+    def test_an_unknown_size_is_not_treated_as_a_mismatch(self, tmp_path: Path, monkeypatch):
+        """Assets resolved without the API carry no size. Refusing those would
+        disable the fallback path entirely."""
+        import localllm.install as mod
+
+        class Response:
+            headers: dict[str, str] = {}
+
+            def __init__(self):
+                self.chunks = [b"abc"]
+
+            def read(self, _n):
+                return self.chunks.pop(0) if self.chunks else b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr(mod, "_open", lambda url, timeout: Response())
+        dest = tmp_path / "m.zip"
+        assert mod.download("https://example.invalid/m", dest).read_bytes() == b"abc"
 
 
 # --- what the client laptop is missing --------------------------------------

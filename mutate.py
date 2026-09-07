@@ -236,6 +236,136 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "if False:",
         "swallowing a 401 writes a client config that cannot authenticate",
     ),
+    # --- install.py: choosing the wrong download ----------------------------
+    (
+        "src/localllm/install.py",
+        "if not is_llama_binary_asset(asset.name):",
+        "if False:",
+        "the CUDA runtime zip contains no llama-server and matches every naive filter",
+    ),
+    (
+        "src/localllm/install.py",
+        "if os_name not in toks or arch not in toks:",
+        "if os_name not in toks:",
+        "an arm64 build installs cleanly on x64 and then refuses to run",
+    ),
+    (
+        "src/localllm/install.py",
+        'return lower.endswith(".zip") and lower.startswith("llama-") and "-bin-" in lower',
+        'return lower.endswith(".zip")',
+        "without the prefix check, cudart- is a candidate llama.cpp build",
+    ),
+    (
+        "src/localllm/install.py",
+        '"hip": ("rocm", "hip", "radeon"),',
+        '"hip": ("hip", "radeon"),',
+        "AMD's build is now named rocm; the old name alone falls through to CPU",
+    ),
+    (
+        "src/localllm/install.py",
+        "real = [g for g in det.gpus if not g.is_virtual]",
+        "real = list(det.gpus)",
+        "a Hyper-V adapter would be given a Vulkan build that silently runs on the CPU",
+    ),
+    (
+        "src/localllm/install.py",
+        "if build is not None and build >= min_build:",
+        "if build is not None:",
+        "ignoring the minimum installs a build `up` will then refuse",
+    ),
+    (
+        "src/localllm/install.py",
+        'return tag if re.fullmatch(r"b\\d{3,}", tag) else None',
+        "return tag or None",
+        "a pointer file holding anything at all would become a download URL",
+    ),
+    (
+        "src/localllm/install.py",
+        "if any(is_llama_binary_asset(a.name) for a in assets):\n        return False",
+        "if False:\n        return False",
+        "treating a real release as a pointer sends the resolver down a dead end",
+    ),
+    (
+        "src/localllm/install.py",
+        "exact = [a for a in candidates if cuda_toolkit_of(a.name) == toolkit]\n"
+        "        return exact[0] if exact else None",
+        "return candidates[0] if candidates else None",
+        "a 13.3 runtime with a 12.4 build is the missing-DLL failure it prevents",
+    ),
+    (
+        "src/localllm/install.py",
+        "if not str(target).startswith(str(into.resolve())):",
+        "if False:",
+        "a zip entry may name any path, including outside the destination",
+    ),
+    (
+        "src/localllm/install.py",
+        "if expected_size and done != expected_size:",
+        "if False:",
+        "a truncated 12 GB model passes every later check and fails inside llama-server",
+    ),
+    (
+        "src/localllm/install.py",
+        "part.replace(dest)",
+        "pass",
+        "the download would never appear at its final name",
+    ),
+    # --- join.py: the new clients -------------------------------------------
+    (
+        "src/localllm/join.py",
+        "if not force and name in GENERIC_FILENAMES and target.exists():",
+        "if False:",
+        "join would destroy an unrelated config.yaml in the directory it runs in",
+    ),
+    (
+        "src/localllm/join.py",
+        '"npm": "@ai-sdk/openai-compatible",',
+        '"npm": "@ai-sdk/openai",',
+        "the openai adapter targets /v1/responses, which llama-server does not serve",
+    ),
+    (
+        "src/localllm/join.py",
+        '"limit": {"context": context, "output": 4096},',
+        '"limit": {"output": 4096},',
+        "without limit.context opencode never compacts and overruns the slot",
+    ),
+    (
+        "src/localllm/join.py",
+        '"      - tool_use",',
+        '"      # tool_use",',
+        "Continue detects tool support by model name, so Agent mode silently dies",
+    ),
+    (
+        "src/localllm/join.py",
+        '"    roles: [autocomplete]",',
+        '"    roles: [chat]",',
+        "autocomplete is not a default role; the model is never asked for completions",
+    ),
+    (
+        "src/localllm/join.py",
+        '"      maxPromptTokens: 1024",',
+        "\"      maxPromptTokens: 32768\",",
+        "a full-context request per keystroke is what makes this feel unusable",
+    ),
+    (
+        "src/localllm/join.py",
+        '"security": {"auth": {"selectedType": "openai"}},',
+        '"security": {},',
+        "Qwen Code stops on first run and asks the user to pick a provider",
+    ),
+    (
+        "src/localllm/join.py",
+        "def _read_cline(path: Path) -> DiscoveredClient | None:",
+        "def _unused_read_cline(path: Path) -> DiscoveredClient | None:",
+        "removing the deliberate no-op reader should be noticed",
+    ),
+    # --- serve.py: is the service there? ------------------------------------
+    (
+        "src/localllm/serve.py",
+        'if "1060" in lowered or "does not exist" in lowered:\n        return False\n    return None',
+        "return False",
+        "reporting access-denied as missing sends the user to reinstall a running service",
+    ),
 ]
 
 
