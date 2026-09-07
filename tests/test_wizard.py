@@ -169,6 +169,37 @@ class TestRunningOutOfDiskIsSaidBeforeTheDownloadNotDuring:
         assert a_plan(free_disk_gb=None).warnings == ()
 
 
+class TestASizeThatIsNotKnownIsNotReportedAsZero:
+    """Assets resolved without the GitHub API carry no length. Adding 0 to the
+    total makes a step that downloads ~90 MB read as free, and turns a floor
+    into what looks like an estimate."""
+
+    def test_the_step_says_so(self):
+        plan = a_plan(llama_bytes=0)
+        line = next(a.line for a in plan.actions if a.key == "llama")
+        assert "size unknown" in line
+
+    def test_the_total_is_a_floor(self):
+        assert "at least" in a_plan(llama_bytes=0).render()
+
+    def test_a_known_size_is_still_an_estimate(self):
+        rendered = a_plan().render()
+        assert "at least" not in rendered
+        assert "~12.1 GB" in rendered
+
+    def test_a_step_that_downloads_nothing_is_not_marked_unknown(self):
+        plan = a_plan()
+        keys = next(a for a in plan.actions if a.key == "keys")
+        assert not keys.size_unknown
+        assert "size unknown" not in keys.line
+
+    def test_a_skipped_download_is_not_marked_unknown(self, tmp_path: Path):
+        exe = tmp_path / "llama-server.exe"
+        exe.write_bytes(b"x")
+        plan = a_plan(llama_server=exe, llama_bytes=0)
+        assert "size unknown" not in next(a.line for a in plan.actions if a.key == "llama")
+
+
 class TestDevicesAreAtLeastOne:
     def test_zero_devices_still_issues_one_key(self):
         """A server with no clients is a server nobody can reach, and `-c` is a

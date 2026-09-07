@@ -45,11 +45,27 @@ class Action:
     """A command the user must run themselves - elevation, or another machine."""
 
     bytes_estimate: int = 0
+    downloads: bool = False
+    """True for a step that fetches something. Kept separate from the size
+    because the size is sometimes genuinely unknown: assets resolved without
+    the GitHub API carry no length, and reporting that as 0 makes the total
+    read as though the step were free."""
+
+    @property
+    def size_unknown(self) -> bool:
+        return self.downloads and not self.bytes_estimate
 
     @property
     def line(self) -> str:
         mark = {Act.RUN: "->", Act.SKIP: "ok", Act.BLOCKED: "!!"}[self.act]
-        size = f"  (~{self.bytes_estimate / 1_000_000_000:.1f} GB)" if self.bytes_estimate else ""
+        if self.act is not Act.RUN:
+            size = ""
+        elif self.bytes_estimate:
+            size = f"  (~{self.bytes_estimate / 1_000_000_000:.1f} GB)"
+        elif self.downloads:
+            size = "  (size unknown)"
+        else:
+            size = ""
         head = f"  {mark} {self.title}{size}"
         return head if not self.detail else f"{head}\n       {self.detail}"
 
@@ -75,6 +91,10 @@ class SetupPlan:
         return sum(a.bytes_estimate for a in self.to_run)
 
     @property
+    def any_size_unknown(self) -> bool:
+        return any(a.size_unknown for a in self.to_run)
+
+    @property
     def nothing_to_do(self) -> bool:
         return not self.to_run and self.blocked is None
 
@@ -87,9 +107,14 @@ class SetupPlan:
         if self.backend or self.model_id:
             lines.append("")
         lines.extend(a.line for a in self.actions)
-        if self.download_bytes:
+        if self.download_bytes or self.any_size_unknown:
+            total = f"~{self.download_bytes / 1_000_000_000:.1f} GB"
+            # "at least", not "about": one of the steps has no size to add, so
+            # the figure is a floor rather than an estimate and should not be
+            # presented as one.
+            lead = "at least" if self.any_size_unknown else ""
             lines.append("")
-            lines.append(f"  to download: ~{self.download_bytes / 1_000_000_000:.1f} GB")
+            lines.append(f"  to download: {lead} {total}".replace("  ", " ").rstrip())
         for w in self.warnings:
             lines.append(f"\n  warning: {w}")
         return "\n".join(lines)
@@ -129,6 +154,7 @@ def plan_setup(
             Act.SKIP if have_llama else Act.RUN,
             detail=f"found {llama_server}" if have_llama else f"{backend} build for this machine",
             bytes_estimate=0 if have_llama else llama_bytes,
+            downloads=not have_llama,
         )
     )
 
@@ -146,6 +172,7 @@ def plan_setup(
             model_act,
             detail=model_detail,
             bytes_estimate=0 if have_model else model_bytes,
+            downloads=not have_model,
         )
     )
 
