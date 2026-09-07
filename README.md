@@ -115,7 +115,7 @@ llama.cpp, llama-swap and gguf-parser. Not a new inference stack.
 git clone https://github.com/ishu-dvd/localLLMSetup
 cd localLLMSetup
 $env:PYTHONPATH="src"
-python -m pytest tests          # 676 tests
+python -m pytest tests          # 698 tests
 python -m localllm next         # says what to do first
 ```
 
@@ -190,6 +190,26 @@ python -m localllm key revoke laptop-2      # history preserved for attribution
 python -m localllm key export --out keys.txt      # llama-server --api-key-file
 python -m localllm key caddyfile ai.tailnet.ts.net  # per-device attribution
 ```
+
+`revoke` rewrites the server's allow-list itself. It used to print *"rewrite the api-key
+file"* as prose — which is the step a person forgets, and until it happens the revoked
+laptop keeps working.
+
+**If a token leaks**, one command replaces the key and drops the old one:
+
+```powershell
+python -m localllm invite laptop-1 --url http://msi:8080 --rotate
+```
+
+```
+rotated laptop-1's key - the previous one is revoked
+...
+  Restart-Service localllm
+  Until that restart, the leaked key still works.
+```
+
+That last line is deliberate. Rotating changes the file; the running process has not
+re-read it, and assuming otherwise is the mistake that leaves the hole open.
 
 **See the fleet, and catch the mistake nothing else reports:**
 
@@ -325,7 +345,7 @@ On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
 | 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**676 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
+**698 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
 
 ---
 
