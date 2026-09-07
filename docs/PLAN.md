@@ -187,6 +187,7 @@ localllm up --llama-server C:\ai\llama-server.exe
 | `01-powercfg.ps1` | never sleep on AC; **lid close = do nothing** |
 | `02-install-service.ps1` | NSSM service, boot-start, restart-on-failure, log rotation |
 | `03-install-watchdog.ps1` | registers the watchdog loop as its own NSSM service |
+| `04-firewall.ps1` | opens the port to the tailnet and the local subnet — **never to a public network** |
 | `watchdog-loop.ps1` | the loop itself — **unnumbered, never run directly** (`while ($true)`) |
 | `llama-server-flags.txt` | the exact invocation from the solver |
 

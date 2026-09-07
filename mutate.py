@@ -532,8 +532,8 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     ),
     (
         "src/localllm/serve.py",
-        '    "03-install-watchdog.ps1",\n)',
-        '    "03-install-watchdog.ps1",\n    WATCHDOG_LOOP_FILENAME,\n)',
+        '    "03-install-watchdog.ps1",\n    "04-firewall.ps1",\n)',
+        '    "03-install-watchdog.ps1",\n    "04-firewall.ps1",\n    WATCHDOG_LOOP_FILENAME,\n)',
         "the loop in the run sequence is the original defect: a terminal that never returns",
     ),
     (
@@ -541,6 +541,49 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         '+ \' "powershell.exe" "-NoProfile -ExecutionPolicy Bypass -File \'',
         '+ \' "cmd.exe" "-NoProfile -ExecutionPolicy Bypass -File \'',
         "NSSM runs executables, not scripts - the loop needs a shell that can host a .ps1",
+    ),
+    # --- serve.py: can the other laptops actually reach it? ------------------
+    (
+        "src/localllm/serve.py",
+        '"    -RemoteAddress LocalSubnet -Profile Private,Domain | Out-Null",',
+        '"    -RemoteAddress LocalSubnet -Profile Any | Out-Null",',
+        "LocalSubnet on a hotel network means every other guest is on your subnet",
+    ),
+    (
+        "src/localllm/serve.py",
+        'TAILNET_CIDR = "100.64.0.0/10"',
+        'TAILNET_CIDR = "0.0.0.0/0"',
+        "a rule scoped to everything is not a rule scoped to the tailnet",
+    ),
+    (
+        "src/localllm/serve.py",
+        '"        Remove-NetFirewallRule",',
+        '"        Out-Null",',
+        "setup is resumable, so without the removal the rules accumulate on re-run",
+    ),
+    (
+        "src/localllm/serve.py",
+        '"    -RemoteAddress $TAILNET -Profile Any | Out-Null",',
+        '"    -RemoteAddress Any -Profile Any | Out-Null",',
+        "an unrestricted tailnet rule opens the port to every network it is on",
+    ),
+    (
+        "src/localllm/serve.py",
+        "    if returncode != 0:\n        return None\n    stripped = text.strip()",
+        "    if False:\n        return None\n    stripped = text.strip()",
+        "a failed query reported as 'no rules' tells someone to re-open an open port",
+    ),
+    (
+        "src/localllm/serve.py",
+        '    "04-firewall.ps1",\n)',
+        ")",
+        "dropping it from the sequence means `service install` never opens the port",
+    ),
+    (
+        "src/localllm/cli.py",
+        "    _report_reachability()\n    return 0",
+        "    return 0",
+        "the reachability answer is the one thing only this machine can give",
     ),
 ]
 

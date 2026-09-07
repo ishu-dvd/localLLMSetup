@@ -457,9 +457,10 @@ python -m localllm up --llama-server C:\ai\llama-server.exe
 ```
 
 On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
-`02-install-service.ps1` (NSSM, boot-start, restart-on-failure) and
+`02-install-service.ps1` (NSSM, boot-start, restart-on-failure),
 `03-install-watchdog.ps1`, which registers `watchdog-loop.ps1` as its own service to
-alert on page-file thrash — otherwise completely silent.
+alert on page-file thrash — otherwise completely silent — and `04-firewall.ps1`, which
+opens the port to the tailnet and the local subnet and **never to a public network**.
 
 **A numbered script is one you run, in that order** — and `localllm service install`
 runs them for you, refusing rather than half-installing if it is not elevated. `setup.ps1`
@@ -475,8 +476,8 @@ calls it at the end, asking for Administrator once through UAC.
 | 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup, agent-readiness gate |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**1026 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13,
-and 83/83 mutations caught.
+**1048 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13,
+and 90/90 mutations caught.
 
 ---
 
