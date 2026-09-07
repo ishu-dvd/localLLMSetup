@@ -97,9 +97,11 @@ from .serve import (
     WATCHDOG_LOOP_FILENAME,
     build_is_recent_enough,
     preflight,
+    probe_firewall_rules,
     probe_free_disk_gb,
     probe_llama_build,
     probe_service_installed,
+    render_firewall_script,
     render_nssm_script,
     render_powercfg_script,
     render_watchdog_install_script,
@@ -271,14 +273,21 @@ def cmd_status(args: argparse.Namespace) -> int:
     print()
     if health.status != 200:
         print(f"Server   : not answering at {origin} ({diagnose(health).detail})")
-        return 0
+    else:
+        _report_running_server(origin, store)
 
+    _report_reachability()
+    return 0
+
+
+def _report_running_server(origin: str, store: KeyStore) -> None:
+    """What the server says about itself, over loopback."""
     key = next((k.key for k in store.active()), None)
     props = probe(f"{origin}/props", api_key=key, timeout=PROBE_TIMEOUT_S)
     facts = read_props(props.body) if props.status == 200 else None
     if facts is None:
         print(f"Server   : up at {origin}, but /props did not answer as expected")
-        return 0
+        return
     print(f"Server   : up at {origin}")
     print(f"           serving '{facts.model_alias or 'unknown'}'")
     print(f"           {facts.n_slots} slot(s) x {facts.context_per_slot:,} tokens each")
@@ -292,7 +301,34 @@ def cmd_status(args: argparse.Namespace) -> int:
     elif slots.status == 200 and isinstance(slots.body, list):
         busy = sum(1 for s in slots.body if isinstance(s, dict) and s.get("is_processing"))
         print(f"           {busy} of {len(slots.body)} slot(s) busy")
-    return 0
+
+
+def _report_reachability() -> None:
+    """Can anyone else get in?
+
+    Every line above this one was answered over loopback, which is exempt from
+    the rule that blocks everybody else. So a server can pass the whole report
+    and still be unreachable from the laptops it exists to serve - and the
+    clients cannot tell either, because a blocked port times out exactly like a
+    server that is not running. This machine is the only one that can answer it,
+    and it is the one machine that never feels the problem.
+
+    Reported unconditionally, including when the server is down: "not answering
+    AND not reachable" is two problems, and finding the second one only after
+    fixing the first wastes the trip.
+    """
+    print()
+    allowed = probe_firewall_rules()
+    if allowed is None:
+        print("Reach    : firewall rules could not be read on this machine")
+    elif allowed:
+        print("Reach    : the port is allowed through the Windows firewall")
+    else:
+        print("Reach    : NOT allowed through the Windows firewall")
+        print("           every other laptop will time out, which looks identical")
+        print("           to the server being down - and this machine cannot see")
+        print("           it, because 127.0.0.1 is exempt from the rule")
+        print("           -> localllm service install")
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -778,6 +814,7 @@ def cmd_up(args: argparse.Namespace) -> int:
             loop_script=str((out / WATCHDOG_LOOP_FILENAME).resolve()),
             log_dir=str((out / "logs").resolve()),
         ),
+        "04-firewall.ps1": render_firewall_script(),
         WATCHDOG_LOOP_FILENAME: render_watchdog_script(),
         "llama-server-flags.txt": flags + "\n",
         # The number each client must pin. Without this, `join` had no way to

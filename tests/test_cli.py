@@ -1776,3 +1776,100 @@ class TestTheInvitePointsAtTheOneCommandPath:
         out = self._invite(tmp_path, capsys)
         token = next(line.strip() for line in out.splitlines() if line.strip().startswith("llmi1_"))
         assert f"localllm client {token}" in out
+
+
+class TestStatusReportsWhetherAnyoneElseCanGetIn:
+    """Every other line of `status` is answered over loopback, which is exempt
+    from the firewall rule that blocks everybody else. So the server can pass
+    the whole report and still be unreachable from the laptops it exists to
+    serve - and the clients cannot tell either, because a blocked port times out
+    exactly like a server that is not running.
+
+    This machine is the only one that can answer the question, and it is the one
+    machine that never feels the problem.
+    """
+
+    def _run_status(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+        *,
+        allowed: bool | None,
+        server_up: bool = False,
+    ) -> str:
+        from localllm.client import Probe
+
+        monkeypatch.setattr("localllm.cli.probe_firewall_rules", lambda *a, **k: allowed)
+        status = 200 if server_up else None
+        monkeypatch.setattr(
+            "localllm.cli.probe",
+            lambda url, **k: (
+                Probe(url=url, status=status, body={"status": "ok"})
+                if server_up
+                else Probe(
+                    url=url,
+                    error=__import__("localllm.client", fromlist=["ProbeError"]).ProbeError.REFUSED,
+                )
+            ),
+        )
+        store = tmp_path / "keys.json"
+        run(["key", "add", "laptop-1", "--store", str(store)], capsys)
+        _, out = run(
+            ["status", "--store", str(store), "--plan", str(tmp_path / "server-plan.json")],
+            capsys,
+        )
+        return out
+
+    def test_a_blocked_port_is_reported_with_why_it_is_invisible(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        out = self._run_status(monkeypatch, capsys, tmp_path, allowed=False)
+        assert "NOT allowed through the Windows firewall" in out
+        assert "127.0.0.1 is exempt" in out
+        assert "localllm service install" in out
+
+    def test_an_open_port_is_confirmed(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        out = self._run_status(monkeypatch, capsys, tmp_path, allowed=True)
+        assert "allowed through the Windows firewall" in out
+        assert "NOT allowed" not in out
+
+    def test_an_unreadable_firewall_is_not_reported_as_blocked(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """Telling someone to re-open a port that is already open sends them to
+        change something that was never wrong."""
+        out = self._run_status(monkeypatch, capsys, tmp_path, allowed=None)
+        assert "could not be read" in out
+        assert "NOT allowed" not in out
+
+    def test_it_is_reported_even_when_the_server_is_down(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """ "Not answering AND not reachable" is two problems. Discovering the
+        second only after fixing the first wastes the trip - and the reachability
+        answer does not depend on the server running."""
+        out = self._run_status(monkeypatch, capsys, tmp_path, allowed=False, server_up=False)
+        assert "not answering" in out
+        assert "NOT allowed through the Windows firewall" in out
+
+    def test_no_probe_skips_it(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr("localllm.cli.probe_firewall_rules", lambda *a, **k: False)
+        store = tmp_path / "keys.json"
+        run(["key", "add", "laptop-1", "--store", str(store)], capsys)
+        _, out = run(
+            [
+                "status",
+                "--store",
+                str(store),
+                "--plan",
+                str(tmp_path / "server-plan.json"),
+                "--no-probe",
+            ],
+            capsys,
+        )
+        assert "Reach" not in out

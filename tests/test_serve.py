@@ -16,13 +16,17 @@ from localllm.catalogue import (
     QWEN25_CODER_14B,
 )
 from localllm.serve import (
+    FIREWALL_RULE_PREFIX,
     MIN_LLAMA_BUILD,
     SERVICE_SCRIPTS,
+    TAILNET_CIDR,
     WATCHDOG_LOOP_FILENAME,
     Level,
     build_is_recent_enough,
+    parse_firewall_count,
     parse_llama_build,
     preflight,
+    render_firewall_script,
     render_nssm_script,
     render_powercfg_script,
     render_watchdog_install_script,
@@ -414,6 +418,7 @@ class TestANumberedScriptIsOneYouRun:
                 loop_script="C:\\ai\\deploy\\watchdog-loop.ps1",
                 log_dir="C:\\ai\\deploy\\logs",
             ),
+            "04-firewall.ps1": render_firewall_script(),
             WATCHDOG_LOOP_FILENAME: render_watchdog_script(),
         }
 
@@ -450,3 +455,95 @@ class TestANumberedScriptIsOneYouRun:
     def test_the_sequence_is_ordered_and_stated_once(self) -> None:
         assert SERVICE_SCRIPTS == tuple(sorted(SERVICE_SCRIPTS))
         assert len(set(SERVICE_SCRIPTS)) == len(SERVICE_SCRIPTS)
+
+
+class TestTheOtherLaptopsCanActuallyReachIt:
+    """The project already knew about this failure and made the user fix it:
+    `diagnose` tells a stuck client "allow the port through the Windows
+    firewall", and nothing ever did.
+
+    It is the likeliest way the whole setup ends in nothing working, because it
+    is invisible from both ends. The server answers 127.0.0.1 perfectly - the
+    loopback interface is exempt from the rule blocking everyone else - and from
+    a client a blocked port times out exactly like a server that is not running.
+    """
+
+    def test_both_documented_transports_are_allowed(self) -> None:
+        """DECISIONS names Tailscale, with same-WiFi LAN as the fallback. A rule
+        covering only one of them silently breaks the other."""
+        s = render_firewall_script()
+        assert TAILNET_CIDR in s
+        assert "LocalSubnet" in s
+
+    def test_the_lan_rule_never_applies_on_a_public_network(self) -> None:
+        """LocalSubnet on a hotel or cafe network means every other guest is on
+        your local subnet. This is the one line where getting it wrong exposes
+        an inference endpoint to strangers."""
+        lan_rule = [ln for ln in render_firewall_script().splitlines() if "LocalSubnet" in ln]
+        assert lan_rule, "the LAN rule vanished"
+        assert all("Public" not in ln for ln in lan_rule)
+        assert any("Private,Domain" in ln for ln in lan_rule)
+
+    def test_the_tailnet_rule_is_safe_on_any_profile(self) -> None:
+        """Restricting to Tailscale's CGNAT range is what makes -Profile Any
+        acceptable: the address is the limit, not the network category. Tailscale
+        does not reliably land in the Private profile, so requiring it would
+        break the primary transport."""
+        lines = render_firewall_script().splitlines()
+        start = next(i for i, ln in enumerate(lines) if "(tailnet)'" in ln and "New-Net" in ln)
+        rule = " ".join(lines[start : start + 3])
+        assert "-Profile Any" in rule
+        assert TAILNET_CIDR in render_firewall_script()
+
+    def test_it_opens_only_the_port_it_was_given(self) -> None:
+        s = render_firewall_script(port=9999)
+        assert "$PORT    = 9999" in s
+        assert s.count("9999") == 1, "the port is stated once and referenced as $PORT"
+        assert s.count("-LocalPort $PORT") == 2
+
+    def test_it_is_inbound_and_nothing_else(self) -> None:
+        s = render_firewall_script()
+        assert "-Direction Inbound" in s
+        assert "Outbound" not in s
+
+    def test_re_running_it_cannot_accumulate_duplicates(self) -> None:
+        """Setup is resumable, so this script will be run more than once."""
+        s = render_firewall_script()
+        assert "Remove-NetFirewallRule" in s
+        assert s.index("Remove-NetFirewallRule") < s.index("New-NetFirewallRule")
+
+    def test_it_says_how_to_undo_itself(self) -> None:
+        assert "# Remove with:" in render_firewall_script()
+
+    def test_the_rules_share_a_prefix_so_they_can_be_found_as_a_set(self) -> None:
+        s = render_firewall_script()
+        assert s.count(FIREWALL_RULE_PREFIX) >= 4
+        assert f"'{FIREWALL_RULE_PREFIX}*'" in s
+
+
+class TestReadingBackWhetherThePortIsOpen:
+    """Tri-state for the same reason `parse_service_query` is: "no rules" and
+    "the query failed" lead to opposite advice, and reporting a failed query as
+    "no rules" tells someone to re-open a port that is already open.
+    """
+
+    def test_a_positive_count_means_the_rules_are_there(self) -> None:
+        assert parse_firewall_count("2\n", 0) is True
+
+    def test_zero_means_they_are_not(self) -> None:
+        assert parse_firewall_count("0\n", 0) is False
+
+    def test_a_failed_query_is_unknown_rather_than_absent(self) -> None:
+        assert parse_firewall_count("", 1) is None
+        assert parse_firewall_count("Get-NetFirewallRule : denied", 1) is None
+
+    def test_empty_output_is_unknown(self) -> None:
+        assert parse_firewall_count("", 0) is None
+        assert parse_firewall_count("   \n  ", 0) is None
+
+    def test_unparseable_output_is_unknown(self) -> None:
+        assert parse_firewall_count("no idea", 0) is None
+
+    def test_it_reads_the_last_line_not_the_first(self) -> None:
+        """PowerShell prefixes warnings and progress ahead of the value."""
+        assert parse_firewall_count("WARNING: something\n3\n", 0) is True

@@ -827,3 +827,47 @@ because only one of them was a gap in the tests:
 A survivor is a question, not a verdict. Assuming the first kind when it is the second adds
 tests for behaviour already covered; assuming the second when it is the first leaves the
 gap open.
+
+---
+
+## 12. Reachability — **DECIDED: open the port, as narrowly as the transport allows**
+
+The project already knew about this failure and made the user fix it. `diagnose` tells a
+stuck client *"allow the port through the Windows firewall"*, `client.py` lists it as one of
+the two causes of a timeout — and **nothing ever opened it**.
+
+It is the likeliest way the whole setup ends in nothing working, because it is invisible from
+both ends:
+
+| Vantage point | What it sees |
+|---|---|
+| The server | `127.0.0.1` answers perfectly. Loopback is exempt from the rule blocking everyone else. |
+| A client | A timeout — **indistinguishable from the server not running** (`http-api.md` §"Server bound to 127.0.0.1"). |
+
+So the one machine that can answer the question is the one machine that never feels the
+problem. `localllm status` now asks it, on every run, including when the server is down —
+*"not answering AND not reachable"* is two problems, and finding the second only after
+fixing the first wastes the trip.
+
+### Two rules, not one
+
+A blanket "allow inbound 8080" would also open the port on hotel and café networks. Each rule
+is scoped to exactly one of the two transports §4 documents, and nothing else:
+
+| Rule | Scope | Why |
+|---|---|---|
+| `(tailnet)` | `-RemoteAddress 100.64.0.0/10 -Profile Any` | Tailscale's CGNAT range, verified against Tailscale's own docs. Safe on **any** profile precisely because the address is the limit — and Tailscale does not reliably land in the Private profile, so requiring it would break the primary transport. |
+| `(local subnet)` | `-RemoteAddress LocalSubnet -Profile Private,Domain` | The documented same-WiFi fallback. **Never Public**: on a hotel network every other guest is on your local subnet. |
+
+Idempotent (removed by name before being added, because setup is resumable) and reversible
+(the script prints the one-line undo). Validated with PowerShell's own parser and with
+`New-NetFirewallRule -WhatIf`, which checks every parameter without changing anything.
+
+### The read-back is tri-state, like the service probe
+
+`parse_firewall_count` returns `None` when the query fails rather than `False`. "No rules"
+and "could not tell" lead to opposite advice, and reporting a failed query as "no rules"
+sends someone to re-open a port that was already open.
+
+Reading firewall rules does not need Administrator, which is what makes it usable from
+`status` — the diagnosis is available before anyone thinks to elevate.

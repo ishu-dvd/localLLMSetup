@@ -56,6 +56,7 @@ SERVICE_SCRIPTS: tuple[str, ...] = (
     "01-powercfg.ps1",
     "02-install-service.ps1",
     "03-install-watchdog.ps1",
+    "04-firewall.ps1",
 )
 """Every script to run, in order, to make this machine serve 24/7.
 
@@ -63,6 +64,17 @@ Stated once. This sequence previously appeared as a literal in three separate
 files - the `up` output, the setup wizard and the guide - with nothing keeping
 them in agreement, so renaming a script would have left two of them lying.
 """
+
+TAILNET_CIDR = "100.64.0.0/10"
+"""The CGNAT range Tailscale assigns tailnet addresses from.
+
+Verified against Tailscale's own documentation. It is deliberately not a private
+RFC1918 range, so restricting a firewall rule to it admits tailnet peers and
+nothing else - no LAN device, no address off the internet.
+"""
+
+FIREWALL_RULE_PREFIX = "localllm llama-server"
+"""Both firewall rules start with this, so they can be found and removed as a set."""
 
 
 class Level(Enum):
@@ -392,6 +404,85 @@ def render_watchdog_install_script(
     )
 
 
+def render_firewall_script(*, port: int = 8080, prefix: str = FIREWALL_RULE_PREFIX) -> str:
+    """Let the other laptops actually reach the server.
+
+    This is the failure the rest of the project already knew about and made
+    somebody else fix: `diagnose` tells a stuck client "allow the port through
+    the Windows firewall", and nothing ever did. It is the likeliest way the
+    whole setup ends in nothing working, because it is invisible from both
+    ends - the server answers `127.0.0.1` perfectly while every other laptop
+    times out, and a timeout is indistinguishable from "not running".
+
+    Two rules, each as narrow as the transport it serves, because a single
+    "allow 8080" would also open the port on hotel and coffee-shop networks:
+
+      tailnet       any profile, but only from Tailscale's CGNAT range. Safe on
+                    a public profile precisely because the address is the limit.
+      local subnet  the documented same-WiFi fallback - private and domain
+                    networks only, never public.
+
+    Reversible, and idempotent: the rules are removed by name before being
+    added, so re-running never accumulates duplicates.
+    """
+    tailnet = f"{prefix} (tailnet)"
+    lan = f"{prefix} (local subnet)"
+    return "\n".join(
+        [
+            "# localllm - let the other laptops reach this server. Run as Administrator.",
+            "#",
+            "# Two rules, each as narrow as the transport it serves. A single",
+            "# blanket 'allow inbound' would also open the port on hotel and",
+            "# cafe networks.",
+            "",
+            f"$PORT    = {port}",
+            f"$TAILNET = '{TAILNET_CIDR}'   # Tailscale's CGNAT range",
+            "",
+            "# Idempotent: remove by name first, so re-running never duplicates.",
+            f"foreach ($name in @('{tailnet}', '{lan}')) {{",
+            "    Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue |",
+            "        Remove-NetFirewallRule",
+            "}",
+            "",
+            "# Tailscale peers, on any profile - the address range is the limit.",
+            f"New-NetFirewallRule -DisplayName '{tailnet}' `",
+            "    -Direction Inbound -Action Allow -Protocol TCP -LocalPort $PORT `",
+            "    -RemoteAddress $TAILNET -Profile Any | Out-Null",
+            "",
+            "# Same-WiFi fallback. Never on a public network.",
+            f"New-NetFirewallRule -DisplayName '{lan}' `",
+            "    -Direction Inbound -Action Allow -Protocol TCP -LocalPort $PORT `",
+            "    -RemoteAddress LocalSubnet -Profile Private,Domain | Out-Null",
+            "",
+            "# Verify:",
+            f"Get-NetFirewallRule -DisplayName '{prefix}*' |",
+            "    Format-Table DisplayName, Enabled, Profile, Action",
+            "",
+            "# Remove with:",
+            f"#   Get-NetFirewallRule -DisplayName '{prefix}*' | Remove-NetFirewallRule",
+            "",
+        ]
+    )
+
+
+def parse_firewall_count(text: str, returncode: int) -> bool | None:
+    """Did the firewall query find our rules? None means it could not tell.
+
+    Tri-state for the same reason `parse_service_query` is: "no rules" and "the
+    query failed" lead to opposite advice, and reporting a failed query as "no
+    rules" would tell someone to re-open a port that is already open.
+    """
+    if returncode != 0:
+        return None
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        return int(stripped.splitlines()[-1].strip()) > 0
+    except ValueError:
+        return None
+
+
 def render_watchdog_script(*, metrics_url: str = "http://127.0.0.1:8080/metrics") -> str:
     """Alert on page-file thrash, which is otherwise completely silent.
 
@@ -473,6 +564,33 @@ def probe_service_installed(name: str) -> bool | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return parse_service_query((r.stdout or "") + (r.stderr or ""), r.returncode)
+
+
+def probe_firewall_rules(prefix: str = FIREWALL_RULE_PREFIX) -> bool | None:
+    """Is the port open to the other laptops? None when it cannot be told.
+
+    Reading firewall rules does not need Administrator, which is what makes
+    this worth doing from `status`: the one machine that can answer the
+    question is the one machine that never notices the problem, because
+    `127.0.0.1` is exempt from the rule that blocks everybody else.
+    """
+    if sys.platform != "win32":
+        return None
+    query = (
+        f"(Get-NetFirewallRule -DisplayName '{prefix}*' "
+        "-ErrorAction SilentlyContinue | Measure-Object).Count"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", query],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_firewall_count(r.stdout or "", r.returncode)
 
 
 def probe_free_disk_gb(path: str | Path) -> float | None:
