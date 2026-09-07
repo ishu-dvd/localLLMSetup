@@ -545,9 +545,30 @@ class TestTheClientsOwnFileWins:
         assert "context" in found.drift
 
     def test_a_field_the_client_file_does_not_carry_is_not_drift(self, tmp_path, monkeypatch):
-        """Aider keeps its URL in the environment. An unset variable is a
-        missing value, not a disagreement, and reporting it as an edit would
-        cry wolf on every fresh shell."""
+        """Aider keeps its limits in a separate metadata file. When that file
+        is missing, `own.context` is None - an absent value, not a
+        disagreement - and reporting it as an edit would cry wolf.
+
+        The deletion is the point. Mutation testing showed that without it this
+        test passed for the wrong reason: Aider normally carries both fields,
+        so the absence guard was never reached and removing it changed nothing.
+        """
+        from localllm.join import read_client_config
+
+        monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        self._joined(tmp_path, client="aider")
+        (tmp_path / ".aider.model.metadata.json").unlink()
+
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.drift == ()
+        # The sidecar supplies what the client file cannot.
+        assert found.context == 8192
+
+    def test_an_unset_environment_url_is_not_drift(self, tmp_path, monkeypatch):
+        """The other absence: Aider's base URL lives in a variable that is
+        simply unset in a fresh shell."""
         from localllm.join import read_client_config
 
         monkeypatch.delenv("OPENAI_API_BASE", raising=False)
