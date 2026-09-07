@@ -62,15 +62,73 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     # --- budget.py: path quoting --------------------------------------------
     (
         "src/localllm/budget.py",
-        "return f'\"{path}\"' if \" \" in path and not path.startswith('\"') else path",
+        'return f\'"{path}"\' if " " in path and not path.startswith(\'"\') else path',
         "return path",
         "unquoted paths with spaces make llama-server exit at startup",
     ),
     (
         "src/localllm/budget.py",
-        'f"--api-key-file {_quoted(api_key_file or \'<path-to>/keys.txt\')}",',
+        "f\"--api-key-file {_quoted(api_key_file or '<path-to>/keys.txt')}\",",
         '"--device Vulkan0",',
         "dropping --api-key-file publishes the model with no auth",
+    ),
+    # --- handoff.py: the refusal and the per-slot read ------------------------
+    (
+        "src/localllm/handoff.py",
+        "if budget is not None and requested > budget:",
+        "if False:",
+        "removing the refusal lets a client overflow its slot silently",
+    ),
+    (
+        "src/localllm/handoff.py",
+        "if requested <= 0:",
+        "if False:",
+        "a zero-token window would reach the client config",
+    ),
+    (
+        "src/localllm/handoff.py",
+        'settings = body.get("default_generation_settings")',
+        "settings = body",
+        "reading the top-level n_ctx gives n_slots times too much context",
+    ),
+    (
+        "src/localllm/handoff.py",
+        "if server is not None:",
+        "if False:",
+        "ignoring the running server means the stale plan wins",
+    ),
+    # --- invite.py: the checksum --------------------------------------------
+    (
+        "src/localllm/invite.py",
+        "if checksum != _checksum(body):",
+        "if False:",
+        "without the checksum a truncated token becomes a wrong key",
+    ),
+    (
+        "src/localllm/invite.py",
+        "if not text.startswith(PREFIX):",
+        "if False:",
+        "anything pasted would be treated as an invite",
+    ),
+    (
+        "src/localllm/invite.py",
+        "if not isinstance(context, int) or isinstance(context, bool) or context <= 0:",
+        "if False:",
+        "a token carrying a zero context would be accepted",
+    ),
+    # --- guide.py: the slots bug found by running it -------------------------
+    (
+        "src/localllm/guide.py",
+        'f"--slots {max(planned_devices, 1)}"',
+        'f"--slots {max(invited_devices, 1)}"',
+        "this is the exact bug running the tool found: slots from the wrong count",
+    ),
+    # --- serve.py: the auth gate --------------------------------------------
+    (
+        "src/localllm/serve.py",
+        "if active_keys <= 0:",
+        "if False:",
+        "removing the auth gate lets `up` publish an unauthenticated server",
     ),
 ]
 

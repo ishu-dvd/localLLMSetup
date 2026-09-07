@@ -115,9 +115,17 @@ llama.cpp, llama-swap and gguf-parser. Not a new inference stack.
 git clone https://github.com/ishu-dvd/localLLMSetup
 cd localLLMSetup
 $env:PYTHONPATH="src"
-python -m pytest tests          # 698 tests
+python -m pytest tests          # 727 tests
 python -m localllm next         # says what to do first
 ```
+
+A green suite is not the same as a suite that would notice. `python mutate.py`
+deliberately breaks 17 safety-critical behaviours one at a time — the context
+refusal, the invite checksum, the per-slot `n_ctx` read, the auth gate, the CRLF
+detector — and requires the tests to catch each one. It currently catches 17/17.
+
+That check earns its place: a code review found a test here that passed no
+matter what the code did, and this harness then found a second one.
 
 **Point it at a real model file** and it reads the facts from the file rather than
 trusting a hand-maintained catalogue:
@@ -345,7 +353,8 @@ On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
 | 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**698 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
+**727 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13,
+and 17/17 mutations caught.
 
 ---
 
