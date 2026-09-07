@@ -37,7 +37,7 @@ from .client import Api, Outcome, check_inference, check_model_visibility, diagn
 from .constants import MODEL_ALIAS
 from .detect import detect
 from .gguf import GgufError, read_gguf_file, read_gguf_url
-from .guide import client_guide, server_guide
+from .guide import client_guide, find_gguf, server_guide
 from .handoff import (
     FILENAME as PLAN_FILENAME,
 )
@@ -48,20 +48,46 @@ from .handoff import (
     resolve_context,
     resolve_model,
 )
+from .install import (
+    BACKENDS,
+    LLAMA_RELEASES_PAGE,
+    Asset,
+    build_of_asset,
+    check_client_tooling,
+    choose_backend,
+    cuda_toolkit_of,
+    cudart_asset,
+    download,
+    find_llama_server,
+    latest_llama_release,
+    pick_asset,
+    unzip,
+)
 from .invite import Invite, InviteError
 from .invite import decode as decode_invite
-from .join import SUPPORTED, build_client_config, normalise_base_url, read_client_config
+from .join import (
+    CLIENTS,
+    SUPPORTED,
+    build_client_config,
+    normalise_base_url,
+    read_client_config,
+    recommend_client_for,
+)
 from .keys import DeviceExistsError, DeviceNotFoundError, KeyStore
 from .serve import (
+    MIN_LLAMA_BUILD,
+    build_is_recent_enough,
     preflight,
     probe_free_disk_gb,
     probe_llama_build,
+    probe_service_installed,
     render_nssm_script,
     render_powercfg_script,
     render_watchdog_script,
 )
 from .speed import context_speed_curve
 from .verify import compare, read_server_log
+from .wizard import Act, finished_message, plan_setup
 
 _MARK = {Fit.FITS: "OK  ", Fit.TIGHT: "TIGHT", Fit.REFUSE: "NO  "}
 DEFAULT_STORE = Path.home() / ".localllm" / "keys.json"
@@ -74,15 +100,24 @@ PROBE_TIMEOUT_S = 5.0
 """Shorter than the doctor's: confirming a plan is advisory and has a fallback."""
 
 
-def _hardware_from(args: argparse.Namespace) -> tuple[Hardware, list[str]]:
-    """Explicit flags win; otherwise probe. Never silently invent numbers."""
+def _hardware_from(
+    args: argparse.Namespace, det: object | None = None
+) -> tuple[Hardware, list[str]]:
+    """Explicit flags win; otherwise probe. Never silently invent numbers.
+
+    `det` lets a caller that has already probed pass the result in. Probing
+    shells out to PowerShell four times, and a caller that needed the raw
+    detection for something else would otherwise pay for it twice - and print
+    every detection warning twice with it.
+    """
     notes: list[str] = []
     if args.vram is not None and args.ram is not None:
         return Hardware(vram_total_gb=args.vram, ram_total_gb=args.ram), notes
 
-    det = detect(getattr(args, "llama_server", None))
-    notes.extend(det.warnings)
-    probed = det.to_hardware()
+    if det is None:
+        det = detect(getattr(args, "llama_server", None))
+        notes.extend(det.warnings)  # type: ignore[attr-defined]
+    probed = det.to_hardware()  # type: ignore[attr-defined]
     if probed is None:
         notes.append("could not determine hardware; using the MSI Alpha reference spec")
         return Hardware(vram_total_gb=args.vram or 8.0, ram_total_gb=args.ram or 16.0), notes
@@ -909,6 +944,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
         model=plan.model_alias,
         context_per_slot=plan.context_per_slot,
         n_slots=plan.n_slots,
+        model_id=plan.model_id,
     ).encode()
 
     print(f"\n  {token}\n")
@@ -1029,7 +1065,14 @@ def cmd_join(args: argparse.Namespace) -> int:
         model=model,
         context=choice.context,
     )
-    written = config.write(args.out)
+    try:
+        written = config.write(args.out, force=getattr(args, "force", False))
+    except FileExistsError as exc:
+        # Reported rather than raised: a traceback here reads as a crash, and
+        # the thing that stopped the command is a deliberate refusal with a
+        # fix in the message.
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     print(f"wrote {written}")
     for name in config.extra_files:
         print(f"wrote {Path(args.out) / name}")
@@ -1041,6 +1084,403 @@ def cmd_join(args: argparse.Namespace) -> int:
     for n in config.notes:
         print(f"  - {n}")
     print("\nConfirm it works, from this directory:\n  localllm check")
+    return 0
+
+
+def stronger_alternative(
+    hw: Hardware, *, devices: int, asked: int, chosen: object | None
+) -> tuple[object, int, float] | None:
+    """A better-scoring model this machine could run, and what it would cost.
+
+    `recommend` refuses to return a TIGHT verdict - an unattended server should
+    not run without margin, and that rule is right. But on the reference
+    hardware it means `setup --devices 2` picks a 7B that FITS over the
+    20B this whole project was built around, which is TIGHT by 0.05 GB, and
+    reports the 7B as simply what the machine can do.
+
+    That is a decision the user should make, not one to bury. So the stronger
+    model is offered explicitly, at the current context if it is merely tight
+    there, or at the largest smaller context where it becomes viable - together
+    with the headroom, so "tight" is a number rather than a word.
+
+    Returns (model, context, headroom_gb), or None when nothing beats the pick.
+    """
+    current = getattr(chosen, "swe_bench_verified", None) or 0.0
+    slots = max(1, devices)
+    best: tuple[object, int, float] | None = None
+    for context in (asked, asked // 2, asked // 4, asked // 8):
+        if context < 4096:
+            break
+        plan = Plan(context_per_slot=context, n_slots=slots)
+        for model in CATALOGUE.values():
+            score = model.swe_bench_verified or 0.0
+            if score <= current:
+                continue
+            verdict = solve(hw, model, plan)
+            if verdict.status is Fit.REFUSE:
+                continue
+            if best is None or score > (best[0].swe_bench_verified or 0.0):
+                best = (model, context, verdict.headroom_gb)
+        if best is not None:
+            # The largest context at which anything better is viable wins;
+            # trading away more context than necessary is not an improvement.
+            return best
+    return best
+
+
+def _progress(label: str):
+    """A one-line download meter. A 12 GB download with no output looks hung."""
+    state = {"last": -1}
+
+    def report(done: int, total: int) -> None:
+        pct = int(done * 100 / total) if total else 0
+        if pct == state["last"]:
+            return
+        state["last"] = pct
+        gb = done / 1_000_000_000
+        end = "\n" if total and done >= total else ""
+        print(f"\r  {label}: {pct:3d}%  ({gb:.2f} GB)", end=end, flush=True)
+
+    return report
+
+
+def _install_llama(dest: Path, backend: str, assets: tuple[Asset, ...]) -> Path | None:
+    """Download and unpack the right llama.cpp build. Returns the server path."""
+    chosen = pick_asset(assets, backend=backend)
+    if chosen is None:
+        print(
+            f"error: this release ships no Windows {backend} build. "
+            f"Pick another with --backend, or download one yourself from\n"
+            f"  {LLAMA_RELEASES_PAGE}",
+            file=sys.stderr,
+        )
+        return None
+
+    dest.mkdir(parents=True, exist_ok=True)
+    archive = dest / chosen.name
+    print(f"  downloading {chosen.name}")
+    download(chosen.url, archive, expected_size=chosen.size, on_progress=_progress("llama.cpp"))
+    unzip(archive, dest)
+    archive.unlink(missing_ok=True)
+
+    if backend == "cuda":
+        # The CUDA build does not bundle NVIDIA's runtime DLLs. Without them the
+        # service exits immediately on a missing DLL, and as a service that
+        # failure goes to a dialog nobody sees rather than to the log. The
+        # runtime must match the build's toolkit: a release ships several.
+        toolkit = cuda_toolkit_of(chosen.name)
+        extra = cudart_asset(assets, toolkit=toolkit)
+        if extra is None:
+            print(
+                f"  warning: no CUDA {toolkit or ''} runtime in this release; "
+                f"the server may fail to start on a missing DLL"
+            )
+        else:
+            print(f"  downloading {extra.name} (CUDA runtime the build needs)")
+            rt = dest / extra.name
+            download(extra.url, rt, expected_size=extra.size, on_progress=_progress("cudart"))
+            unzip(rt, dest)
+            rt.unlink(missing_ok=True)
+
+    found = find_llama_server(dest)
+    if found is None:
+        print(f"error: unpacked {chosen.name} but found no llama-server in {dest}", file=sys.stderr)
+    return found
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Nothing to a running model, in one command.
+
+    Every step here already existed. What did not exist is the thing that runs
+    them in order and skips the ones already done - which matters because two
+    of them are multi-gigabyte downloads over a home connection, and the run
+    *will* be interrupted at least once.
+    """
+    root = Path(args.dir)
+    llama_dir = root / "llama.cpp"
+    model_dir = Path(args.model_dir) if args.model_dir else root / "models"
+    out = Path(args.out) if args.out else root / "deploy"
+
+    det = detect(args.llama_server)
+    for w in det.warnings:
+        print(f"note     : {w}")
+    if args.backend == "auto":
+        backend, why = choose_backend(det)
+    else:
+        backend, why = args.backend, "chosen with --backend"
+
+    explicit = Path(args.llama_server) if args.llama_server else None
+    llama = explicit if explicit and explicit.exists() else find_llama_server(llama_dir)
+    gguf = find_gguf(model_dir)
+
+    hw, hw_notes = _hardware_from(args, det)
+    for n in hw_notes:
+        print(f"note     : {n}")
+    verdict = recommend(hw, Plan(context_per_slot=args.context, n_slots=max(1, args.devices)))
+    model = verdict.model if verdict else None
+
+    if args.model:
+        picked = CATALOGUE.get(args.model)
+        if picked is None:
+            print(
+                f"error: no model {args.model!r} in the catalogue. Known ids:\n  "
+                + "\n  ".join(sorted(CATALOGUE)),
+                file=sys.stderr,
+            )
+            return 1
+        chosen_verdict = solve(hw, picked, Plan(args.context, max(1, args.devices)))
+        if chosen_verdict.status is Fit.REFUSE:
+            # Overriding the solver is allowed; overriding a refusal is not.
+            # A REFUSE means the numbers say it cannot load, and downloading
+            # 13 GB to prove that is an expensive way to be told.
+            print(
+                f"error: {picked.id} does not fit at --context {args.context} with "
+                f"{max(1, args.devices)} slot(s): {chosen_verdict.headroom_gb:+.2f} GB. "
+                f"Lower --context or --devices.",
+                file=sys.stderr,
+            )
+            return 1
+        model = picked
+        print(f"note     : using {picked.id} as asked ({chosen_verdict.status.name})")
+
+    better = stronger_alternative(hw, devices=args.devices, asked=args.context, chosen=model)
+    if better is not None:
+        alt, ctx, headroom = better
+        mine = f"{model.swe_bench_verified or 0:.1f}" if model else "nothing"
+        where = "at this context" if ctx == args.context else f"at --context {ctx}"
+        print(
+            f"note     : {alt.id} scores {alt.swe_bench_verified:.1f} on SWE-bench "
+            f"against {mine} for {model.id if model else 'nothing'}."
+        )
+        print(
+            f"           It runs {where} with {headroom:+.2f} GB spare. That margin "
+            f"is thin for an unattended server, which is why it was not chosen for "
+            f"you - re-run with --model to take it."
+        )
+
+    # Resolving the release is a small JSON call, and it is what turns "about
+    # 90 MB" into the real figure before the user commits to the download.
+    assets: tuple[Asset, ...] = ()
+    llama_bytes = 0
+    if llama is None:
+        try:
+            tag, assets = latest_llama_release(min_build=MIN_LLAMA_BUILD)
+            picked = pick_asset(assets, backend=backend)
+            llama_bytes = picked.size if picked else 0
+            print(f"note     : latest llama.cpp release is {tag}")
+            resolved_build = build_of_asset(picked.name) if picked else build_of_asset(tag)
+            if not build_is_recent_enough(resolved_build):
+                # Found before the download rather than after it. `up`'s
+                # preflight refuses an old build, so without this the user
+                # waits for 90 MB and a full unpack to be told no.
+                print(
+                    f"error: the current llama.cpp release is build "
+                    f"{resolved_build}, older than the {MIN_LLAMA_BUILD} this "
+                    f"project requires - earlier builds take a much slower "
+                    f"Vulkan path.",
+                    file=sys.stderr,
+                )
+                print(
+                    f"Pick a newer nightly from {LLAMA_RELEASES_PAGE} and pass it "
+                    f"with --llama-server <path>\\llama-server.exe.",
+                    file=sys.stderr,
+                )
+                return 1
+        except OSError as exc:
+            print(f"note     : could not reach the llama.cpp release API ({exc})")
+
+    store = KeyStore(args.store)
+    plan = plan_setup(
+        llama_server=llama,
+        gguf=gguf,
+        plan_file=out / PLAN_FILENAME,
+        active_keys=len(store.active()),
+        devices=args.devices,
+        backend=backend,
+        backend_reason=why,
+        model_id=model.id if model else "",
+        model_bytes=int(model.weights_gb * 1_000_000_000) if model else 0,
+        llama_bytes=llama_bytes,
+        service_installed=probe_service_installed(args.service_name),
+        free_disk_gb=probe_free_disk_gb(root),
+    )
+    print()
+    print(plan.render())
+    print()
+
+    if plan.blocked is not None:
+        print(f"error: {plan.blocked.detail}", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print("Dry run - nothing was downloaded or written.")
+        return 0
+    if plan.nothing_to_do:
+        print("Already set up. `localllm status` shows whether the server is answering.")
+        return 0
+
+    todo = {a.key for a in plan.to_run}
+
+    if "llama" in todo:
+        if not assets:
+            try:
+                _, assets = latest_llama_release(min_build=MIN_LLAMA_BUILD)
+            except OSError as exc:
+                print(f"error: cannot reach the llama.cpp releases API: {exc}", file=sys.stderr)
+                return 1
+        llama = _install_llama(llama_dir, backend, assets)
+        if llama is None:
+            return 1
+        print(f"  installed {llama}")
+
+    if "model" in todo:
+        if model is None or not model.download_url:
+            print("error: no download source recorded for this model", file=sys.stderr)
+            return 1
+        target = model_dir / str(model.hf_file)
+        print(f"  downloading {model.id} ({model.weights_gb:.1f} GB)")
+        try:
+            download(model.download_url, target, on_progress=_progress("model"))
+        except OSError as exc:
+            print(f"error: model download failed: {exc}", file=sys.stderr)
+            return 1
+        gguf = target
+        print(f"  installed {target}")
+
+    if "keys" in todo:
+        for i in range(len(store.active()), max(1, args.devices)):
+            name = f"laptop-{i + 1}"
+            if store.for_device(name) is None:
+                store.add(name)
+                print(f"  issued a key for {name}")
+
+    if "up" in todo:
+        rc = cmd_up(
+            argparse.Namespace(
+                **{
+                    **vars(args),
+                    "llama_server": str(llama) if llama else None,
+                    "gguf": str(gguf) if gguf else None,
+                    "slots": max(1, args.devices),
+                    "out": out,
+                }
+            )
+        )
+        if rc != 0:
+            return rc
+
+    devices = [e.device for e in store.active()][: max(1, args.devices)]
+    invites: list[tuple[str, str]] = []
+    url = args.url or f"http://{_this_host()}:8080"
+    try:
+        server_plan = ServerPlan.load(out / PLAN_FILENAME)
+    except (HandoffError, OSError) as exc:
+        print(f"note     : could not read the plan ({exc}); run `localllm invite <name>`")
+    else:
+        key_file = out / KEY_FILENAME
+        if key_file.exists():
+            store.write_api_key_file(key_file)
+        for device in devices:
+            entry = store.for_device(device)
+            if entry is None:
+                continue
+            invites.append(
+                (
+                    device,
+                    Invite(
+                        url=url,
+                        api_key=entry.key,
+                        device=device,
+                        model=server_plan.model_alias,
+                        context_per_slot=server_plan.context_per_slot,
+                        n_slots=server_plan.n_slots,
+                        model_id=server_plan.model_id,
+                    ).encode(),
+                )
+            )
+
+    print()
+    print(
+        finished_message(
+            invites=invites,
+            url=url,
+            manual=[m for a in plan.actions if a.act is Act.RUN and (m := a.manual)],
+        )
+    )
+    return 0
+
+
+def _this_host() -> str:
+    """This machine's LAN name, so the invite points somewhere the others can reach.
+
+    `localhost` is correct on the server and useless in an invite - it is the
+    one value that works everywhere it is generated and nowhere it is sent.
+    """
+    import socket
+
+    try:
+        return socket.gethostname() or "127.0.0.1"
+    except OSError:
+        return "127.0.0.1"
+
+
+def cmd_client(args: argparse.Namespace) -> int:
+    """The client-laptop counterpart: paste the invite, get a working agent.
+
+    `join` writes a config file. That is necessary and not sufficient: the
+    agent it configures is usually not installed, and the two things that go
+    wrong on a fresh laptop - no Node, no VS Code - produce errors from the
+    agent's own installer that say nothing about this project.
+    """
+    try:
+        inv = decode_invite(args.invite)
+    except InviteError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    client = args.client or recommend_client_for(inv.model_id or inv.model)
+    profile = CLIENTS.get(client)
+    if profile is None:
+        print(f"error: unknown client {client!r}", file=sys.stderr)
+        return 1
+    chosen_by = "you" if args.client else ("the model in the invite" if inv.model_id else "default")
+    print(f"agent    : {profile.title} (chosen by {chosen_by})")
+    print(f"           {profile.why}\n")
+
+    print("This laptop has:")
+    checks = check_client_tooling()
+    for c in checks:
+        print(c.line)
+    missing = [c for c in checks if not c.present and c.name in profile.requires]
+    if missing:
+        print("\nInstall the missing prerequisites above, then re-run this command.")
+        return 1
+
+    print(f"\nInstall {profile.title}:\n  {profile.install}\n")
+
+    rc = cmd_join(
+        argparse.Namespace(
+            **{
+                **vars(args),
+                "client": profile.join_name,
+                "device": "",
+                "url": "",
+                "model": "",
+                # None, not 0: `resolve_context` reads 0 as "you asked for zero
+                # tokens" and refuses, which is what running this actually did.
+                "context": None,
+                "plan": DEFAULT_PLAN_PATH,
+                "store": DEFAULT_STORE,
+            }
+        )
+    )
+    if rc != 0:
+        return rc
+    if not profile.writes_config:
+        print(
+            f"\nNote: {profile.title} cannot be configured from a file - the file "
+            f"above holds the values to enter by hand. `--client opencode` or "
+            f"`--client continue` write a real config."
+        )
     return 0
 
 
@@ -1083,6 +1523,60 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run one coding model on one laptop; use it from the others.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    setup = sub.add_parser(
+        "setup",
+        help="do the whole server setup: download llama.cpp and a model, then run it",
+    )
+    _add_plan_args(setup)
+    setup.add_argument(
+        "--dir",
+        type=Path,
+        default=Path("C:/ai/localllm") if sys.platform == "win32" else Path.home() / "localllm",
+        help="where llama.cpp, the model and the service definition go",
+    )
+    setup.add_argument("--model-dir", type=Path, default=None, help="override the model location")
+    setup.add_argument("--out", type=Path, default=None, help="override the deploy directory")
+    setup.add_argument("--devices", type=int, default=2, help="how many laptops will use this")
+    setup.add_argument(
+        "--backend",
+        default="auto",
+        choices=["auto", *BACKENDS],
+        help="which llama.cpp build to install (default: from the detected GPU)",
+    )
+    setup.add_argument("--url", default="", help="the URL the other laptops will use")
+    setup.add_argument(
+        "--model",
+        default="",
+        help="a catalogue id to install instead of the recommended one, e.g. "
+        "'gpt-oss-20b:MXFP4'. Refused if it cannot fit.",
+    )
+    setup.add_argument("--store", type=Path, default=DEFAULT_STORE)
+    setup.add_argument("--service-name", default="localllm")
+    setup.add_argument(
+        "--dry-run", action="store_true", help="show the plan and the download size, then stop"
+    )
+    setup.set_defaults(func=cmd_setup)
+
+    client = sub.add_parser(
+        "client",
+        help="on another laptop: paste an invite, get a working coding agent",
+    )
+    client.add_argument("invite", help="the token printed by `localllm setup` or `localllm invite`")
+    client.add_argument(
+        "--client",
+        default="",
+        choices=["", *sorted(CLIENTS)],
+        help="which coding agent (default: chosen from the model in the invite)",
+    )
+    client.add_argument("--out", type=Path, default=Path("."), help="where to write the config")
+    client.add_argument("--no-probe", action="store_true", help="do not contact the server")
+    client.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing config.yaml or settings.json that this tool did not write",
+    )
+    client.set_defaults(func=cmd_client)
 
     nxt = sub.add_parser(
         "next",
@@ -1269,6 +1763,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not ask the server to confirm the plan - use the plan file alone",
     )
     join.add_argument("--out", type=Path, default=Path("."))
+    join.add_argument(
+        "--force",
+        action="store_true",
+        help="overwrite an existing config.yaml or settings.json that this tool did not write",
+    )
     join.add_argument("--store", type=Path, default=DEFAULT_STORE)
     join.set_defaults(func=cmd_join)
 

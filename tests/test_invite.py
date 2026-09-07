@@ -134,3 +134,31 @@ def test_the_token_carries_its_format_version():
     """A v2 token pasted into a v1 build should be recognisable as such rather
     than reported as corrupt."""
     assert an_invite().encode().startswith(PREFIX)
+
+
+class TestTheRealModelIdTravelsSeparatelyFromTheAlias:
+    """`model` is always `claude-local-coder` - a constant, chosen so that
+    Claude-compatible clients find it in the model list. So it identifies the
+    protocol and never the model, and the client-side code that picked a
+    coding agent "from the model in the invite" was reading a constant."""
+
+    def test_it_round_trips(self):
+        token = an_invite(model_id="gpt-oss-20b:MXFP4").encode()
+        assert decode(token).model_id == "gpt-oss-20b:MXFP4"
+
+    def test_the_alias_is_untouched_by_it(self):
+        decoded = decode(an_invite(model_id="gpt-oss-20b:MXFP4").encode())
+        assert decoded.model == "claude-local-coder"
+
+    def test_a_token_minted_before_the_field_existed_still_decodes(self):
+        """Older tokens carry no `i` key at all. Refusing them would strand
+        every laptop already invited."""
+        old = an_invite()
+        assert "i" not in json.loads(
+            base64.urlsafe_b64decode(old.encode()[len(PREFIX) :].rsplit("_", 1)[0] + "==")
+        )
+        assert decode(old.encode()).model_id == ""
+
+    def test_the_checksum_covers_it(self):
+        """Two invites differing only in the model id must not share a token."""
+        assert an_invite(model_id="a").encode() != an_invite(model_id="b").encode()

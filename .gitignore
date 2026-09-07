@@ -16,7 +16,10 @@ models/
 deploy/
 keys.txt
 localllm-client.json
-cline-settings.json
 .aider.conf.yml
 .aider.model.metadata.json
 octofriend.json5
+opencode.json
+settings.json
+config.yaml
+cline-setup.md

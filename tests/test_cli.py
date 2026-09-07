@@ -469,7 +469,7 @@ class TestJoinPinsTheContextTheServerActuallyGives:
         argv = [
             "join",
             "--client",
-            "cline",
+            "opencode",
             "--device",
             "laptop-a",
             "--url",
@@ -485,12 +485,23 @@ class TestJoinPinsTheContextTheServerActuallyGives:
         captured = capsys.readouterr()
         return code, captured.out + captured.err
 
+    def _written(self, tmp_path):
+        """What the client's OWN file says - not the sidecar.
+
+        The sidecar records what `join` intended; this is what opencode loads.
+        Asserting the sidecar here would pass no matter what the client config
+        contained, which is how a context test went vacuous once before.
+        """
+        data = json.loads((tmp_path / "client" / "opencode.json").read_text())
+        provider = data["provider"]["llama.cpp"]
+        model = next(iter(provider["models"]))
+        return {"model": model, "context": provider["models"][model]["limit"]["context"]}
+
     def test_the_plan_file_sets_the_client_context(self, tmp_path, capsys) -> None:
         plan = self._plan_file(tmp_path, context=8192)
         code, out = self._join(tmp_path, capsys, "--plan", str(plan))
         assert code == 0
-        written = json.loads((tmp_path / "client" / "cline-settings.json").read_text())
-        assert written["openAiModelInfo"]["contextWindow"] == 8192
+        assert self._written(tmp_path)["context"] == 8192
 
     def test_asking_for_more_than_the_plan_allows_is_refused(self, tmp_path, capsys) -> None:
         """The whole point. This must fail the command, not warn."""
@@ -498,14 +509,13 @@ class TestJoinPinsTheContextTheServerActuallyGives:
         code, out = self._join(tmp_path, capsys, "--plan", str(plan), "--context", "32768")
         assert code == 1
         assert "exceed_context_size_error" in out
-        assert not (tmp_path / "client" / "cline-settings.json").exists()
+        assert not (tmp_path / "client" / "opencode.json").exists()
 
     def test_asking_for_less_than_the_plan_allows_is_accepted(self, tmp_path, capsys) -> None:
         plan = self._plan_file(tmp_path, context=8192)
         code, _ = self._join(tmp_path, capsys, "--plan", str(plan), "--context", "4096")
         assert code == 0
-        written = json.loads((tmp_path / "client" / "cline-settings.json").read_text())
-        assert written["openAiModelInfo"]["contextWindow"] == 4096
+        assert self._written(tmp_path)["context"] == 4096
 
     def test_a_named_plan_that_does_not_exist_is_an_error(self, tmp_path, capsys) -> None:
         """Silently ignoring a typo'd path would write exactly the unpinned
@@ -543,8 +553,7 @@ class TestJoinPinsTheContextTheServerActuallyGives:
         ).write(tmp_path / "deploy")
         code, _ = self._join(tmp_path, capsys, "--plan", str(plan))
         assert code == 0
-        written = json.loads((tmp_path / "client" / "cline-settings.json").read_text())
-        assert written["openAiModelId"] == "claude-something-else"
+        assert self._written(tmp_path)["model"] == "claude-something-else"
 
     def test_the_running_server_overrides_a_stale_plan(self, tmp_path, capsys) -> None:
         """A plan promising more than the server gives is the dangerous case."""
@@ -571,7 +580,7 @@ class TestJoinPinsTheContextTheServerActuallyGives:
             argv = [
                 "join",
                 "--client",
-                "cline",
+                "opencode",
                 "--device",
                 "laptop-a",
                 "--url",
@@ -591,8 +600,7 @@ class TestJoinPinsTheContextTheServerActuallyGives:
 
         assert code == 0
         assert "less than planned" in out
-        written = json.loads((tmp_path / "client" / "cline-settings.json").read_text())
-        assert written["openAiModelInfo"]["contextWindow"] == 8192
+        assert self._written(tmp_path)["context"] == 8192
 
 
 class TestUpHandsThePlanToTheClients:
@@ -1338,7 +1346,7 @@ class TestARejectedKeyDuringJoinIsFatal:
                 "--invite",
                 self.TOKEN,
                 "--client",
-                "cline",
+                "opencode",
                 "--out",
                 str(tmp_path / "client"),
                 *extra,
@@ -1359,7 +1367,7 @@ class TestARejectedKeyDuringJoinIsFatal:
         walks away believing the laptop is set up."""
         self._with_status(monkeypatch, 401, {"error": {"message": "Invalid API Key"}})
         self._join(tmp_path, capsys)
-        assert not (tmp_path / "client" / "cline-settings.json").exists()
+        assert not (tmp_path / "client" / "opencode.json").exists()
 
     def test_the_message_names_the_likely_cause(self, tmp_path, capsys, monkeypatch) -> None:
         """A bare "unauthorised" sends the user to re-issue a key that is fine.
@@ -1382,11 +1390,11 @@ class TestARejectedKeyDuringJoinIsFatal:
         monkeypatch.setattr("localllm.cli.probe", fake_probe)
         code, out = self._join(tmp_path, capsys)
         assert code == 0, out
-        assert (tmp_path / "client" / "cline-settings.json").exists()
+        assert (tmp_path / "client" / "opencode.json").exists()
 
     def test_no_probe_skips_the_check_entirely(self, tmp_path, capsys, monkeypatch) -> None:
         """The documented escape hatch must not be broken by making 401 fatal."""
         self._with_status(monkeypatch, 401, {"error": {"message": "Invalid API Key"}})
         code, _ = self._join(tmp_path, capsys, "--no-probe")
         assert code == 0
-        assert (tmp_path / "client" / "cline-settings.json").exists()
+        assert (tmp_path / "client" / "opencode.json").exists()
