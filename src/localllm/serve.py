@@ -40,6 +40,30 @@ THRASH_PAGES_PER_SEC = 50
 MIN_FREE_DISK_GB = 5.0
 """Headroom beyond the model file itself."""
 
+WATCHDOG_SERVICE_NAME = "localllm-watchdog"
+"""The watchdog runs as its own service, separate from llama-server."""
+
+WATCHDOG_LOOP_FILENAME = "watchdog-loop.ps1"
+"""Deliberately unnumbered. See `render_watchdog_install_script`.
+
+The deploy directory follows one naming rule: **a numbered script is one you
+run, in that order.** This file is `while ($true)` and never exits, so running
+it directly is never right - it is registered as a service by `03-install-
+watchdog.ps1` instead.
+"""
+
+SERVICE_SCRIPTS: tuple[str, ...] = (
+    "01-powercfg.ps1",
+    "02-install-service.ps1",
+    "03-install-watchdog.ps1",
+)
+"""Every script to run, in order, to make this machine serve 24/7.
+
+Stated once. This sequence previously appeared as a literal in three separate
+files - the `up` output, the setup wizard and the guide - with nothing keeping
+them in agreement, so renaming a script would have left two of them lying.
+"""
+
 
 class Level(Enum):
     PASS = "PASS"
@@ -315,6 +339,53 @@ def render_nssm_script(
             f"nssm start {service_name}",
             "",
             "# Health check:  curl http://127.0.0.1:8080/health",
+            f"# Remove with:   nssm remove {service_name} confirm",
+            "",
+        ]
+    )
+
+
+def render_watchdog_install_script(
+    *,
+    service_name: str = WATCHDOG_SERVICE_NAME,
+    loop_script: str,
+    log_dir: str,
+) -> str:
+    """Register the watchdog loop as its own service.
+
+    The loop cannot be *run* - it is `while ($true)`, so a user following the
+    old instruction to "run 01, 02, 03 as Administrator" got a terminal that
+    never came back, and concluded the setup had hung. Its own header said
+    "Run under NSSM alongside the server" and nothing ever did, so the thrash
+    alerting this project advertises was generated and then never started.
+
+    Hence the naming rule the deploy directory now follows: **a numbered script
+    is one you run, in that order.** The loop is `watchdog-loop.ps1`, with no
+    number, because running it directly is never the right thing to do.
+    """
+    return "\n".join(
+        [
+            f"# localllm - install {service_name} as a Windows service. Run as Administrator.",
+            "# Requires NSSM: winget install NSSM.NSSM",
+            "#",
+            "# This registers the watchdog LOOP as a service. Do not run the loop",
+            "# directly - it never exits.",
+            "",
+            "nssm install "
+            + service_name
+            + ' "powershell.exe" "-NoProfile -ExecutionPolicy Bypass -File '
+            + f'\\"{loop_script}\\""',
+            f'nssm set {service_name} AppStdout "{log_dir}\\{service_name}.out.log"',
+            f'nssm set {service_name} AppStderr "{log_dir}\\{service_name}.err.log"',
+            f"nssm set {service_name} AppRotateFiles 1",
+            f"nssm set {service_name} AppRotateBytes 10485760",
+            "",
+            f"nssm set {service_name} Start SERVICE_AUTO_START",
+            f"nssm set {service_name} AppExit Default Restart",
+            f"nssm set {service_name} AppRestartDelay 5000",
+            "",
+            f"nssm start {service_name}",
+            "",
             f"# Remove with:   nssm remove {service_name} confirm",
             "",
         ]

@@ -17,12 +17,15 @@ from localllm.catalogue import (
 )
 from localllm.serve import (
     MIN_LLAMA_BUILD,
+    SERVICE_SCRIPTS,
+    WATCHDOG_LOOP_FILENAME,
     Level,
     build_is_recent_enough,
     parse_llama_build,
     preflight,
     render_nssm_script,
     render_powercfg_script,
+    render_watchdog_install_script,
     render_watchdog_script,
 )
 
@@ -380,3 +383,70 @@ class TestWhetherTheServiceExistsIsATriState:
         from localllm.serve import parse_service_query
 
         assert parse_service_query("done\n", 0) is None
+
+
+class TestANumberedScriptIsOneYouRun:
+    """The deploy directory carried `03-watchdog.ps1`, and three separate
+    places in the source told the user to run it. It is `while ($true)`, and
+    its own header said "Run under NSSM alongside the server" - so following
+    the instruction gave a terminal that never came back, and the user
+    concluded the setup had hung.
+
+    Nothing ever registered it either, so the thrash alerting this project
+    advertises was generated and then never started.
+
+    Hence the rule this pins: a numbered script is one you run, in that order.
+    The loop is unnumbered.
+    """
+
+    @staticmethod
+    def _rendered() -> dict[str, str]:
+        return {
+            "01-powercfg.ps1": render_powercfg_script(),
+            "02-install-service.ps1": render_nssm_script(
+                service_name="llama",
+                exe_path="C:\\ai\\llama-server.exe",
+                flags="-m model.gguf",
+                working_dir="C:\\ai\\deploy",
+                log_dir="C:\\ai\\deploy\\logs",
+            ),
+            "03-install-watchdog.ps1": render_watchdog_install_script(
+                loop_script="C:\\ai\\deploy\\watchdog-loop.ps1",
+                log_dir="C:\\ai\\deploy\\logs",
+            ),
+            WATCHDOG_LOOP_FILENAME: render_watchdog_script(),
+        }
+
+    def test_no_script_we_tell_users_to_run_loops_forever(self) -> None:
+        for name in SERVICE_SCRIPTS:
+            body = self._rendered()[name]
+            assert "while ($true)" not in body, f"{name} would never return"
+
+    def test_the_loop_is_deliberately_unnumbered(self) -> None:
+        assert "while ($true)" in render_watchdog_script()
+        assert WATCHDOG_LOOP_FILENAME not in SERVICE_SCRIPTS
+        assert not WATCHDOG_LOOP_FILENAME[0].isdigit()
+
+    def test_every_numbered_script_is_rendered_by_something(self) -> None:
+        """A sequence naming a file nothing writes is an instruction to run a
+        file that will not be there."""
+        rendered = self._rendered()
+        for name in SERVICE_SCRIPTS:
+            assert name in rendered, f"{name} is in the run sequence but nothing renders it"
+
+    def test_the_watchdog_is_actually_installed_rather_than_only_generated(self) -> None:
+        s = render_watchdog_install_script(loop_script="C:\\d\\watchdog-loop.ps1", log_dir="C:\\d")
+        assert "nssm install" in s
+        assert "watchdog-loop.ps1" in s
+        assert "SERVICE_AUTO_START" in s, "it has to come back after a reboot"
+
+    def test_the_installer_runs_the_loop_through_powershell(self) -> None:
+        """NSSM runs an executable, not a script. Pointing it straight at a
+        .ps1 registers a service that fails at every start."""
+        s = render_watchdog_install_script(loop_script="C:\\d\\watchdog-loop.ps1", log_dir="C:\\d")
+        assert "powershell.exe" in s
+        assert "-ExecutionPolicy Bypass" in s
+
+    def test_the_sequence_is_ordered_and_stated_once(self) -> None:
+        assert SERVICE_SCRIPTS == tuple(sorted(SERVICE_SCRIPTS))
+        assert len(set(SERVICE_SCRIPTS)) == len(SERVICE_SCRIPTS)

@@ -457,8 +457,13 @@ python -m localllm up --llama-server C:\ai\llama-server.exe
 ```
 
 On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
-`02-install-service.ps1` (NSSM, boot-start, restart-on-failure) and `03-watchdog.ps1`
-(alerts on page-file thrash, which is otherwise completely silent).
+`02-install-service.ps1` (NSSM, boot-start, restart-on-failure) and
+`03-install-watchdog.ps1`, which registers `watchdog-loop.ps1` as its own service to
+alert on page-file thrash — otherwise completely silent.
+
+**A numbered script is one you run, in that order** — and `localllm service install`
+runs them for you, refusing rather than half-installing if it is not elevated. `setup.ps1`
+calls it at the end, asking for Administrator once through UAC.
 
 | Phase | Status |
 |---|---|

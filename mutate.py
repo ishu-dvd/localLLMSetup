@@ -480,6 +480,68 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "if worst == 0 and not args.no_inference:",
         "--no-agent-checks would spend two requests it promised to skip",
     ),
+    # --- elevate.py: the Administrator half ---------------------------------
+    (
+        "src/localllm/elevate.py",
+        'if sys.platform != "win32":\n        return None',
+        "if False:\n        return None",
+        "claiming elevation off Windows would run the scripts where they cannot work",
+    ),
+    (
+        "src/localllm/elevate.py",
+        "return self.complete and self.elevated is True",
+        "return self.complete",
+        "running unelevated leaves a half-registered service, which is why it refuses",
+    ),
+    (
+        "src/localllm/elevate.py",
+        "if code != 0:\n            break",
+        "if False:\n            break",
+        "carrying on past a failed 02 registers a watchdog for a service that is not there",
+    ),
+    (
+        "src/localllm/elevate.py",
+        "if self.missing:\n            return (",
+        "if False:\n            return (",
+        "telling someone to elevate when `up` was never run sends them to the wrong place",
+    ),
+    (
+        "src/localllm/elevate.py",
+        '("-NoProfile", "-ExecutionPolicy", "Bypass", "-File")',
+        '("-NoProfile", "-File")',
+        "a stock Windows refuses to run an unsigned .ps1 without Bypass",
+    ),
+    (
+        "src/localllm/elevate.py",
+        "inner = f'localllm service install --dir \"{directory}\"'",
+        "inner = f\"localllm service install --dir '{directory}'\"",
+        "reusing the enclosing quote mangles -ArgumentList into three broken arguments",
+    ),
+    (
+        "src/localllm/elevate.py",
+        "sys.stdout.flush()\n    sys.stderr.flush()",
+        "pass",
+        "without the flush a script's output appears above the line announcing it",
+    ),
+    # --- serve.py: a numbered script is one you run --------------------------
+    (
+        "src/localllm/serve.py",
+        'WATCHDOG_LOOP_FILENAME = "watchdog-loop.ps1"',
+        'WATCHDOG_LOOP_FILENAME = "03-watchdog.ps1"',
+        "numbering the loop puts a script that never exits back in the run sequence",
+    ),
+    (
+        "src/localllm/serve.py",
+        '    "03-install-watchdog.ps1",\n)',
+        '    "03-install-watchdog.ps1",\n    WATCHDOG_LOOP_FILENAME,\n)',
+        "the loop in the run sequence is the original defect: a terminal that never returns",
+    ),
+    (
+        "src/localllm/serve.py",
+        'f\'\\\\"{loop_script}\\\\""\',',
+        'f\'\\\\"{loop_script}\\\\""\'.replace("powershell.exe", "cmd.exe"),',
+        "NSSM runs executables, not scripts - the loop needs a shell to host it",
+    ),
 ]
 
 

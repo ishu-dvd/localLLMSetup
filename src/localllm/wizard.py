@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from .serve import SERVICE_SCRIPTS
+
 KEY_FILENAME = "keys.txt"
 
 
@@ -214,7 +216,8 @@ def plan_setup(
             "Install and start the Windows service",
             service_act,
             detail=service_detail,
-            manual="Run 01-powercfg.ps1, 02-install-service.ps1, 03-watchdog.ps1 as Administrator",
+            manual=f"Run {', '.join(SERVICE_SCRIPTS)} as Administrator, "
+            f"or `localllm service install`",
         )
     )
 

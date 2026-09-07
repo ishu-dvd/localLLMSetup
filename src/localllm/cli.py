@@ -47,6 +47,12 @@ from .client import (
 )
 from .constants import MODEL_ALIAS
 from .detect import detect
+from .elevate import (
+    elevated_relaunch_command,
+    plan_service_install,
+    run_service_scripts,
+    summarise,
+)
 from .gguf import GgufError, read_gguf_file, read_gguf_url
 from .guide import client_guide, find_gguf, server_guide
 from .handoff import (
@@ -87,6 +93,8 @@ from .join import (
 from .keys import DeviceExistsError, DeviceNotFoundError, KeyStore
 from .serve import (
     MIN_LLAMA_BUILD,
+    SERVICE_SCRIPTS,
+    WATCHDOG_LOOP_FILENAME,
     build_is_recent_enough,
     preflight,
     probe_free_disk_gb,
@@ -94,6 +102,7 @@ from .serve import (
     probe_service_installed,
     render_nssm_script,
     render_powercfg_script,
+    render_watchdog_install_script,
     render_watchdog_script,
 )
 from .speed import context_speed_curve
@@ -765,7 +774,11 @@ def cmd_up(args: argparse.Namespace) -> int:
             working_dir=str(out.resolve()),
             log_dir=str((out / "logs").resolve()),
         ),
-        "03-watchdog.ps1": render_watchdog_script(),
+        "03-install-watchdog.ps1": render_watchdog_install_script(
+            loop_script=str((out / WATCHDOG_LOOP_FILENAME).resolve()),
+            log_dir=str((out / "logs").resolve()),
+        ),
+        WATCHDOG_LOOP_FILENAME: render_watchdog_script(),
         "llama-server-flags.txt": flags + "\n",
         # The number each client must pin. Without this, `join` had no way to
         # know what was decided here and fell back to a default that was right
@@ -778,14 +791,43 @@ def cmd_up(args: argparse.Namespace) -> int:
     print(f"wrote {key_file}")
 
     print("\nRun these as Administrator, in order:")
-    for name in ("01-powercfg.ps1", "02-install-service.ps1", "03-watchdog.ps1"):
+    for name in SERVICE_SCRIPTS:
         print(f"  .\\{name}")
+    print("\nOr let it do that for you:")
+    print(f"  localllm service install --dir {out}")
     print(
         f"\nThen invite each laptop - one token carries this "
         f"{verdict.plan.context_per_slot:,}-token window, its key and the model id:"
     )
     print("  localllm invite <laptop-name> --url http://<this-machine>:8080")
     return 0
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    """Run the Administrator half of setup, or say precisely why it cannot."""
+    install = plan_service_install(Path(args.dir))
+
+    print(f"Service scripts in {install.directory}\n")
+    for name in SERVICE_SCRIPTS:
+        mark = "found  " if name in install.present else "MISSING"
+        print(f"  [{mark}] {name}")
+
+    if args.dry_run:
+        print("\nDry run: nothing was executed.")
+        return 0 if install.complete else 1
+
+    if not install.ready:
+        print(f"\nCannot run them: {install.blocker}")
+        if install.complete and install.elevated is False:
+            print("\nRe-run elevated with:\n")
+            print(f"  {elevated_relaunch_command(install.directory)}")
+        return 1
+
+    print()
+    results = run_service_scripts(install)
+    print()
+    print(summarise(results, total=len(install.present)))
+    return 0 if results and all(r.ok for r in results) else 1
 
 
 def _refresh_key_file(store: KeyStore, key_file: Path, service_name: str) -> list[str]:
@@ -1758,6 +1800,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="the device-key store whose keys are baked into the server's key file",
     )
     up.set_defaults(func=cmd_up)
+
+    service = sub.add_parser(
+        "service",
+        help="on the server: run the Administrator half of setup",
+    )
+    ssub = service.add_subparsers(dest="service_cmd", required=True)
+    s_ins = ssub.add_parser(
+        "install",
+        help="run the numbered scripts `up` wrote, in order (needs Administrator)",
+    )
+    s_ins.add_argument(
+        "--dir",
+        type=Path,
+        default=Path("deploy"),
+        help="where `localllm up` wrote them (default: ./deploy)",
+    )
+    s_ins.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report which scripts are present and whether this shell can run them",
+    )
+    service.set_defaults(func=cmd_service)
 
     key = sub.add_parser("key", help="issue, list and revoke per-device API keys")
     key.add_argument("--store", type=Path, default=DEFAULT_STORE)

@@ -733,3 +733,74 @@ only when present, and the live tool call settles the rest.
 3. **The invite still hand-rolled a `join`** after `localllm client <token>` had replaced it
    — the longer path, ending at the worst client. Nothing tested the invite's closing
    instruction, which is how it survived the entire feature that superseded it.
+
+---
+
+## 11. The Administrator half — **DECIDED: run it, do not describe it**
+
+`setup` ended with *"Still to do on THIS machine, as Administrator: run these three
+scripts"*. That is the half that makes the machine actually serve — power settings, the
+service, the watchdog — so a setup stopping there has downloaded 12 GB and started nothing.
+The stated requirement was that running one script makes everything work.
+
+`localllm service install` now runs them, and `setup.ps1` calls it, asking for Administrator
+once through UAC. Declining leaves a complete install that simply does not start on boot,
+and says so with the command to finish later.
+
+### Why it refuses rather than trying
+
+Running these unelevated does not fail cleanly. `powercfg` reports success and changes
+nothing; `nssm install` fails partway through and leaves a half-registered service. Refusing
+up front, naming which of the two problems it is — *scripts missing* (run `up` first) or
+*not elevated* — is the only outcome that cannot leave the machine in a state nobody asked
+for. `is_elevated()` returns `None` off Windows rather than `False`, because `False` means
+"re-run elevated and it will work", which is not true on a platform without the concept.
+
+### 🚨 `03-watchdog.ps1` could never be run, and nothing ever installed it
+
+The watchdog is `while ($true)`. Its own header said *"Run under NSSM alongside the
+server"* — and **nothing did**. Meanwhile three separate places in the source told the user
+to run `01-powercfg.ps1, 02-install-service.ps1, 03-watchdog.ps1 as Administrator`.
+Following that instruction gives a terminal that never returns, which reads as a hung
+setup. So the thrash alerting this project advertises was generated on every `up` and
+started on none.
+
+Fixed by a naming rule the deploy directory now follows: **a numbered script is one you
+run, in that order.** The loop became `watchdog-loop.ps1` — unnumbered — and
+`03-install-watchdog.ps1` registers it under NSSM, auto-start, restart-on-failure, invoked
+as `powershell.exe -ExecutionPolicy Bypass -File` because NSSM runs executables, not
+scripts. `TestANumberedScriptIsOneYouRun` asserts no script in the run sequence contains
+`while ($true)`, that every name in the sequence is rendered by something, and that the
+loop stays unnumbered.
+
+The sequence itself was a literal in three files with nothing keeping them in agreement.
+It is now `serve.SERVICE_SCRIPTS`, stated once.
+
+### 🚨 The relaunch command parsed, and did the wrong thing
+
+The first draft quoted the path with the same character enclosing the argument:
+
+```powershell
+... -ArgumentList '-NoProfile','-NoExit','-Command','localllm service install --dir 'C:\ai\deploy''
+```
+
+It **parses** — which is why it survives a glance — but PowerShell concatenates adjacent
+tokens in argument mode. Checked against the real parser with a spaced path, that produces
+three mangled arguments:
+
+```
+arg[0] = [-Command localllm service install --dir ]
+arg[1] = [C:\Program]
+arg[2] = [Files\deploy]
+```
+
+`-Command` glued onto the command text, the path split on its spaces. Double-quoting the
+path inside the single-quoted argument yields the correct two arguments. A fix message
+naming a command that does not *work* is the same defect as one naming a command that does
+not *exist*, and considerably harder to spot.
+
+### Also fixed while running it
+
+Script output appeared **before** the line saying which script was running: Python
+block-buffers stdout when it is a pipe, while a subprocess writes to the console directly.
+`_run` now flushes before spawning, so the transcript reads in the order things happened.
