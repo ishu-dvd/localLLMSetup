@@ -467,11 +467,11 @@ On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
 | 2 — resolve open questions | ⏳ needs the MSI |
 | 3 — server as a service | ✅ done, 38 tests (reboot gate needs the MSI) |
 | 4 — per-device keys | ✅ done, 24 tests |
-| 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup |
+| 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup, agent-readiness gate |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**978 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13,
-and 55/55 mutations caught.
+**989 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13,
+and 73/73 mutations caught.
 
 ---
 
