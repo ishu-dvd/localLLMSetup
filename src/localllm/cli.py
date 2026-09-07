@@ -1456,6 +1456,8 @@ def cmd_client(args: argparse.Namespace) -> int:
         return 1
 
     print(f"\nInstall {profile.title}:\n  {profile.install}\n")
+    for command, why in profile.also:
+        print(f"Optional:\n  {command}\n      {why}\n")
 
     rc = cmd_join(
         argparse.Namespace(

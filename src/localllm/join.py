@@ -468,6 +468,15 @@ class ClientProfile:
     `join` produces is instructions rather than configuration. Stated on the
     profile so the caller can say which it got."""
 
+    also: tuple[tuple[str, str], ...] = ()
+    """Optional companions, as (command, what it gets you).
+
+    Not prerequisites - the agent works without them. Qwen Code has an official
+    VS Code extension that gives the CLI access to the open workspace, which is
+    the only way any Qwen-branded tooling reaches VS Code against a self-hosted
+    endpoint: the cloud extensions cannot be pointed at one.
+    """
+
     free: bool = True
 
     def __post_init__(self) -> None:
@@ -522,6 +531,14 @@ CLIENTS: dict[str, ClientProfile] = {
             "window, so it will overrun the slot and be truncated server-side",
             requires=("node",),
             writes_config=True,
+            also=(
+                (
+                    "code --install-extension qwenlm.qwen-code-vscode-ide-companion",
+                    "official VS Code companion - gives the CLI your open files and "
+                    "a diff view, and is the only Qwen-branded route into VS Code "
+                    "that works against a self-hosted endpoint",
+                ),
+            ),
         ),
         ClientProfile(
             name="cline",

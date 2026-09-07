@@ -752,3 +752,37 @@ class TestTheClientsOwnFileWins:
         assert found is not None
         assert found.drift == ()
         assert BASE.split("//")[1] in found.base_url
+
+
+class TestOptionalCompanionsAreOfferedButNotRequired:
+    """Answering "can I use Qwen in VS Code": not directly - the Alibaba cloud
+    extensions cannot be pointed at a self-hosted endpoint. The official
+    companion to the CLI can, because the CLI is the thing that is pointed."""
+
+    def test_qwen_offers_its_official_vscode_companion(self):
+        from localllm.join import CLIENTS
+
+        commands = [c for c, _ in CLIENTS["qwen"].also]
+        assert any("qwenlm.qwen-code-vscode-ide-companion" in c for c in commands)
+
+    def test_the_companion_is_not_a_prerequisite(self):
+        """It is a convenience. Requiring VS Code to use a terminal CLI would
+        refuse a laptop that is perfectly able to run it."""
+        from localllm.join import CLIENTS
+
+        assert "code" not in CLIENTS["qwen"].requires
+
+    def test_every_companion_says_what_it_gets_you(self):
+        """A bare install command in the middle of a setup is noise."""
+        from localllm.join import CLIENTS
+
+        for profile in CLIENTS.values():
+            for command, why in profile.also:
+                assert command.strip(), profile.name
+                assert len(why) > 20, profile.name
+
+    def test_no_client_lists_itself_as_its_own_companion(self):
+        from localllm.join import CLIENTS
+
+        for profile in CLIENTS.values():
+            assert profile.install not in [c for c, _ in profile.also], profile.name

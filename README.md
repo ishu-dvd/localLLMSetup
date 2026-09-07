@@ -169,11 +169,26 @@ download size — then stops.
 | **Qwen Code** | terminal | ⚠️ yes, but it has **no verified way to pin the context** |
 | **Cline** | VS Code | ❌ settings live in VS Code's SQLite storage and the OS keychain |
 
+All six are free. `localllm client` picks one from the model in the invite, checks that Node
+or VS Code is actually present, and prints the install command.
+
 Cline was the recommendation, and `join --client cline` wrote a `cline-settings.json` for a
 path that does not exist. Cline keeps its settings in `context.globalState` and its key in
 `context.secrets` — neither writable from outside VS Code — and had renamed the fields to be
 per-mode besides. The file was inert, and `check` read it back and reported the laptop as
 configured. `--client cline` now prints the values to type in.
+
+**Wanted Qwen in VS Code?** No Qwen extension can be pointed at a self-hosted endpoint — the
+Alibaba ones talk to Alibaba. The official `qwenlm.qwen-code-vscode-ide-companion` works,
+because it is a companion to the *CLI*, and the CLI is what points here;
+`--client qwen` prints that install line too. For a self-contained VS Code setup, use
+Continue.
+
+**Crush was rejected**, despite having the best ergonomics of any candidate (a native
+`llamacpp` provider and an explicit `--context-window`): its `LICENSE.md` is **FSL-1.1-MIT**,
+source-available rather than open source, and its config format is now a **Bash dialect that
+runs in a full shell** — generating it would mean writing an executable file containing an API
+key. See [`docs/DECISIONS.md`](docs/DECISIONS.md) §6.
 
 A green suite is not the same as a suite that would notice. `python mutate.py`
 deliberately breaks 55 safety-critical behaviours one at a time — the context

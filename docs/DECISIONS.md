@@ -439,6 +439,34 @@ are forks of Cline and inherit the same storage model** — Roo's marketplace id
 could be verified in its documentation, and inventing a name would look like the limit had been
 applied while the client kept overrunning it.
 
+### Qwen in VS Code
+
+There is no Qwen extension that can be pointed at a self-hosted endpoint — the Alibaba cloud
+extensions talk to Alibaba. The route that does work is the official
+**`qwenlm.qwen-code-vscode-ide-companion`** ("Qwen Code Companion", publisher `qwenlm`, free):
+it is a companion to the *CLI*, giving it your open workspace and a diff view, while the CLI
+is the thing pointed at this server. `localllm client --client qwen` prints the install line.
+
+For a self-contained VS Code experience against this server, **Continue** remains the answer.
+
+### ❌ Crush — considered, and rejected on two verified grounds
+
+[`charmbracelet/crush`](https://github.com/charmbracelet/crush) is otherwise the strongest
+candidate here. It has a **first-class `llamacpp` provider type** with model auto-discovery,
+and `--context-window` / `--default-max-tokens` give both halves of the budget explicitly —
+better ergonomics than anything else in the table.
+
+1. **It is not open source.** `LICENSE.md` on `main` is **FSL-1.1-MIT** — the Functional
+   Source License, source-available, converting to MIT after two years. Fine to use here, but
+   this stack is meant to be free *and* open, and the distinction should not be blurred.
+2. **Its config is executable code.** `crushrc` — now the primary format, with JSON deprecated
+   — is a Bash dialect that runs in a full shell, and `$(...)` inside `crush.json` is
+   evaluated at load time. Generating it means writing an executable file containing an API
+   key. Every other client here takes inert JSON or YAML.
+
+The second reason is the disqualifying one, and it is specific to this tool: a human writing
+their own `crushrc` is doing something ordinary. A config *generator* emitting shell is not.
+
 > Do not copy a context from this table by hand. `localllm invite` carries the number the
 > solver actually chose, and `localllm join` refuses anything larger than the slot holds —
 > the row above said `contextWindow: 32768` for a configuration that would now OOM.
