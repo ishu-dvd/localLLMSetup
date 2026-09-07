@@ -344,7 +344,7 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     (
         "src/localllm/join.py",
         '"      maxPromptTokens: 1024",',
-        "\"      maxPromptTokens: 32768\",",
+        '"      maxPromptTokens: 32768",',
         "a full-context request per keystroke is what makes this feel unusable",
     ),
     (
@@ -362,7 +362,9 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
     # --- serve.py: is the service there? ------------------------------------
     (
         "src/localllm/serve.py",
-        'if "1060" in lowered or "does not exist" in lowered:\n        return False\n    return None',
+        'if "1060" in lowered or "does not exist" in lowered:\n'
+        "        return False\n"
+        "    return None",
         "return False",
         "reporting access-denied as missing sends the user to reinstall a running service",
     ),

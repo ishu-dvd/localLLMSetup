@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from localllm.budget import Hardware
 from localllm.catalogue import CATALOGUE
 from localllm.cli import main, stronger_alternative
+from localllm.install import Asset
 from localllm.invite import Invite
 
 
@@ -30,7 +33,53 @@ def a_token(**over) -> str:
     return Invite(**base).encode()  # type: ignore[arg-type]
 
 
+@pytest.fixture(autouse=True)
+def tooling_present(monkeypatch):
+    """Pretend node, git and VS Code are installed.
+
+    Without this these tests assert on the machine they run on rather than on
+    the code: `client --client continue` requires `code`, which a Linux CI
+    runner does not have, so the whole class passed here and failed there. The
+    missing-tool path is covered deliberately below instead of by accident.
+    """
+    from localllm.install import ToolCheck
+
+    monkeypatch.setattr(
+        "localllm.cli.check_client_tooling",
+        lambda: tuple(
+            ToolCheck(name=n, present=True, needed_for="test") for n in ("node", "git", "code")
+        ),
+    )
+
+
 class TestSetupSaysWhatItWillDoBeforeDoingIt:
+    @pytest.fixture(autouse=True)
+    def _no_network(self, monkeypatch):
+        """Resolve the llama.cpp release from a fixture, not from GitHub.
+
+        Left live, these tests make an HTTP request each on six CI runners and
+        pass or fail on GitHub's rate limiter rather than on this code. The
+        resolution logic itself is tested against fixtures in test_install.py.
+        """
+        monkeypatch.setattr(
+            "localllm.cli.latest_llama_release",
+            lambda **_: (
+                "b10839",
+                (
+                    Asset(
+                        "llama-b10839-bin-win-vulkan-x64.zip",
+                        "https://example.invalid/v.zip",
+                        90_000_000,
+                    ),
+                    Asset(
+                        "llama-b10839-bin-win-cpu-x64.zip",
+                        "https://example.invalid/c.zip",
+                        60_000_000,
+                    ),
+                ),
+            ),
+        )
+
     def _run(self, tmp_path, capsys, *extra):
         code = main(
             [
@@ -182,6 +231,48 @@ class TestClientTurnsAnInviteIntoAWorkingAgent:
         assert code == 1
         assert "damaged" in out or "incomplete" in out
         assert not any(tmp_path.iterdir())
+
+    def test_a_missing_prerequisite_stops_before_writing_a_config(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        """A config for an agent that cannot run is not a configured laptop,
+        and the error the agent's own installer gives mentions nothing about
+        this project."""
+        from localllm.install import ToolCheck
+
+        monkeypatch.setattr(
+            "localllm.cli.check_client_tooling",
+            lambda: (
+                ToolCheck(
+                    name="node",
+                    present=False,
+                    install_hint="winget install OpenJS.NodeJS.LTS",
+                    needed_for="opencode",
+                ),
+            ),
+        )
+        code = main(["client", a_token(), "--out", str(tmp_path), "--no-probe"])
+        out = capsys.readouterr().out
+        assert code == 1
+        assert "winget install OpenJS.NodeJS.LTS" in out
+        assert not (tmp_path / "opencode.json").exists()
+
+    def test_a_prerequisite_another_client_needs_does_not_block_this_one(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        """Aider needs neither Node nor VS Code. Refusing it because VS Code is
+        absent would be refusing on someone else's behalf."""
+        from localllm.install import ToolCheck
+
+        monkeypatch.setattr(
+            "localllm.cli.check_client_tooling",
+            lambda: (ToolCheck(name="code", present=False, needed_for="Cline, Continue"),),
+        )
+        code = main(
+            ["client", a_token(), "--out", str(tmp_path), "--no-probe", "--client", "aider"]
+        )
+        assert code == 0
+        assert (tmp_path / ".aider.conf.yml").exists()
 
 
 class TestJoinRefusesToDestroyAFileItDidNotWrite:
