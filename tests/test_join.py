@@ -7,6 +7,7 @@ import json
 import pytest
 
 from localllm.join import (
+    SIDECAR,
     SUPPORTED,
     build_client_config,
     normalise_base_url,
@@ -64,10 +65,33 @@ def test_every_client_points_at_the_server(client):
 @pytest.mark.parametrize("client", SUPPORTED)
 def test_every_client_is_told_the_real_context(client):
     """Whichever file carries it, the client must know the per-slot limit -
-    otherwise it oversends and the server truncates silently."""
+    otherwise it oversends and the server truncates silently.
+
+    The sidecar is excluded deliberately. It always contains the context, so
+    including it made this assertion true for every client no matter what the
+    client's own config said - and it is the client's config that the client
+    loads. That is not hypothetical: with the sidecar counted, Octofriend's
+    context could be hard-coded to 999 and the entire suite stayed green.
+    """
     c = cfg(client)
-    everywhere = c.content + "".join(c.extra_files.values())
+    client_owned = {k: v for k, v in c.extra_files.items() if k != SIDECAR}
+    everywhere = c.content + "".join(client_owned.values())
     assert str(CTX) in everywhere
+
+
+def test_octofriend_pins_the_context_in_its_own_config():
+    """Cline and Aider each have a dedicated context test; Octofriend had none,
+    which is why the gap above went unnoticed."""
+    assert f"context: {CTX}," in cfg("octofriend").content
+
+
+def test_the_sidecar_alone_does_not_satisfy_the_context_check():
+    """Guards the guard. If SIDECAR stopped being excluded above, this fails
+    rather than the coverage silently evaporating again.
+    """
+    c = cfg("octofriend")
+    assert SIDECAR in c.extra_files
+    assert str(CTX) in c.extra_files[SIDECAR]
 
 
 @pytest.mark.parametrize("client", SUPPORTED)
@@ -436,3 +460,100 @@ class TestTheSidecarMakesEveryClientReadable:
         found = read_client_config(tmp_path)
         assert found is not None
         assert found.path.name == "cline-settings.json"
+
+
+class TestTheClientsOwnFileWins:
+    """The sidecar records what `join` INTENDED; the client file is what the
+    client LOADS. Preferring the sidecar unconditionally meant a hand-edited
+    octofriend.json5 asking for 131,072 tokens was checked as though it asked
+    for 8,192 - so `check` reported "context agrees" for a client heading
+    straight into a 400 exceed_context_size_error.
+
+    Two copies of one fact, and nothing comparing them. `_read_octofriend`'s
+    own docstring invites the edit that breaks it.
+    """
+
+    def _joined(self, tmp_path, client="octofriend", ctx=8192):
+        build_client_config(
+            client=client,
+            base_url=BASE,
+            api_key=KEY,
+            model=MODEL,
+            context=ctx,
+        ).write(tmp_path)
+        return tmp_path
+
+    def test_an_edited_context_is_reported_not_the_recorded_one(self, tmp_path, monkeypatch):
+        from localllm.join import read_client_config
+
+        monkeypatch.setenv("LOCAL_LLM_KEY", KEY)
+        self._joined(tmp_path, ctx=8192)
+        path = tmp_path / "octofriend.json5"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("context: 8192", "context: 131072"),
+            encoding="utf-8",
+        )
+
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.context == 131072
+        assert "context" in found.drift
+
+    def test_an_edited_model_is_reported(self, tmp_path, monkeypatch):
+        from localllm.join import read_client_config
+
+        monkeypatch.setenv("LOCAL_LLM_KEY", KEY)
+        self._joined(tmp_path)
+        path = tmp_path / "octofriend.json5"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(MODEL, "something-else"),
+            encoding="utf-8",
+        )
+
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.model == "something-else"
+        assert "model" in found.drift
+
+    def test_an_untouched_config_reports_no_drift(self, tmp_path, monkeypatch):
+        """The check must be quiet in the normal case, or the warning stops
+        meaning anything."""
+        from localllm.join import read_client_config
+
+        monkeypatch.setenv("LOCAL_LLM_KEY", KEY)
+        self._joined(tmp_path)
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.drift == ()
+        assert found.context == 8192
+
+    def test_a_cline_edit_is_caught_too(self, tmp_path):
+        """Cline keeps everything in one file, so it has the same exposure."""
+        from localllm.join import read_client_config
+
+        self._joined(tmp_path, client="cline", ctx=8192)
+        path = tmp_path / "cline-settings.json"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                '"contextWindow": 8192', '"contextWindow": 99999'
+            ),
+            encoding="utf-8",
+        )
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.context == 99999
+        assert "context" in found.drift
+
+    def test_a_field_the_client_file_does_not_carry_is_not_drift(self, tmp_path, monkeypatch):
+        """Aider keeps its URL in the environment. An unset variable is a
+        missing value, not a disagreement, and reporting it as an edit would
+        cry wolf on every fresh shell."""
+        from localllm.join import read_client_config
+
+        monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        self._joined(tmp_path, client="aider")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.drift == ()
+        assert BASE.split("//")[1] in found.base_url

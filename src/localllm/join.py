@@ -247,6 +247,12 @@ class DiscoveredClient:
     how Aider and Octofriend are configured. Naming it lets the doctor say
     which variable is unset instead of reporting a missing key."""
 
+    drift: tuple[str, ...] = ()
+    """Fields where the client's own config disagrees with what `join`
+    recorded. Non-empty means someone edited the client file afterwards, and
+    the values reported here are the client's — the ones it will actually
+    send."""
+
 
 def _read_cline(path: Path) -> DiscoveredClient | None:
     try:
@@ -394,20 +400,53 @@ def read_client_config(directory: Path | str = ".") -> DiscoveredClient | None:
     Returns None rather than raising: not finding one is an ordinary state on a
     laptop that has not been joined yet, and the caller has a better error to
     give than this function does.
+
+    When both the sidecar and the client's own file are present they are
+    **reconciled, and the client's file wins**. The sidecar records what `join`
+    intended; the client file is what the client actually loads. Preferring the
+    sidecar unconditionally meant a hand-edited `octofriend.json5` asking for
+    131,072 tokens was checked as though it asked for 8,192 — so `check`
+    reported "context agrees" for a client heading straight into a 400. Two
+    copies of one fact, and nothing comparing them.
     """
     d = Path(directory)
-    sidecar = d / SIDECAR
-    if sidecar.exists():
-        found = _read_sidecar(sidecar)
-        if found is not None:
-            return found
+    own = next(
+        (r(d / f) for f, r in _READERS if (d / f).exists() and r(d / f) is not None),
+        None,
+    )
 
-    # Falls back to the client's own file, which covers a config written before
-    # the sidecar existed, or one a user assembled by hand.
-    for filename, reader in _READERS:
-        path = d / filename
-        if path.exists():
-            found = reader(path)
-            if found is not None:
-                return found
-    return None
+    sidecar = d / SIDECAR
+    recorded = _read_sidecar(sidecar) if sidecar.exists() else None
+
+    if recorded is None:
+        # Covers a laptop joined before the sidecar existed, and one a user
+        # assembled by hand.
+        return own
+    if own is None:
+        return recorded
+
+    drift = tuple(
+        field
+        for field, intended, actual in (
+            ("context", recorded.context, own.context),
+            ("model", recorded.model, own.model),
+        )
+        # A client file that does not carry a field at all is not disagreeing
+        # about it; only a different value is drift.
+        if actual is not None and actual != "" and intended != actual
+    )
+    if not drift:
+        return recorded
+
+    # Take the client's own values where it has them, but keep the sidecar's
+    # base URL when the client keeps that in the environment and it is unset.
+    return DiscoveredClient(
+        client=own.client,
+        path=own.path,
+        base_url=own.base_url or recorded.base_url,
+        model=own.model or recorded.model,
+        api_key=own.api_key or recorded.api_key,
+        context=own.context if own.context is not None else recorded.context,
+        key_env_var=own.key_env_var or recorded.key_env_var,
+        drift=drift,
+    )
