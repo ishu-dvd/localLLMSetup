@@ -216,6 +216,21 @@ it; `caddy reload` revokes a device **without interrupting the others' in-flight
 > ⚠️ **Caddy must not rewrite request bodies or inject headers.** Anything that perturbs the
 > prompt head destroys longest-common-prefix cache matching (§6). Keep it to auth + routing.
 
+**What this repo actually generates: llama-server's own auth, no proxy.** Caddy stays optional,
+bought only for attribution and non-disruptive revocation. Three properties of the built-in path
+drive the implementation, all read from source and all failing in the *unsafe* direction:
+
+| Behaviour | Source | Consequence |
+|---|---|---|
+| **An empty key list disables auth**, rather than denying everything: `if (api_keys.empty()) { return true; }` | `server-http.cpp:613` | A `keys.txt` with only comments publishes the model on `0.0.0.0:8080` **wide open** — and it is invisible, because a client sending a key it ignores still gets correct answers. `up` therefore **FAILS preflight** with zero keys. |
+| **The file is parsed once, at startup** | `common/arg.cpp:3520` | A key added or revoked later is inert until the service restarts. A new laptop gets a `401` that looks like a bad token; a **revoked laptop keeps working**. `localllm status` reports both directions, and `invite` / `key revoke` rewrite the file and say to restart. |
+| **A missing file aborts startup** (`std::runtime_error`) | `common/arg.cpp:3523` | Fail-fast, and the useful direction: the service does not come up rather than coming up unprotected. So `up` always writes the file. |
+
+**This is the one place Caddy earns its keep.** Because llama-server re-reads keys only at
+startup, built-in revocation costs a restart and drops in-flight streams. Caddy's `reload` does
+not. If that matters more than one fewer moving part, put Caddy in front — but note the auth is
+then *its* job, and llama-server should bind `127.0.0.1` rather than `0.0.0.0`.
+
 **Fairness is solved one layer down, for free:** `-np N` with continuous batching interleaves
 streams *at the token level*, so a runaway loop on laptop A cannot starve laptop B. It is
 work-conserving — one active laptop gets full throughput. Better than any proxy rate limit.
@@ -382,16 +397,25 @@ llama-server.exe `
   -m C:\models\gpt-oss-20b-MXFP4.gguf `
   -a claude-local-coder `      # clients hide model IDs lacking "claude"/"anthropic"
   --host 0.0.0.0 --port 8080 `
+  --api-key-file C:\ai\keys.txt ` # MUST be non-empty: an empty list disables auth
   --device Vulkan0 -ngl 99 -ncmoe 30 `
   -np 1 -c 65536 `             # -np 1 => total == per-slot. 128K also fits.
   -t 8 -fa on `
   -ctk q8_0 -ctv q8_0 `        # NEVER q4_0 - degrades tool calling
   -b 4096 -ub 1024 `           # 8K prefill 181 -> 223 tok/s; avoids Vulkan bug #27237
-  -lm mmap+mlock `             # needs SeLockMemoryPrivilege - verify, don't assume
+  -lm auto `                   # NOT mmap+mlock: 12.11 GB cannot be pinned into 10.5
+  -fit off `                   # defaults ON and silently rewrites -c down to 4096
+  --cache-reuse 256 `          # free; aimed at tool results inserted mid-prompt
   -cram 1024 `                 # NOT the 8192 MiB default
-  --jinja --metrics --sse-ping-interval 30 `
-  --api-key-file C:\ai\keys.txt
+  --spec-default `             # ngram-mod: ~16 MB, no draft model, no draft KV
+  --jinja --metrics --sse-ping-interval 30
 ```
+
+> This block is checked against the flags the solver actually emits
+> (`tests/test_decisions_match_code.py`). Two of the corrections above were
+> drift that had already happened: `-lm mmap+mlock` asks Windows to pin 12.11 GB
+> of weights into ~10.5 GB of usable RAM, and `-fit off` / `--cache-reuse` /
+> `--spec-default` were added to the code without reaching this page.
 
 **Why `gpt-oss-20b` first:** it is the only candidate with **zero quantisation loss** (MXFP4
 is its native release format), leaving ~3 GB of margin and its full 128K context. That makes it

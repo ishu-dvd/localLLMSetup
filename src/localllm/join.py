@@ -18,10 +18,26 @@ Octofriend wants the bare origin. Getting that wrong is a silent 404.
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 SUPPORTED = ("cline", "aider", "octofriend")
+
+SIDECAR = "localllm-client.json"
+"""Where `join` records what it configured, in one place for every client.
+
+The three clients keep their settings in three shapes, and two of them put the
+base URL in an *environment variable* rather than a file. So reading a client's
+own config back is not enough to know where it points: on a fresh shell, Aider's
+`.aider.conf.yml` names a model and nothing else.
+
+This file closes that hole. It holds no secret — the key stays in the client's
+own file or in the environment, exactly where the client itself looks for it.
+"""
+
+SIDECAR_VERSION = 1
 
 
 @dataclass
@@ -33,6 +49,26 @@ class ClientConfig:
     notes: list[str] = field(default_factory=list)
     extra_files: dict[str, str] = field(default_factory=dict)
     """Additional files this client needs, keyed by filename."""
+
+    key_env_var: str = ""
+    """The variable this client reads its key from, when it is not in the file."""
+
+    def sidecar(self, base_url: str, model: str, context: int) -> str:
+        """What was configured, in a form every client shares."""
+        return (
+            json.dumps(
+                {
+                    "version": SIDECAR_VERSION,
+                    "client": self.client,
+                    "base_url": normalise_base_url(base_url, want_v1=False),
+                    "model": model,
+                    "context": context,
+                    "key_env_var": self.key_env_var,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
 
     def write(self, directory: Path | str) -> Path:
         d = Path(directory)
@@ -109,6 +145,7 @@ def _aider(base_url: str, api_key: str, model: str, context: int) -> ClientConfi
             "OPENAI_API_KEY": api_key,
         },
         extra_files={".aider.model.metadata.json": json.dumps(metadata, indent=2) + "\n"},
+        key_env_var="OPENAI_API_KEY",
         notes=[
             "Install with: py -3.12 -m pip install aider-install && aider-install "
             "(Python 3.12, NOT 3.13+).",
@@ -146,6 +183,7 @@ def _octofriend(base_url: str, api_key: str, model: str, context: int) -> Client
         filename="octofriend.json5",
         content=body,
         env={"LOCAL_LLM_KEY": api_key},
+        key_env_var="LOCAL_LLM_KEY",
         notes=[
             "Place at ~/.config/octofriend/octofriend.json5.",
             "Its fix-json and diff-apply repair models run locally on this laptop "
@@ -172,9 +210,204 @@ def build_client_config(
         raise ValueError("an API key is required - issue one with `localllm key add <device>`")
     if context <= 0:
         raise ValueError("context must be positive")
-    return _BUILDERS[key](base_url, api_key, model, context)
+    config = _BUILDERS[key](base_url, api_key, model, context)
+    # Always alongside the client's own file, so the doctor can find out where
+    # this laptop points without depending on the shell's environment.
+    config.extra_files[SIDECAR] = config.sidecar(base_url, model, context)
+    return config
 
 
 def recommend_client(*, model_is_tool_call_trained: bool) -> str:
     """DECISIONS.md §6: the right harness depends on how the model was trained."""
     return "cline" if model_is_tool_call_trained else "aider"
+
+
+# --- reading a config back ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DiscoveredClient:
+    """A client config found on disk, in the terms the doctor needs.
+
+    `check` used to require the URL, key and model to be supplied again,
+    moments after `join` had written all three to a file in the current
+    directory. Retyping them is not just tedious - a typo in the retyped
+    version gets diagnosed as a server fault, which is the opposite of what
+    the doctor is for.
+    """
+
+    client: str
+    path: Path
+    base_url: str
+    model: str
+    api_key: str = ""
+    context: int | None = None
+    key_env_var: str = ""
+    """Set when the key lives in the environment rather than the file, which is
+    how Aider and Octofriend are configured. Naming it lets the doctor say
+    which variable is unset instead of reporting a missing key."""
+
+
+def _read_cline(path: Path) -> DiscoveredClient | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    url = data.get("openAiBaseUrl")
+    if not isinstance(url, str) or not url:
+        return None
+    info = data.get("openAiModelInfo")
+    context = info.get("contextWindow") if isinstance(info, dict) else None
+    return DiscoveredClient(
+        client="cline",
+        path=path,
+        base_url=url,
+        model=str(data.get("openAiModelId") or ""),
+        api_key=str(data.get("openAiApiKey") or ""),
+        context=context if isinstance(context, int) and not isinstance(context, bool) else None,
+    )
+
+
+def _read_aider(path: Path) -> DiscoveredClient | None:
+    """Aider splits itself across three places: the model in a YAML file, the
+    limits in a metadata JSON, and the URL and key in the environment."""
+    try:
+        conf = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    model = ""
+    for line in conf.splitlines():
+        if line.strip().startswith("model:"):
+            model = line.split(":", 1)[1].strip()
+            break
+    if not model:
+        return None
+
+    context = None
+    meta_path = path.parent / ".aider.model.metadata.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            entry = meta.get(model) if isinstance(meta, dict) else None
+            if isinstance(entry, dict):
+                value = entry.get("max_input_tokens")
+                if isinstance(value, int) and not isinstance(value, bool):
+                    context = value
+        except (OSError, ValueError):
+            context = None
+
+    return DiscoveredClient(
+        client="aider",
+        path=path,
+        base_url=os.environ.get("OPENAI_API_BASE", ""),
+        # Aider is told `openai/<model>`; the server knows it without the prefix.
+        model=model.split("/", 1)[-1],
+        api_key=os.environ.get("OPENAI_API_KEY", ""),
+        context=context,
+        key_env_var="OPENAI_API_KEY",
+    )
+
+
+def _read_octofriend(path: Path) -> DiscoveredClient | None:
+    """JSON5: unquoted keys and trailing commas, so json.loads cannot be used.
+
+    A tolerant field scan is deliberate - this file is meant to be hand-edited,
+    and refusing to read a config a user has legitimately customised would send
+    them back to retyping the very values we are trying to recover.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    def field_of(name: str) -> str:
+        match = re.search(rf'{name}\s*:\s*"([^"]*)"', text)
+        return match.group(1) if match else ""
+
+    url = field_of("baseUrl")
+    if not url:
+        return None
+    context_match = re.search(r"context\s*:\s*(\d+)", text)
+    env_var = field_of("apiEnvVar") or "LOCAL_LLM_KEY"
+    return DiscoveredClient(
+        client="octofriend",
+        path=path,
+        base_url=url,
+        model=field_of("model"),
+        api_key=os.environ.get(env_var, ""),
+        context=int(context_match.group(1)) if context_match else None,
+        key_env_var=env_var,
+    )
+
+
+_READERS = (
+    ("cline-settings.json", _read_cline),
+    (".aider.conf.yml", _read_aider),
+    ("octofriend.json5", _read_octofriend),
+)
+
+
+def _read_sidecar(path: Path) -> DiscoveredClient | None:
+    """The record `join` leaves, which every client shares.
+
+    Preferred over the client's own file because two of the three keep their
+    base URL in the environment: on a fresh shell those configs name a model
+    and nothing else, which is not enough to check anything.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != SIDECAR_VERSION:
+        return None
+    url = data.get("base_url")
+    if not isinstance(url, str) or not url:
+        return None
+
+    client = str(data.get("client") or "")
+    env_var = str(data.get("key_env_var") or "")
+    # The secret deliberately is not here. It stays where the client itself
+    # looks for it: in the client's own file, or in the environment.
+    api_key = os.environ.get(env_var, "") if env_var else ""
+    if not api_key:
+        own = next((r(path.parent / f) for f, r in _READERS if (path.parent / f).exists()), None)
+        if own is not None:
+            api_key = own.api_key
+
+    context = data.get("context")
+    return DiscoveredClient(
+        client=client,
+        path=path,
+        base_url=url,
+        model=str(data.get("model") or ""),
+        api_key=api_key,
+        context=context if isinstance(context, int) and not isinstance(context, bool) else None,
+        key_env_var=env_var,
+    )
+
+
+def read_client_config(directory: Path | str = ".") -> DiscoveredClient | None:
+    """Find a config this tool wrote and recover what the doctor needs.
+
+    Returns None rather than raising: not finding one is an ordinary state on a
+    laptop that has not been joined yet, and the caller has a better error to
+    give than this function does.
+    """
+    d = Path(directory)
+    sidecar = d / SIDECAR
+    if sidecar.exists():
+        found = _read_sidecar(sidecar)
+        if found is not None:
+            return found
+
+    # Falls back to the client's own file, which covers a config written before
+    # the sidecar existed, or one a user assembled by hand.
+    for filename, reader in _READERS:
+        path = d / filename
+        if path.exists():
+            found = reader(path)
+            if found is not None:
+                return found
+    return None

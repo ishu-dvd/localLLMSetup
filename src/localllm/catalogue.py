@@ -93,6 +93,33 @@ class Model:
     license_is_commercial: bool | None = None
     """Three-state, where None means unknown rather than acceptable."""
 
+    hf_repo: str | None = None
+    """The Hugging Face repo this quantisation is published in.
+
+    The solver can say "run this model" with total confidence and still leave
+    the user to work out where it lives, which is where the flow actually
+    stalled: `up` refuses until a GGUF exists on disk, and nothing pointed at
+    one. Recording the source turns that dead end into a command to run.
+    """
+
+    hf_file: str | None = None
+    """The file within `hf_repo`. Kept separate from the repo because the
+    download tools take them as separate arguments."""
+
+    @property
+    def download_command(self) -> str | None:
+        """The exact line that fetches this model, or None if unrecorded."""
+        if not self.hf_repo or not self.hf_file:
+            return None
+        return f"hf download {self.hf_repo} {self.hf_file} --local-dir ."
+
+    @property
+    def download_url(self) -> str | None:
+        """A direct URL, for a machine with curl but no Python tooling."""
+        if not self.hf_repo or not self.hf_file:
+            return None
+        return f"https://huggingface.co/{self.hf_repo}/resolve/main/{self.hf_file}"
+
     @property
     def id(self) -> str:
         return f"{self.name}:{self.quant}"
@@ -147,6 +174,11 @@ class Model:
 GPT_OSS_20B = Model(
     name="gpt-oss-20b",
     quant="MXFP4",
+    # NOT unsloth/gpt-oss-20b-GGUF: that repo publishes F16/Q2_K..Q8_0 and the
+    # UD quants, but no MXFP4 at all, so the obvious guess 404s. ggml-org is
+    # llama.cpp's own org and the only source of the native conversion.
+    hf_repo="ggml-org/gpt-oss-20b-GGUF",
+    hf_file="gpt-oss-20b-MXFP4.gguf",
     weights_gb=12.11,
     kb_per_token_q8=12.0,
     n_layers=24,
@@ -175,6 +207,11 @@ GPT_OSS_20B = Model(
 KAT_CODER_Q2_K_L = Model(
     name="KAT-Coder-V2.5-Dev",
     quant="Q2_K_L",
+    # Kwaipilot publish no GGUF; bartowski is the only repo carrying both of
+    # the quants we consider. The `Kwaipilot_` prefix is his naming convention,
+    # not part of the model name.
+    hf_repo="bartowski/Kwaipilot_KAT-Coder-V2.5-Dev-GGUF",
+    hf_file="Kwaipilot_KAT-Coder-V2.5-Dev-Q2_K_L.gguf",
     weights_gb=13.11,
     kb_per_token_q8=10.0,
     n_layers=40,
@@ -192,6 +229,8 @@ KAT_CODER_Q2_K_L = Model(
 KAT_CODER_IQ3_XXS = Model(
     name="KAT-Coder-V2.5-Dev",
     quant="IQ3_XXS",
+    hf_repo="bartowski/Kwaipilot_KAT-Coder-V2.5-Dev-GGUF",
+    hf_file="Kwaipilot_KAT-Coder-V2.5-Dev-IQ3_XXS.gguf",
     weights_gb=14.87,
     kb_per_token_q8=10.0,
     n_layers=40,
@@ -209,6 +248,9 @@ KAT_CODER_IQ3_XXS = Model(
 QWEN36_35B_A3B_IQ3_XXS = Model(
     name="Qwen3.6-35B-A3B",
     quant="UD-IQ3_XXS",
+    # UD-* are Unsloth's own calibration, so there is no alternative upstream.
+    hf_repo="unsloth/Qwen3.6-35B-A3B-GGUF",
+    hf_file="Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf",
     weights_gb=12.30,
     kb_per_token_q8=10.0,
     n_layers=40,
@@ -225,6 +267,10 @@ QWEN36_35B_A3B_IQ3_XXS = Model(
 GEMMA4_26B_A4B_Q3 = Model(
     name="Gemma-4-26B-A4B-it",
     quant="UD-Q3_K_XL",
+    # Canonical repo id is lowercase `gemma`; the capitalised form only works
+    # because HF redirects repo paths case-insensitively, unlike file paths.
+    hf_repo="unsloth/gemma-4-26B-A4B-it-GGUF",
+    hf_file="gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf",
     weights_gb=12.02,
     kb_per_token_q8=12.5,
     n_layers=30,
@@ -244,6 +290,12 @@ GEMMA4_26B_A4B_Q3 = Model(
 QWEN25_CODER_14B = Model(
     name="Qwen2.5-Coder-14B",
     quant="Q4_K_M",
+    # Qwen's own repos use all-lowercase filenames; bartowski's mirrors use
+    # CamelCase. HF file paths are case-sensitive, so these are not swappable.
+    # This repo also ships a 2-part split of the same quant - the single file
+    # is chosen to avoid shard handling.
+    hf_repo="Qwen/Qwen2.5-Coder-14B-Instruct-GGUF",
+    hf_file="qwen2.5-coder-14b-instruct-q4_k_m.gguf",
     weights_gb=8.99,
     kb_per_token_q8=96.0,
     n_layers=48,
@@ -259,6 +311,8 @@ QWEN25_CODER_14B = Model(
 QWEN25_CODER_7B = Model(
     name="Qwen2.5-Coder-7B",
     quant="Q4_K_M",
+    hf_repo="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+    hf_file="qwen2.5-coder-7b-instruct-q4_k_m.gguf",
     weights_gb=4.68,
     kb_per_token_q8=28.0,
     n_layers=28,
@@ -274,6 +328,8 @@ QWEN25_CODER_7B = Model(
 QWEN3_CODER_30B_A3B = Model(
     name="Qwen3-Coder-30B-A3B",
     quant="Q3_K_M",
+    hf_repo="unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+    hf_file="Qwen3-Coder-30B-A3B-Instruct-Q3_K_M.gguf",
     weights_gb=14.71,
     kb_per_token_q8=48.0,
     n_layers=48,

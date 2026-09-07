@@ -98,15 +98,53 @@ def build_is_recent_enough(build: int | None) -> bool:
 # --- Preflight --------------------------------------------------------------
 
 
+def _auth_check(active_keys: int) -> Check:
+    """Refuse to install an unauthenticated always-on server.
+
+    llama.cpp skips key validation entirely when the key list is empty
+    (`server-http.cpp:613`: `if (api_keys.empty()) { return true; }`), so a
+    `keys.txt` containing only comments does not lock the server down — it
+    turns authentication off. Paired with `--host 0.0.0.0` that is an open
+    model endpoint on every interface the machine has.
+
+    It is a FAIL rather than a WARN because the failure is invisible. A client
+    configured with a key gets correct answers from a server that never looked
+    at it, so nothing at any point in normal use reveals that the door is open.
+    """
+    if active_keys <= 0:
+        return Check(
+            "auth",
+            Level.FAIL,
+            "no device keys have been issued, and llama.cpp treats an empty key "
+            "list as 'authentication off' rather than 'deny everything' - this "
+            "would publish the model on 0.0.0.0:8080 with no auth at all",
+            "issue one first: localllm key add <laptop-name>",
+        )
+    return Check(
+        "auth",
+        Level.PASS,
+        f"{active_keys} device key(s) will be baked into the key file",
+    )
+
+
 def preflight(
     verdict: Verdict,
     *,
     llama_build: int | None,
     free_disk_gb: float | None,
     gpu_detected: bool,
+    active_keys: int | None = None,
 ) -> Preflight:
-    """Everything that must be true before an unattended server is allowed to start."""
+    """Everything that must be true before an unattended server is allowed to start.
+
+    `active_keys` is checked because of a llama.cpp behaviour that fails in the
+    dangerous direction: an empty key list disables authentication rather than
+    denying everything (`server-http.cpp:613`). See `_auth_check`.
+    """
     checks: list[Check] = []
+
+    if active_keys is not None:
+        checks.append(_auth_check(active_keys))
 
     # 1. Does the plan even fit?
     if verdict.status is Fit.REFUSE:

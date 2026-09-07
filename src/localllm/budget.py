@@ -273,8 +273,21 @@ class Verdict:
         # Dense models have no experts to separate, so offload whole layers.
         return f"-ngl {self.n_gpu_layers}"
 
-    def llama_server_flags(self) -> str:
-        """The exact invocation. See docs/DECISIONS.md §7 for why each value."""
+    def llama_server_flags(self, api_key_file: str | None = None) -> str:
+        """The exact invocation. See docs/DECISIONS.md §7 for why each value.
+
+        `--api-key-file` is **always** emitted, with a placeholder path when the
+        real one is unknown — the same convention `-m` already uses. It is not
+        optional because of how llama.cpp behaves without it
+        (`server-http.cpp:613`):
+
+            if (api_keys.empty()) { return true; }   // skip validation
+
+        Zero keys does not lock the server down, it turns authentication **off**.
+        Combined with `--host 0.0.0.0` that is an open endpoint on every
+        interface — and it is indistinguishable from a working setup, because a
+        client sending a key it ignores gets exactly the right answer.
+        """
         model_path = self.model.source_path or (
             f"<path-to>/{self.model.name}-{self.model.quant}.gguf"
         )
@@ -282,6 +295,7 @@ class Verdict:
             f"-m {model_path}",
             f"-a {MODEL_ALIAS}",  # Anthropic-path clients filter IDs lacking "claude"
             "--host 0.0.0.0 --port 8080",
+            f"--api-key-file {api_key_file or '<path-to>/keys.txt'}",
             "--device Vulkan0",
             self._offload_flags(),
             f"-np {self.plan.n_slots}",

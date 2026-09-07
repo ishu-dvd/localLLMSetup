@@ -106,6 +106,42 @@ class KeyStore:
     def for_device(self, device: str) -> DeviceKey | None:
         return next((k for k in self._keys if k.device == device and k.is_active), None)
 
+    def keys_in_file(self, path: Path | str) -> list[str] | None:
+        """The keys llama-server would actually accept, read the way it reads them.
+
+        Deliberately reimplements llama.cpp's parser rather than trusting our
+        own writer (`common/arg.cpp:3520`): skip empty lines and lines whose
+        **first character** is `#`, take the rest verbatim with no trimming.
+        Reading it any other way would hide exactly the mistakes that matter -
+        an indented comment becomes a literal key, and a stray `\\r` becomes
+        part of one.
+
+        Returns None when the file does not exist, which is a different state
+        from "exists and is empty": the first is a server that will not start,
+        the second is a server with authentication switched off.
+        """
+        p = Path(path)
+        if not p.exists():
+            return None
+        try:
+            raw = p.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        return [line for line in raw.split("\n") if line and line[0] != "#"]
+
+    def file_is_current(self, path: Path | str) -> bool | None:
+        """Would a restart change which keys the server accepts?
+
+        The key file is parsed once, at startup, so the store and the file drift
+        apart the moment a device is added or revoked - and nothing about that
+        drift is visible from either side. A newly invited laptop simply gets a
+        401 that looks like a bad token.
+        """
+        in_file = self.keys_in_file(path)
+        if in_file is None:
+            return None
+        return sorted(in_file) == sorted(k.key for k in self.active())
+
     # --- rendering ----------------------------------------------------------
 
     def render_api_key_file(self) -> str:

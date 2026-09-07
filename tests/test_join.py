@@ -213,3 +213,226 @@ def test_tool_call_trained_model_recommends_cline():
 
 def test_general_model_recommends_aider():
     assert recommend_client(model_is_tool_call_trained=False) == "aider"
+
+
+class TestReadingAConfigBack:
+    """`check` used to demand the URL, key and model again - moments after
+    `join` had written all three into the current directory.
+
+    Retyping them is not merely tedious: a typo in the retyped version gets
+    diagnosed as a server fault, which is the exact opposite of what the doctor
+    is for. Reading the file back also means the doctor checks the config the
+    client will really use, rather than one described on a command line.
+    """
+
+    def _write(self, tmp_path, client, **over):
+        kwargs = dict(
+            client=client,
+            base_url="http://msi:8080",
+            api_key="sk-localllm-secret",
+            model="claude-local-coder",
+            context=8192,
+        )
+        kwargs.update(over)
+        build_client_config(**kwargs).write(tmp_path)
+        return tmp_path
+
+    def test_a_cline_config_round_trips(self, tmp_path):
+        from localllm.join import read_client_config
+
+        self._write(tmp_path, "cline")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.client == "cline"
+        assert found.model == "claude-local-coder"
+        assert found.api_key == "sk-localllm-secret"
+        assert found.context == 8192
+        assert "msi:8080" in found.base_url
+
+    def test_an_aider_config_round_trips_with_the_key_from_the_environment(
+        self, tmp_path, monkeypatch
+    ):
+        """Aider splits itself across three places, and the key is one of the
+        two that live in the environment rather than a file."""
+        from localllm.join import read_client_config
+
+        self._write(tmp_path, "aider")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-from-env")
+        monkeypatch.setenv("OPENAI_API_BASE", "http://msi:8080/v1")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.client == "aider"
+        assert found.api_key == "sk-from-env"
+        assert found.context == 8192
+
+    def test_the_aider_model_loses_its_provider_prefix(self, tmp_path, monkeypatch):
+        """Aider is told `openai/<model>`; the server only knows the bare id,
+        so passing the prefixed form to a model-visibility check would report a
+        model the server has never heard of."""
+        from localllm.join import read_client_config
+
+        self._write(tmp_path, "aider")
+        monkeypatch.setenv("OPENAI_API_BASE", "http://msi:8080/v1")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.model == "claude-local-coder"
+
+    def test_an_octofriend_config_round_trips(self, tmp_path, monkeypatch):
+        """Its file is JSON5 - unquoted keys, trailing commas - so it cannot be
+        parsed with json.loads."""
+        from localllm.join import read_client_config
+
+        self._write(tmp_path, "octofriend")
+        monkeypatch.setenv("LOCAL_LLM_KEY", "sk-octo")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.client == "octofriend"
+        assert found.context == 8192
+        assert found.api_key == "sk-octo"
+        assert found.model == "claude-local-coder"
+
+    def test_a_missing_environment_key_is_named_rather_than_reported_as_absent(
+        self, tmp_path, monkeypatch
+    ):
+        """Saying "no key" when the real problem is an unset variable sends the
+        user to re-issue a key that was never the issue."""
+        from localllm.join import read_client_config
+
+        self._write(tmp_path, "octofriend")
+        monkeypatch.delenv("LOCAL_LLM_KEY", raising=False)
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.api_key == ""
+        assert found.key_env_var == "LOCAL_LLM_KEY"
+
+    def test_no_config_present_is_not_an_error(self, tmp_path):
+        """An unjoined laptop is an ordinary state, and the caller has a better
+        message for it than this function does."""
+        from localllm.join import read_client_config
+
+        assert read_client_config(tmp_path) is None
+
+    def test_a_corrupt_config_is_skipped_rather_than_raising(self, tmp_path):
+        from localllm.join import read_client_config
+
+        (tmp_path / "cline-settings.json").write_text("{ not json", encoding="utf-8")
+        assert read_client_config(tmp_path) is None
+
+    def test_a_hand_edited_octofriend_config_still_reads(self, tmp_path, monkeypatch):
+        """It is meant to be edited. Refusing to read a legitimately customised
+        file would send the user back to retyping the values we are recovering."""
+        from localllm.join import read_client_config
+
+        (tmp_path / "octofriend.json5").write_text(
+            "{\n  models: [\n    {\n"
+            '      nickname: "my own name",\n'
+            '      baseUrl: "http://elsewhere:9090",\n'
+            '      apiEnvVar: "MY_KEY",\n'
+            '      model: "something-else",\n'
+            "      context: 4096,\n"
+            "      // a comment the user added\n"
+            "    },\n  ],\n}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MY_KEY", "sk-mine")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.base_url == "http://elsewhere:9090"
+        assert found.model == "something-else"
+        assert found.context == 4096
+        assert found.api_key == "sk-mine"
+
+
+class TestTheSidecarMakesEveryClientReadable:
+    """Two of the three clients keep the base URL in an environment variable.
+
+    Reading their own config back is therefore not enough to know where a
+    laptop points: on a fresh shell, `.aider.conf.yml` names a model and
+    nothing else. `check` found the file, recovered no URL, and reported
+    "nothing to check ... run this from the directory join wrote its config
+    into" - to a user who was standing in exactly that directory.
+    """
+
+    def _join(self, tmp_path, client):
+        build_client_config(
+            client=client,
+            base_url="http://msi:8080",
+            api_key="sk-localllm-secret",
+            model="claude-local-coder",
+            context=8192,
+        ).write(tmp_path)
+        return tmp_path
+
+    @pytest.mark.parametrize("client", ["cline", "aider", "octofriend"])
+    def test_every_client_records_where_it_points(self, client, tmp_path, monkeypatch):
+        from localllm.join import read_client_config
+
+        for var in ("OPENAI_API_BASE", "OPENAI_API_KEY", "LOCAL_LLM_KEY"):
+            monkeypatch.delenv(var, raising=False)
+        self._join(tmp_path, client)
+
+        found = read_client_config(tmp_path)
+        assert found is not None, client
+        assert "msi:8080" in found.base_url, client
+        assert found.model == "claude-local-coder", client
+        assert found.context == 8192, client
+
+    def test_the_sidecar_holds_no_secret(self, tmp_path):
+        """It sits next to a client config in a working directory that may well
+        be a git repository. The key belongs where the client already looks."""
+        from localllm.join import SIDECAR
+
+        self._join(tmp_path, "aider")
+        assert "sk-localllm-secret" not in (tmp_path / SIDECAR).read_text(encoding="utf-8")
+
+    def test_the_key_still_reaches_the_doctor_from_the_environment(self, tmp_path, monkeypatch):
+        from localllm.join import read_client_config
+
+        self._join(tmp_path, "octofriend")
+        monkeypatch.setenv("LOCAL_LLM_KEY", "sk-from-env")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.api_key == "sk-from-env"
+
+    def test_the_key_is_recovered_from_the_client_file_when_it_lives_there(self, tmp_path):
+        """Cline stores its own key, so no environment variable is involved."""
+        from localllm.join import read_client_config
+
+        self._join(tmp_path, "cline")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.api_key == "sk-localllm-secret"
+
+    def test_the_sidecar_records_the_origin_not_the_v1_suffix(self, tmp_path):
+        """The clients disagree about the /v1 suffix - Octofriend wants the
+        bare origin, the others want /v1. Storing one canonical form keeps the
+        doctor from having to guess which convention wrote it."""
+        from localllm.join import read_client_config
+
+        self._join(tmp_path, "cline")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert not found.base_url.endswith("/v1")
+
+    def test_a_config_without_a_sidecar_still_reads(self, tmp_path):
+        """Covers a laptop joined before the sidecar existed, and one a user
+        assembled by hand."""
+        from localllm.join import SIDECAR, read_client_config
+
+        self._join(tmp_path, "cline")
+        (tmp_path / SIDECAR).unlink()
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.client == "cline"
+
+    def test_a_sidecar_from_a_future_version_falls_back_rather_than_misreading(self, tmp_path):
+        from localllm.join import SIDECAR, read_client_config
+
+        self._join(tmp_path, "cline")
+        path = tmp_path / SIDECAR
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["version"] = 99
+        path.write_text(json.dumps(data), encoding="utf-8")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.path.name == "cline-settings.json"
