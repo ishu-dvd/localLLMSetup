@@ -22,6 +22,7 @@ from localllm.client import (
     BUFFERED_SPREAD_S,
     MIN_FRAMES_TO_JUDGE_TIMING,
     PUBLIC_ENDPOINTS,
+    STREAM_PROBE_MAX_TOKENS,
     TOOL_PROBE_NAME,
     Api,
     Outcome,
@@ -852,3 +853,99 @@ class TestProbeCanReadIncrementally:
         response = self._FakeResponse([b'{"ok": true}'])
         monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: response)
         assert probe("http://s/x").body == {"ok": True}
+
+
+class TestTheStreamingConstantsMustAgreeWithEachOther:
+    """Three constants encode one argument, and nothing linked them.
+
+    `stream_probe_body` asks for `STREAM_PROBE_MAX_TOKENS`. `check_streaming`
+    refuses to judge below `MIN_FRAMES_TO_JUDGE_TIMING` frames. Lower the first
+    below the second and the buffering check still passes every test in this
+    file while becoming permanently unable to detect buffering - it would answer
+    "too few frames to tell" forever, on every server, and read as healthy.
+
+    `BUFFERED_SPREAD_S` is justified in its own docstring by an arithmetic
+    claim about tokens per second. If someone widens it without redoing that
+    sum, the justification silently stops being true.
+    """
+
+    def test_the_request_asks_for_more_frames_than_the_judge_needs(self) -> None:
+        assert STREAM_PROBE_MAX_TOKENS > MIN_FRAMES_TO_JUDGE_TIMING, (
+            "the probe would never collect enough frames to judge buffering, and "
+            "the check would report 'too few frames' on every server forever"
+        )
+
+    def test_there_is_real_headroom_not_just_one_token(self) -> None:
+        """A model can stop early, and llama.cpp packs more than one token into
+        some frames. Scraping past the threshold exactly would make the check
+        depend on the model's choice of when to stop talking."""
+        assert STREAM_PROBE_MAX_TOKENS >= MIN_FRAMES_TO_JUDGE_TIMING * 4
+
+    def test_both_apis_ask_for_that_many_tokens(self) -> None:
+        for api in (Api.OPENAI, Api.ANTHROPIC):
+            assert api.stream_probe_body("m")["max_tokens"] == STREAM_PROBE_MAX_TOKENS
+
+    def test_the_streaming_probe_actually_asks_for_a_stream(self) -> None:
+        """It is one boolean between a working check and one that reads a whole
+        JSON body, finds no SSE frames and reports every server as broken."""
+        for api in (Api.OPENAI, Api.ANTHROPIC):
+            assert api.stream_probe_body("m")["stream"] is True
+
+    def test_the_threshold_matches_the_tokens_per_second_claim(self) -> None:
+        """The docstring justifies the threshold with a rate. n frames spread
+        over t seconds is n-1 intervals, not n - the first draft said "over 400
+        tok/s" when the real figure is 350, and nothing was checking."""
+        intervals = MIN_FRAMES_TO_JUDGE_TIMING - 1
+        implied_tok_per_s = intervals / BUFFERED_SPREAD_S
+        assert implied_tok_per_s == pytest.approx(350.0)
+
+    def test_the_threshold_stays_far_above_what_this_hardware_can_do(self) -> None:
+        """The property the arithmetic exists to guarantee. If the threshold
+        ever creeps into the range the hardware can actually reach, healthy
+        servers start being reported as buffered."""
+        fastest_plausible_tok_per_s = 40.0
+        implied = (MIN_FRAMES_TO_JUDGE_TIMING - 1) / BUFFERED_SPREAD_S
+        assert implied > fastest_plausible_tok_per_s * 5, (
+            f"the threshold now implies {implied:.0f} tok/s is suspicious, which is "
+            "too close to what this hardware genuinely reaches"
+        )
+
+    def test_a_stream_at_the_hardware_s_real_speed_is_not_called_buffered(self) -> None:
+        """The end the arithmetic exists to protect: 40 tok/s is the top of the
+        budgeted range, and must pass."""
+        fastest_plausible_tok_per_s = 40.0
+        n = MIN_FRAMES_TO_JUDGE_TIMING
+        spread = (n - 1) / fastest_plausible_tok_per_s
+        step = spread / (n - 1)
+        samples = [StreamSample(elapsed_s=i * step, line='data: {"a":1}\n') for i in range(n)]
+        assert check_streaming(samples).outcome is Outcome.OK
+
+
+class TestAProxyErrorPageIsNotAModelProblem:
+    """`check_inference` guards against a 200 that is not JSON. The tool check
+    did not, so a proxy returning an HTML error page - a routing fault - was
+    reported as "the model answered in prose", sending the user off to change
+    models over something no model could fix.
+    """
+
+    URL = "http://s/v1/chat/completions"
+
+    def test_html_is_reported_as_a_wrong_endpoint(self) -> None:
+        p = Probe(url=self.URL, status=200, body="<html><body>502 Bad Gateway</body></html>")
+        f = check_tool_calling(p)
+        assert f.outcome is Outcome.BAD_ENDPOINT
+        assert "proxy" in f.detail
+
+    def test_the_sibling_check_agrees(self) -> None:
+        """Both look at the same response; disagreeing would be worse than
+        either verdict alone."""
+        p = Probe(url=self.URL, status=200, body="<html>502</html>")
+        assert check_inference(p).outcome is check_tool_calling(p).outcome
+
+    def test_a_json_list_is_also_not_a_completion(self) -> None:
+        p = Probe(url=self.URL, status=200, body=[1, 2, 3])
+        assert check_tool_calling(p).outcome is Outcome.BAD_ENDPOINT
+
+    def test_a_real_json_reply_is_still_judged_on_its_tool_calls(self) -> None:
+        p = Probe(url=self.URL, status=200, body={"choices": [{"message": {"content": "no"}}]})
+        assert check_tool_calling(p).outcome is Outcome.TOOLS_IGNORED

@@ -698,7 +698,7 @@ most worth catching: a model that *can* emit tool calls but never decides to. Ag
 A buffering proxy returns **valid SSE**. The frames are well-formed, the content is correct,
 and `read()` returns exactly the same bytes it would from a healthy stream. The only thing
 that differs is *when* they arrive — so `check` reads the response line by line and records a
-timestamp per frame. Frames arriving within 20 ms of each other would be over 400 tok/s;
+timestamp per frame. Eight frames spread over 20 ms is seven intervals — 350 tok/s;
 this hardware is budgeted at 10–40 tok/s, so no genuine stream can land there and a buffered
 one always does. Below 8 frames it declines to judge rather than fail a healthy server.
 

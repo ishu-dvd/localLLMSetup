@@ -73,10 +73,11 @@ timing needs samples.
 BUFFERED_SPREAD_S = 0.02
 """Arrival spread below which a multi-frame response was certainly buffered.
 
-The arithmetic: `MIN_FRAMES_TO_JUDGE_TIMING` frames inside 20 ms would be over
-400 tokens/second. The models this project can run are budgeted at roughly
-10-40 tokens/second, so no genuine stream from this hardware can land here,
-while a buffered one always does.
+The arithmetic: `MIN_FRAMES_TO_JUDGE_TIMING` frames spread over 20 ms is seven
+intervals in 0.02 s, i.e. 350 tokens/second. The models this project can run are
+budgeted at roughly 10-40 tokens/second, so a genuine stream from this hardware
+is an order of magnitude slower than the threshold, while a buffered one - whose
+frames are parsed out of a single read - always lands under it.
 """
 
 STREAM_PROBE_MAX_FRAMES = 400
@@ -552,6 +553,17 @@ def check_tool_calling(result: Probe, api: Api = Api.OPENAI) -> Finding:
     finding = diagnose(result)
     if not finding:
         return finding
+
+    if not isinstance(result.body, dict):
+        # The same guard `check_inference` carries. Without it a proxy that
+        # answers 200 with an HTML error page is reported as "the model answered
+        # in prose", sending the user to change models over a routing fault.
+        return Finding(
+            Outcome.BAD_ENDPOINT,
+            "the server answered 200 but not with JSON - something other than "
+            "llama-server may be replying, such as a proxy error page",
+            "check the base URL points at llama-server itself",
+        )
 
     calls = _tool_calls(result.body, api)
     if not calls:
