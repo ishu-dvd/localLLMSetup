@@ -355,6 +355,22 @@ _READERS = (
 )
 
 
+def _read_own_config(directory: Path) -> DiscoveredClient | None:
+    """The first client config in this directory that parses.
+
+    Split out rather than inlined so the file is read once per reader: the
+    generator that replaced it evaluated the reader twice, once to test the
+    result and once to yield it.
+    """
+    for filename, reader in _READERS:
+        path = directory / filename
+        if path.exists():
+            found = reader(path)
+            if found is not None:
+                return found
+    return None
+
+
 def _read_sidecar(path: Path) -> DiscoveredClient | None:
     """The record `join` leaves, which every client shares.
 
@@ -378,7 +394,7 @@ def _read_sidecar(path: Path) -> DiscoveredClient | None:
     # looks for it: in the client's own file, or in the environment.
     api_key = os.environ.get(env_var, "") if env_var else ""
     if not api_key:
-        own = next((r(path.parent / f) for f, r in _READERS if (path.parent / f).exists()), None)
+        own = _read_own_config(path.parent)
         if own is not None:
             api_key = own.api_key
 
@@ -410,10 +426,7 @@ def read_client_config(directory: Path | str = ".") -> DiscoveredClient | None:
     copies of one fact, and nothing comparing them.
     """
     d = Path(directory)
-    own = next(
-        (r(d / f) for f, r in _READERS if (d / f).exists() and r(d / f) is not None),
-        None,
-    )
+    own = _read_own_config(d)
 
     sidecar = d / SIDECAR
     recorded = _read_sidecar(sidecar) if sidecar.exists() else None
