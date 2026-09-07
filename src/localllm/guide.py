@@ -197,7 +197,7 @@ def server_guide(
             "service",
             "Install and start the Windows service",
             State.UNKNOWN if have_plan else State.WAITING,
-            command="Run 01-powercfg.ps1, 02-install-service.ps1, 03-watchdog.ps1 as Administrator",
+            command="localllm service install",
             detail="cannot be checked from here" if have_plan else "",
         )
     )
@@ -233,7 +233,7 @@ def client_guide(*, config_written: bool, url: str = "") -> Guide:
             "join",
             "Write this laptop's client config",
             State.DONE if config_written else State.NEXT,
-            command="localllm join --invite <token> --client cline",
+            command="localllm client <token>",
             detail=f"pointed at {url}" if config_written and url else "",
         ),
         Step(

@@ -374,7 +374,7 @@ This is a password. It contains laptop-1's API key - send it over
 something private, and revoke it with `localllm key revoke` if it leaks.
 
 On laptop-1, run:
-  localllm join --invite llmi1_... --client cline
+  localllm client llmi1_...
 
 That pins 8,192 tokens of context - the share this server actually gives each of its 2 slot(s).
 ```
@@ -383,11 +383,13 @@ On the laptop, that single token is the entire handoff — URL, key, model id an
 per-slot context, none of it retyped:
 
 ```powershell
-python -m localllm join --invite llmi1_... --client cline
-python -m localllm check          # no arguments: it reads the config just written
+python -m localllm client llmi1_...   # picks the agent, installs it, writes the config
+python -m localllm check              # no arguments: it reads the config just written
 ```
 
-Writes ready-to-use config for **Cline**, **Aider** or **Octofriend**. The token is
+Writes ready-to-use config for **opencode**, **Continue**, **Aider**, **Octofriend** or
+**Qwen Code** — and for Cline, which cannot be configured from a file, the values to type in.
+The token is
 checksummed, because these get pasted through chat apps that wrap long lines — and a
 silently truncated token becomes a wrong key that surfaces as a 401 hours later and gets
 blamed on authentication:
@@ -409,6 +411,36 @@ The client would build prompts the server rejects with 400 exceed_context_size_e
 That failure is otherwise completely silent at setup time: it only appears later, as a
 coding agent that works on small files and dies on large ones.
 
+**`check` proves the agent works, not merely that the server answers.** Reachable,
+authorised, and able to reply "ok" is what a connectivity check establishes — and none of it
+is what a coding agent needs. Agents call tools, and they stream. Both fail independently of
+plain generation, and both fail *silently*:
+
+```
+[FAIL] the model calls tools
+       the model answered in prose instead of calling the tool it was given
+       -> this model will not drive a coding agent reliably. If it is a low-bit
+          quantisation, try a larger one - tool calling is the first thing
+          quantisation damages. `localllm plan` ranks the models that fit this hardware
+
+[FAIL] the reply streams as it is generated
+       all 20 frames arrived less than 1 ms apart, so the response was generated
+       and only then released
+       -> something between the client and llama-server is buffering ...
+```
+
+The streaming one cannot be caught by reading the response. A buffering proxy returns
+*valid* SSE — it just withholds it until generation finishes, so the body parses, the
+content is right, and the agent shows nothing for thirty seconds before the whole answer
+appears at once. Users read that as "the model is slow" and never suspect the proxy. Only
+the **arrival times** distinguish them, which is why `check` reads the response line by line
+instead of whole. It is also what proves the generated Caddyfile's buffering directive is
+actually in force.
+
+Free, and asked by nobody else: `/props` advertises `chat_template_tool_use` only when jinja
+is on *and* the model ships a tool-use template. We were already fetching `/props` for the
+context and throwing that key away.
+
 **Set it up to run 24/7** (refuses to generate anything until preflight passes):
 
 ```powershell
@@ -425,8 +457,13 @@ python -m localllm up --llama-server C:\ai\llama-server.exe
 ```
 
 On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
-`02-install-service.ps1` (NSSM, boot-start, restart-on-failure) and `03-watchdog.ps1`
-(alerts on page-file thrash, which is otherwise completely silent).
+`02-install-service.ps1` (NSSM, boot-start, restart-on-failure) and
+`03-install-watchdog.ps1`, which registers `watchdog-loop.ps1` as its own service to
+alert on page-file thrash — otherwise completely silent.
+
+**A numbered script is one you run, in that order** — and `localllm service install`
+runs them for you, refusing rather than half-installing if it is not elevated. `setup.ps1`
+calls it at the end, asking for Administrator once through UAC.
 
 | Phase | Status |
 |---|---|
@@ -435,11 +472,11 @@ On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
 | 2 — resolve open questions | ⏳ needs the MSI |
 | 3 — server as a service | ✅ done, 38 tests (reboot gate needs the MSI) |
 | 4 — per-device keys | ✅ done, 24 tests |
-| 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup |
+| 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup, agent-readiness gate |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**736 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13,
-and 34/34 mutations caught.
+**1026 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13,
+and 83/83 mutations caught.
 
 ---
 

@@ -13,19 +13,29 @@ finding with a fix. No network in any of these tests.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
 
 from localllm.client import (
+    BUFFERED_SPREAD_S,
+    MIN_FRAMES_TO_JUDGE_TIMING,
     PUBLIC_ENDPOINTS,
+    STREAM_PROBE_MAX_TOKENS,
+    TOOL_PROBE_NAME,
     Api,
     Outcome,
     Probe,
     ProbeError,
+    StreamSample,
     check_inference,
     check_model_visibility,
+    check_streaming,
+    check_tool_calling,
     diagnose,
+    probe,
+    stream_probe,
 )
 
 
@@ -529,3 +539,413 @@ class TestApiEndpoints:
         ant = Api.ANTHROPIC.probe_body("m")
         assert "messages" in oai and "messages" in ant
         assert "max_tokens" in ant, "the Anthropic API rejects a request without it"
+
+
+class TestToolCallingDecidesWhetherAnAgentWorks:
+    """Every client this project recommends drives the model through tool
+    calls. Nothing above this point touches that path, so a server can pass
+    every other check and still be useless - the agent connects, sends its
+    first real request and gets prose where a function call belonged.
+    """
+
+    URL = "http://s/v1/chat/completions"
+
+    @staticmethod
+    def _call(arguments: object = '{"path": "/srv/notes/build-id.txt"}') -> dict:
+        return {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": arguments},
+        }
+
+    def _probe(self, body: object, status: int = 200) -> Probe:
+        return Probe(url=self.URL, status=status, body=body)
+
+    def test_a_well_formed_tool_call_passes(self) -> None:
+        f = check_tool_calling(
+            self._probe({"choices": [{"message": {"tool_calls": [self._call()]}}]})
+        )
+        assert f.outcome is Outcome.OK
+
+    def test_answering_in_prose_is_a_failure_not_a_pass(self) -> None:
+        """The whole point. A plain completion check calls this healthy."""
+        body = {"choices": [{"message": {"content": "I cannot read files."}}]}
+        assert check_inference(self._probe(body)), "the old check is satisfied"
+        f = check_tool_calling(self._probe(body))
+        assert f.outcome is Outcome.TOOLS_IGNORED
+        assert not f
+
+    def test_arguments_that_are_not_json_are_caught(self) -> None:
+        """The classic sign of a quantisation too low for structured output:
+        the call looks right and the agent crashes parsing it."""
+        f = check_tool_calling(
+            self._probe({"choices": [{"message": {"tool_calls": [self._call('{"path": ')]}}]})
+        )
+        assert f.outcome is Outcome.TOOLS_MALFORMED
+
+    def test_arguments_given_as_an_object_are_caught(self) -> None:
+        """The OpenAI API specifies `arguments` as a STRING of JSON. A server
+        that helpfully pre-parses it breaks every client that calls json.loads."""
+        f = check_tool_calling(
+            self._probe({"choices": [{"message": {"tool_calls": [self._call({"path": "/x"})]}}]})
+        )
+        assert f.outcome is Outcome.TOOLS_MALFORMED
+
+    def test_arguments_that_parse_to_a_list_are_caught(self) -> None:
+        f = check_tool_calling(
+            self._probe({"choices": [{"message": {"tool_calls": [self._call("[1,2]")]}}]})
+        )
+        assert f.outcome is Outcome.TOOLS_MALFORMED
+
+    def test_a_no_jinja_server_keeps_its_existing_diagnosis(self) -> None:
+        """diagnose already names the flag. Inventing a second outcome for one
+        server state would mean the same server reported two different ways."""
+        body = {"error": {"code": 500, "message": "tools param requires --jinja flag"}}
+        f = check_tool_calling(self._probe(body, status=500))
+        assert f.outcome is Outcome.NOT_ENABLED
+        assert "jinja" in f.fix.lower()
+
+    def test_transport_failures_are_not_reported_as_a_model_problem(self) -> None:
+        f = check_tool_calling(Probe(url=self.URL, error=ProbeError.REFUSED))
+        assert f.outcome is Outcome.UNREACHABLE
+
+    def test_the_anthropic_dialect_is_read_in_its_own_shape(self) -> None:
+        body = {"content": [{"type": "tool_use", "name": "read_file", "input": {"path": "/x"}}]}
+        assert check_tool_calling(
+            Probe(url="http://s/v1/messages", status=200, body=body), api=Api.ANTHROPIC
+        )
+
+    def test_anthropic_text_only_is_a_failure(self) -> None:
+        body = {"content": [{"type": "text", "text": "I cannot read files."}]}
+        f = check_tool_calling(
+            Probe(url="http://s/v1/messages", status=200, body=body), api=Api.ANTHROPIC
+        )
+        assert f.outcome is Outcome.TOOLS_IGNORED
+
+    def test_an_openai_shaped_reply_on_the_anthropic_path_is_not_credited(self) -> None:
+        """Reading the wrong dialect's key would pass a server that is in fact
+        answering the wrong endpoint."""
+        body = {"choices": [{"message": {"tool_calls": [self._call()]}}]}
+        f = check_tool_calling(
+            Probe(url="http://s/v1/messages", status=200, body=body), api=Api.ANTHROPIC
+        )
+        assert f.outcome is Outcome.TOOLS_IGNORED
+
+
+class TestTheToolProbeSpeaksEachDialect:
+    """`/v1/messages` is a translation shim, so sending it OpenAI-shaped tools
+    would test our own mistake rather than the server."""
+
+    def test_openai_nests_the_schema_under_function_parameters(self) -> None:
+        tool = Api.OPENAI.tool_probe_body("m")["tools"][0]
+        assert tool["type"] == "function"
+        assert tool["function"]["name"] == TOOL_PROBE_NAME
+        assert tool["function"]["parameters"]["type"] == "object"
+
+    def test_anthropic_puts_the_schema_at_input_schema(self) -> None:
+        tool = Api.ANTHROPIC.tool_probe_body("m")["tools"][0]
+        assert tool["name"] == TOOL_PROBE_NAME
+        assert tool["input_schema"]["type"] == "object"
+        assert "function" not in tool
+
+    def test_tool_choice_is_left_at_auto(self) -> None:
+        """Forcing it would test a path real clients do not use, and would hide
+        the failure worth catching: a model that CAN emit tool calls but never
+        decides to. Agents rely on auto."""
+        for api in (Api.OPENAI, Api.ANTHROPIC):
+            assert "tool_choice" not in api.tool_probe_body("m")
+
+    def test_the_probe_does_not_stream(self) -> None:
+        """check_tool_calling reads a whole JSON body; a streamed reply would
+        arrive as SSE frames and parse as nothing."""
+        assert Api.OPENAI.tool_probe_body("m")["stream"] is False
+
+
+class TestBufferingIsInvisibleWithoutTiming:
+    """A buffering proxy returns perfectly valid SSE - it just withholds it
+    until generation finishes. The body parses, the content is right, and the
+    agent shows nothing for thirty seconds before the whole answer appears.
+    Users read that as "the model is slow" and never suspect the proxy.
+    """
+
+    @staticmethod
+    def _frames(n: int, spread_s: float) -> list[StreamSample]:
+        step = spread_s / max(n - 1, 1)
+        return [
+            StreamSample(elapsed_s=i * step, line=f'data: {{"choices":[{{"delta":{i}}}]}}\n')
+            for i in range(n)
+        ]
+
+    def test_a_genuine_stream_passes(self) -> None:
+        f = check_streaming(self._frames(20, spread_s=2.0))
+        assert f.outcome is Outcome.OK
+
+    def test_frames_arriving_together_are_reported_as_buffered(self) -> None:
+        f = check_streaming(self._frames(20, spread_s=0.001))
+        assert f.outcome is Outcome.STREAM_BUFFERED
+        assert "buffering" in f.fix.lower()
+
+    def test_a_response_with_no_sse_frames_is_not_streaming_at_all(self) -> None:
+        f = check_streaming([StreamSample(0.1, '{"choices": [{"message": {}}]}')])
+        assert f.outcome is Outcome.STREAM_UNSUPPORTED
+
+    def test_no_output_at_all_is_also_reported(self) -> None:
+        assert check_streaming([]).outcome is Outcome.STREAM_UNSUPPORTED
+
+    def test_too_few_frames_refuses_to_judge_rather_than_guessing(self) -> None:
+        """A short reply cannot be told apart from a buffered one. Saying so is
+        honest; calling it buffered would fail a healthy server."""
+        f = check_streaming(self._frames(3, spread_s=0.001))
+        assert f.outcome is Outcome.OK
+        assert "too few" in f.detail
+
+    def test_the_threshold_is_where_the_docstring_says_it_is(self) -> None:
+        n = MIN_FRAMES_TO_JUDGE_TIMING
+        assert check_streaming(self._frames(n, BUFFERED_SPREAD_S * 2)).outcome is Outcome.OK
+        assert (
+            check_streaming(self._frames(n, BUFFERED_SPREAD_S / 2)).outcome
+            is Outcome.STREAM_BUFFERED
+        )
+
+    def test_keepalive_pings_are_not_mistaken_for_content(self) -> None:
+        """--sse-ping-interval emits comment lines. Counting them would make an
+        idle stream look healthy - and make a buffered one look spread out."""
+        pings = [StreamSample(elapsed_s=float(i), line=": ping\n") for i in range(30)]
+        assert check_streaming(pings).outcome is Outcome.STREAM_UNSUPPORTED
+
+    def test_the_done_sentinel_is_not_content(self) -> None:
+        samples = [StreamSample(elapsed_s=float(i), line="data: [DONE]\n") for i in range(30)]
+        assert check_streaming(samples).outcome is Outcome.STREAM_UNSUPPORTED
+
+    def test_blank_data_lines_are_not_content(self) -> None:
+        samples = [StreamSample(elapsed_s=float(i), line="data:  \n") for i in range(30)]
+        assert check_streaming(samples).outcome is Outcome.STREAM_UNSUPPORTED
+
+    def test_a_stream_padded_with_pings_is_still_judged_on_its_content(self) -> None:
+        """The pings are spread over 30s; the content frames are not. Judging
+        the mixture would hide the buffering."""
+        mixed: list[StreamSample] = []
+        for i in range(MIN_FRAMES_TO_JUDGE_TIMING):
+            mixed.append(StreamSample(elapsed_s=float(i), line=": ping\n"))
+            mixed.append(StreamSample(elapsed_s=10.0 + i * 0.0001, line='data: {"a":1}\n'))
+        assert check_streaming(mixed).outcome is Outcome.STREAM_BUFFERED
+
+
+class TestStreamProbeRecordsArrivalTimes:
+    """The IO half. `read()` returns the same bytes whether or not a proxy
+    buffered them, so reading incrementally is the entire mechanism - a
+    stream_probe that quietly fell back to read() would report every server as
+    healthy and the check would be decorative.
+    """
+
+    def test_it_reads_line_by_line_rather_than_whole(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: dict[str, object] = {}
+
+        def fake_probe(url, api_key=None, timeout=10.0, json_body=None, on_line=None):  # type: ignore[no-untyped-def]
+            seen["on_line"] = on_line
+            assert on_line is not None, "stream_probe must ask for incremental reads"
+            for i in range(5):
+                on_line(f'data: {{"i":{i}}}\n')
+            return Probe(url=url, status=200, body=None)
+
+        monkeypatch.setattr("localllm.client.probe", fake_probe)
+        result, samples = stream_probe("http://s/v1/chat/completions")
+        assert result.status == 200
+        assert len(samples) == 5
+        assert [s.line for s in samples][0].startswith("data:")
+
+    def test_arrival_times_are_recorded_and_never_go_backwards(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def fake_probe(url, api_key=None, timeout=10.0, json_body=None, on_line=None):  # type: ignore[no-untyped-def]
+            for i in range(4):
+                time.sleep(0.005)
+                on_line(f"data: {i}\n")
+            return Probe(url=url, status=200, body=None)
+
+        monkeypatch.setattr("localllm.client.probe", fake_probe)
+        _, samples = stream_probe("http://s/v1/chat/completions")
+        times = [s.elapsed_s for s in samples]
+        assert times == sorted(times)
+        assert times[-1] > times[0], "elapsed time must actually advance"
+
+    def test_it_stops_after_max_frames(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Generation length is the model's decision. A check a user runs after
+        `join` must not sit there until the model runs out of things to say."""
+        delivered = 0
+
+        def fake_probe(url, api_key=None, timeout=10.0, json_body=None, on_line=None):  # type: ignore[no-untyped-def]
+            nonlocal delivered
+            for i in range(1000):
+                delivered = i + 1
+                if not on_line(f"data: {i}\n"):
+                    break
+            return Probe(url=url, status=200, body=None)
+
+        monkeypatch.setattr("localllm.client.probe", fake_probe)
+        _, samples = stream_probe("http://s/v1/chat/completions", max_frames=6)
+        assert len(samples) == 6
+        assert delivered == 6, "reading must stop, not merely discard"
+
+    def test_a_refused_connection_comes_back_as_a_probe_not_an_empty_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Otherwise a server that is simply down would be reported as a
+        streaming fault, sending the user to look at their proxy."""
+
+        def fake_probe(url, api_key=None, timeout=10.0, json_body=None, on_line=None):  # type: ignore[no-untyped-def]
+            return Probe(url=url, error=ProbeError.REFUSED)
+
+        monkeypatch.setattr("localllm.client.probe", fake_probe)
+        result, samples = stream_probe("http://s/v1/chat/completions")
+        assert samples == ()
+        assert diagnose(result).outcome is Outcome.UNREACHABLE
+
+
+class TestProbeCanReadIncrementally:
+    """`on_line` lives on `probe` rather than in a second function so that the
+    API key is constructed in exactly one place."""
+
+    class _FakeResponse:
+        status = 200
+
+        def __init__(self, lines: list[bytes]) -> None:
+            self._lines = lines
+            self.read_called = False
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            return iter(self._lines)
+
+        def read(self):  # type: ignore[no-untyped-def]
+            self.read_called = True
+            return b"".join(self._lines)
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    def test_with_a_callback_it_never_calls_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        response = self._FakeResponse([b"data: a\n", b"data: b\n"])
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: response)
+        lines: list[str] = []
+        result = probe("http://s/x", on_line=lambda line: (lines.append(line), True)[1])
+        assert lines == ["data: a\n", "data: b\n"]
+        assert result.status == 200
+        assert not response.read_called, "read() would defeat the whole point"
+
+    def test_returning_false_stops_the_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        response = self._FakeResponse([b"a\n", b"b\n", b"c\n"])
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: response)
+        lines: list[str] = []
+
+        def once(line: str) -> bool:
+            lines.append(line)
+            return False
+
+        probe("http://s/x", on_line=once)
+        assert lines == ["a\n"]
+
+    def test_without_a_callback_the_body_is_still_parsed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        response = self._FakeResponse([b'{"ok": true}'])
+        monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: response)
+        assert probe("http://s/x").body == {"ok": True}
+
+
+class TestTheStreamingConstantsMustAgreeWithEachOther:
+    """Three constants encode one argument, and nothing linked them.
+
+    `stream_probe_body` asks for `STREAM_PROBE_MAX_TOKENS`. `check_streaming`
+    refuses to judge below `MIN_FRAMES_TO_JUDGE_TIMING` frames. Lower the first
+    below the second and the buffering check still passes every test in this
+    file while becoming permanently unable to detect buffering - it would answer
+    "too few frames to tell" forever, on every server, and read as healthy.
+
+    `BUFFERED_SPREAD_S` is justified in its own docstring by an arithmetic
+    claim about tokens per second. If someone widens it without redoing that
+    sum, the justification silently stops being true.
+    """
+
+    def test_the_request_asks_for_more_frames_than_the_judge_needs(self) -> None:
+        assert STREAM_PROBE_MAX_TOKENS > MIN_FRAMES_TO_JUDGE_TIMING, (
+            "the probe would never collect enough frames to judge buffering, and "
+            "the check would report 'too few frames' on every server forever"
+        )
+
+    def test_there_is_real_headroom_not_just_one_token(self) -> None:
+        """A model can stop early, and llama.cpp packs more than one token into
+        some frames. Scraping past the threshold exactly would make the check
+        depend on the model's choice of when to stop talking."""
+        assert STREAM_PROBE_MAX_TOKENS >= MIN_FRAMES_TO_JUDGE_TIMING * 4
+
+    def test_both_apis_ask_for_that_many_tokens(self) -> None:
+        for api in (Api.OPENAI, Api.ANTHROPIC):
+            assert api.stream_probe_body("m")["max_tokens"] == STREAM_PROBE_MAX_TOKENS
+
+    def test_the_streaming_probe_actually_asks_for_a_stream(self) -> None:
+        """It is one boolean between a working check and one that reads a whole
+        JSON body, finds no SSE frames and reports every server as broken."""
+        for api in (Api.OPENAI, Api.ANTHROPIC):
+            assert api.stream_probe_body("m")["stream"] is True
+
+    def test_the_threshold_matches_the_tokens_per_second_claim(self) -> None:
+        """The docstring justifies the threshold with a rate. n frames spread
+        over t seconds is n-1 intervals, not n - the first draft said "over 400
+        tok/s" when the real figure is 350, and nothing was checking."""
+        intervals = MIN_FRAMES_TO_JUDGE_TIMING - 1
+        implied_tok_per_s = intervals / BUFFERED_SPREAD_S
+        assert implied_tok_per_s == pytest.approx(350.0)
+
+    def test_the_threshold_stays_far_above_what_this_hardware_can_do(self) -> None:
+        """The property the arithmetic exists to guarantee. If the threshold
+        ever creeps into the range the hardware can actually reach, healthy
+        servers start being reported as buffered."""
+        fastest_plausible_tok_per_s = 40.0
+        implied = (MIN_FRAMES_TO_JUDGE_TIMING - 1) / BUFFERED_SPREAD_S
+        assert implied > fastest_plausible_tok_per_s * 5, (
+            f"the threshold now implies {implied:.0f} tok/s is suspicious, which is "
+            "too close to what this hardware genuinely reaches"
+        )
+
+    def test_a_stream_at_the_hardware_s_real_speed_is_not_called_buffered(self) -> None:
+        """The end the arithmetic exists to protect: 40 tok/s is the top of the
+        budgeted range, and must pass."""
+        fastest_plausible_tok_per_s = 40.0
+        n = MIN_FRAMES_TO_JUDGE_TIMING
+        spread = (n - 1) / fastest_plausible_tok_per_s
+        step = spread / (n - 1)
+        samples = [StreamSample(elapsed_s=i * step, line='data: {"a":1}\n') for i in range(n)]
+        assert check_streaming(samples).outcome is Outcome.OK
+
+
+class TestAProxyErrorPageIsNotAModelProblem:
+    """`check_inference` guards against a 200 that is not JSON. The tool check
+    did not, so a proxy returning an HTML error page - a routing fault - was
+    reported as "the model answered in prose", sending the user off to change
+    models over something no model could fix.
+    """
+
+    URL = "http://s/v1/chat/completions"
+
+    def test_html_is_reported_as_a_wrong_endpoint(self) -> None:
+        p = Probe(url=self.URL, status=200, body="<html><body>502 Bad Gateway</body></html>")
+        f = check_tool_calling(p)
+        assert f.outcome is Outcome.BAD_ENDPOINT
+        assert "proxy" in f.detail
+
+    def test_the_sibling_check_agrees(self) -> None:
+        """Both look at the same response; disagreeing would be worse than
+        either verdict alone."""
+        p = Probe(url=self.URL, status=200, body="<html>502</html>")
+        assert check_inference(p).outcome is check_tool_calling(p).outcome
+
+    def test_a_json_list_is_also_not_a_completion(self) -> None:
+        p = Probe(url=self.URL, status=200, body=[1, 2, 3])
+        assert check_tool_calling(p).outcome is Outcome.BAD_ENDPOINT
+
+    def test_a_real_json_reply_is_still_judged_on_its_tool_calls(self) -> None:
+        p = Probe(url=self.URL, status=200, body={"choices": [{"message": {"content": "no"}}]})
+        assert check_tool_calling(p).outcome is Outcome.TOOLS_IGNORED

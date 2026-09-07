@@ -13,12 +13,14 @@ wording change without catching a single real fault.
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 
 import pytest
 
 from localllm.budget import Hardware, Plan, solve
 from localllm.catalogue import GPT_OSS_20B
-from localllm.cli import main
+from localllm.cli import build_parser, main
 from localllm.constants import CLAUDE_ALIAS_SUBSTRING, MODEL_ALIAS
 from localllm.handoff import resolve_model
 from localllm.join import build_client_config
@@ -145,11 +147,45 @@ class TestCheckCommandWiring:
     def _fake_probe(responses: dict[str, object]):  # type: ignore[no-untyped-def]
         from localllm.client import Probe
 
-        def fake(url: str, api_key: str | None = None, timeout: float = 10.0, json_body=None):  # type: ignore[no-untyped-def]
+        def fake(  # type: ignore[no-untyped-def]
+            url: str,
+            api_key: str | None = None,
+            timeout: float = 10.0,
+            json_body=None,
+            on_line=None,
+        ):
+            # A tool-calling request goes to the same URL as a plain one, so the
+            # body is the only thing that distinguishes them.
+            if json_body is not None and json_body.get("tools"):
+                key = "/tools"
+            else:
+                key = url
             for fragment, body in responses.items():
-                if fragment in url:
+                if fragment in key or (key != url and fragment == key):
                     return Probe(url=url, status=200, body=body)
             return Probe(url=url, status=404)
+
+        return fake
+
+    @staticmethod
+    def _fake_stream(frames: int = 12, spread_s: float = 1.2):  # type: ignore[no-untyped-def]
+        """A healthy stream: frames genuinely spread out over time."""
+        from localllm.client import Probe, StreamSample
+
+        def fake(  # type: ignore[no-untyped-def]
+            url: str,
+            api_key: str | None = None,
+            timeout: float = 10.0,
+            json_body=None,
+            max_frames: int = 400,
+            max_seconds: float = 120.0,
+        ):
+            step = spread_s / max(frames - 1, 1)
+            samples = tuple(
+                StreamSample(elapsed_s=i * step, line=f'data: {{"choices":[{{"delta":{i}}}]}}\n')
+                for i in range(frames)
+            )
+            return Probe(url=url, status=200, body=None), samples
 
         return fake
 
@@ -161,11 +197,33 @@ class TestCheckCommandWiring:
                     "/health": {"status": "ok"},
                     "/v1/models": {"data": [{"id": alias}]},
                     "/slots": [{"id": 0}],
+                    "/tools": {
+                        "choices": [
+                            {
+                                "message": {
+                                    "tool_calls": [
+                                        {
+                                            "id": "c1",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": '{"path": "/srv/notes/build-id.txt"}',
+                                            },
+                                        }
+                                    ]
+                                }
+                            }
+                        ],
+                        "content": [
+                            {"type": "tool_use", "name": "read_file", "input": {"path": "/x"}}
+                        ],
+                    },
                     "/v1/chat/completions": {"choices": [{"message": {"content": "ok"}}]},
                     "/v1/messages": {"content": [{"type": "text", "text": "ok"}]},
                 }
             ),
         )
+        monkeypatch.setattr("localllm.cli.stream_probe", self._fake_stream())
 
     def test_a_healthy_server_passes(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -1398,3 +1456,323 @@ class TestARejectedKeyDuringJoinIsFatal:
         code, _ = self._join(tmp_path, capsys, "--no-probe")
         assert code == 0
         assert (tmp_path / "client" / "opencode.json").exists()
+
+
+class TestCheckProvesTheAgentWorksNotJustTheConnection:
+    """Reachable, authorised and able to answer "ok" is what every other check
+    establishes - and none of it is what a coding agent needs. Agents call
+    tools and they stream. Both fail independently of plain generation, and
+    both fail silently: prose where a function call belonged, or a reply that
+    appears to hang while a proxy holds it back.
+    """
+
+    HEALTHY = {
+        "/health": {"status": "ok"},
+        "/v1/models": {"data": [{"id": "claude-local-coder"}]},
+        "/slots": [{"id": 0}],
+        "/v1/chat/completions": {"choices": [{"message": {"content": "ok"}}]},
+    }
+
+    TOOL_CALL = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": '{"path": "/a"}'},
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+    def _wire(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        tool_reply: object,
+        stream_spread_s: float = 2.0,
+        stream_frames: int = 20,
+        props: object | None = None,
+    ) -> None:
+        w = TestCheckCommandWiring()
+        responses = dict(self.HEALTHY)
+        responses["/tools"] = tool_reply
+        if props is not None:
+            responses["/props"] = props
+        monkeypatch.setattr("localllm.cli.probe", w._fake_probe(responses))
+        monkeypatch.setattr(
+            "localllm.cli.stream_probe", w._fake_stream(stream_frames, stream_spread_s)
+        )
+
+    def test_a_model_that_answers_in_prose_fails_the_check(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """This server passes every other check. It is still useless."""
+        self._wire(monkeypatch, tool_reply={"choices": [{"message": {"content": "I cannot."}}]})
+        code, out = run(["check", "--server", "http://s:8080", "--api-key", "k"], capsys)
+        assert code == 1
+        assert "calls tools" in out
+        assert "prose" in out
+
+    def test_malformed_tool_arguments_fail_the_check(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        broken = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {"type": "function", "function": {"name": "f", "arguments": "{"}}
+                        ]
+                    }
+                }
+            ]
+        }
+        self._wire(monkeypatch, tool_reply=broken)
+        code, out = run(["check", "--server", "http://s:8080", "--api-key", "k"], capsys)
+        assert code == 1
+        assert "quantisation" in out
+
+    def test_a_buffering_proxy_fails_the_check(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Valid SSE, correct content, and completely unusable - the agent shows
+        nothing until generation ends."""
+        self._wire(monkeypatch, tool_reply=self.TOOL_CALL, stream_spread_s=0.0005)
+        code, out = run(["check", "--server", "http://s:8080", "--api-key", "k"], capsys)
+        assert code == 1
+        assert "streams" in out
+        assert "buffering" in out.lower()
+
+    def test_a_healthy_agent_path_passes(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._wire(monkeypatch, tool_reply=self.TOOL_CALL)
+        code, out = run(["check", "--server", "http://s:8080", "--api-key", "k"], capsys)
+        assert code == 0
+        assert "calls tools" in out
+        assert "All checks passed" in out
+
+    def test_the_agent_checks_can_be_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._wire(monkeypatch, tool_reply={"choices": [{"message": {"content": "I cannot."}}]})
+        code, out = run(
+            ["check", "--server", "http://s:8080", "--api-key", "k", "--no-agent-checks"], capsys
+        )
+        assert code == 0
+        assert "calls tools" not in out
+
+    def test_no_inference_also_skips_them(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """They are inference. Skipping generation but still spending two
+        requests on tools and streaming would make the flag a lie."""
+        self._wire(monkeypatch, tool_reply={"choices": [{"message": {"content": "I cannot."}}]})
+        code, out = run(
+            ["check", "--server", "http://s:8080", "--api-key", "k", "--no-inference"], capsys
+        )
+        assert code == 0
+        assert "calls tools" not in out
+        assert "streams" not in out
+
+    def test_the_free_tool_template_signal_is_reported(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._wire(
+            monkeypatch,
+            tool_reply=self.TOOL_CALL,
+            props={
+                "default_generation_settings": {"n_ctx": 32768},
+                "total_slots": 3,
+                "chat_template_tool_use": "{% for m in messages %}",
+            },
+        )
+        code, out = run(["check", "--server", "http://s:8080", "--api-key", "k"], capsys)
+        assert code == 0
+        assert "tool-use template" in out
+
+    def test_a_missing_tool_template_is_not_announced_as_a_problem(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Absence collapses two causes and the tool call settles it anyway.
+        Reporting it would scare users off a model that works."""
+        self._wire(
+            monkeypatch,
+            tool_reply=self.TOOL_CALL,
+            props={"default_generation_settings": {"n_ctx": 32768}, "total_slots": 3},
+        )
+        code, out = run(["check", "--server", "http://s:8080", "--api-key", "k"], capsys)
+        assert code == 0
+        assert "tool-use template" not in out
+
+
+class TestEveryCommandWeTellUsersToRunExists:
+    """A doctor that ends with "now run `localllm caddyfile`" is worse than one
+    that says nothing: the user runs it, argparse rejects it, and now they
+    distrust the diagnosis as well.
+
+    Two such strings shipped in this file's own findings and neither test nor
+    reviewer caught them - they are plain prose inside a string literal, so
+    nothing on earth was checking them. This walks the source for every command
+    we quote and asks argparse whether it is real.
+    """
+
+    PATTERN = re.compile(r"`localllm ([a-z][a-z0-9 -]*)`")
+
+    @staticmethod
+    def _sources() -> list[Path]:
+        root = Path(__file__).resolve().parents[1] / "src" / "localllm"
+        return sorted(root.glob("*.py"))
+
+    @classmethod
+    def _quoted_commands(cls) -> set[tuple[str, ...]]:
+        found: set[tuple[str, ...]] = set()
+        for path in cls._sources():
+            for match in cls.PATTERN.finditer(path.read_text(encoding="utf-8")):
+                words = tuple(w for w in match.group(1).split() if not w.startswith("-"))
+                if words:
+                    found.add(words)
+        return found
+
+    @staticmethod
+    def _is_real(words: tuple[str, ...]) -> bool:
+        parser = build_parser()
+        try:
+            parser.parse_args([*words, "--help"])
+        except SystemExit as exit_:
+            return exit_.code == 0
+        return True
+
+    def test_the_scan_actually_finds_commands(self) -> None:
+        """Guard the guard: a regex that matched nothing would pass silently
+        while checking nothing at all."""
+        found = self._quoted_commands()
+        assert len(found) >= 3, f"the scan found only {found}"
+
+    def test_every_quoted_command_is_a_real_command(self) -> None:
+        bad = sorted(" ".join(w) for w in self._quoted_commands() if not self._is_real(w))
+        assert not bad, f"these are quoted in the source but argparse rejects them: {bad}"
+
+    def test_the_check_would_catch_an_invented_command(self) -> None:
+        """Both real defects were of exactly this shape."""
+        assert not self._is_real(("recommend",))
+        assert not self._is_real(("caddyfile",))
+        assert self._is_real(("key", "caddyfile"))
+        assert self._is_real(("plan",))
+
+
+class TestWeNeverTellUsersToPickTheClientWeCannotConfigure:
+    """The recommendation table, `recommend_client_for` and the decision record
+    all agree that Cline cannot be configured from a file. Three literal
+    instruction strings did not: `key add`, the invite, and the setup guide each
+    ended with `--client cline`.
+
+    So the product's own next step steered every user to the one client that
+    then prints "this cannot be configured from a file". Being right in the
+    table and wrong in the instruction is worse than being consistently wrong,
+    because the table is what a reviewer reads and the instruction is what a
+    user runs.
+    """
+
+    INSTRUCTION = re.compile(r"localllm[^\"'\n]*?--client (\w+)")
+
+    @staticmethod
+    def _sources() -> list[Path]:
+        root = Path(__file__).resolve().parents[1] / "src" / "localllm"
+        return sorted(root.glob("*.py"))
+
+    def test_no_instruction_names_a_client_that_writes_no_config(self) -> None:
+        from localllm.join import CLIENTS
+
+        offenders: list[str] = []
+        for path in self._sources():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                for name in self.INSTRUCTION.findall(line):
+                    profile = CLIENTS.get(name)
+                    if profile is not None and not profile.writes_config:
+                        offenders.append(f"{path.name}: {line.strip()[:90]}")
+        assert not offenders, "these tell the user to run a client we cannot configure: " + str(
+            offenders
+        )
+
+    def test_the_scan_sees_the_instructions_it_is_policing(self) -> None:
+        """Guard the guard: a regex matching nothing would pass forever."""
+        found = {
+            name
+            for path in self._sources()
+            for name in self.INSTRUCTION.findall(path.read_text(encoding="utf-8"))
+        }
+        assert found, "the scan found no --client instruction at all"
+
+    def test_the_regex_would_have_caught_the_real_defect(self) -> None:
+        assert self.INSTRUCTION.findall(
+            'print("Next: localllm join --client cline --device x")'
+        ) == ["cline"]
+        guide_line = 'command="localllm join --invite <t> --client cline"'
+        assert self.INSTRUCTION.findall(guide_line) == ["cline"]
+
+
+class TestTheInvitePointsAtTheOneCommandPath:
+    """`localllm client <token>` picks the agent from the model in the invite,
+    checks Node or VS Code is present and writes a real config. The invite was
+    still telling users to run `join --client cline` by hand - the longer path,
+    ending at the one client that cannot be configured from a file.
+
+    Nothing tested the invite's closing instruction, which is how it stayed
+    wrong through the whole feature that replaced it.
+    """
+
+    @staticmethod
+    def _plan(tmp_path: Path) -> Path:
+        from localllm.handoff import ServerPlan
+        from localllm.keys import KeyStore
+
+        plan = ServerPlan(
+            context_per_slot=8192,
+            n_slots=2,
+            model_alias=MODEL_ALIAS,
+            model_id="m",
+            kv_quant="q8_0",
+            ctx_size_flag=16384,
+        ).write(tmp_path / "deploy")
+        KeyStore(tmp_path / "keys.json").write_api_key_file(tmp_path / "deploy" / "keys.txt")
+        return plan
+
+    def _invite(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> str:
+        plan = self._plan(tmp_path)
+        code, out = run(
+            [
+                "invite",
+                "laptop-1",
+                "--url",
+                "http://msi:8080",
+                "--plan",
+                str(plan),
+                "--store",
+                str(tmp_path / "keys.json"),
+            ],
+            capsys,
+        )
+        assert code == 0, out
+        return out
+
+    def test_it_offers_the_single_command(self, tmp_path: Path, capsys) -> None:
+        assert "localllm client " in self._invite(tmp_path, capsys)
+
+    def test_it_no_longer_hand_rolls_a_join(self, tmp_path: Path, capsys) -> None:
+        out = self._invite(tmp_path, capsys)
+        assert "--client cline" not in out
+
+    def test_the_token_is_carried_into_the_command_it_suggests(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        """A suggestion the user has to splice a token into by hand is how the
+        token gets truncated in the first place."""
+        out = self._invite(tmp_path, capsys)
+        token = next(line.strip() for line in out.splitlines() if line.strip().startswith("llmi1_"))
+        assert f"localllm client {token}" in out

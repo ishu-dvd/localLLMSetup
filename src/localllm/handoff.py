@@ -159,6 +159,20 @@ class ServerFacts:
     context_per_slot: int
     n_slots: int
     model_alias: str
+    tool_template: bool = False
+    """Whether `/props` advertised `chat_template_tool_use`.
+
+    llama.cpp only sets that key when jinja is on **and** the loaded model ships
+    a tool-use template (`server-context.cpp`, guarded by `if (params.use_jinja)`
+    then `if (!tmpl_tools.empty())`). So its presence is a free, zero-inference
+    answer to "can this model drive a coding agent" — the question every client
+    this project recommends depends on and none of them ask.
+
+    Its absence is not proof of the opposite: it collapses two causes (`--no-jinja`,
+    or a model with no dedicated tool template) that only an actual tool call can
+    tell apart. Treat it as good news when present and as a prompt to check
+    properly when not.
+    """
 
 
 def read_props(body: Any) -> ServerFacts | None:
@@ -186,10 +200,12 @@ def read_props(body: Any) -> ServerFacts | None:
     if not isinstance(slots, int) or isinstance(slots, bool) or slots <= 0:
         slots = 1
     alias = body.get("model_alias")
+    template = body.get("chat_template_tool_use")
     return ServerFacts(
         context_per_slot=n_ctx,
         n_slots=slots,
         model_alias=str(alias) if isinstance(alias, str) and alias else "",
+        tool_template=isinstance(template, str) and bool(template.strip()),
     )
 
 

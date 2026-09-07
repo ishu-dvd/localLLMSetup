@@ -33,9 +33,26 @@ from pathlib import Path
 
 from .budget import Fit, Hardware, Plan, recommend, solve
 from .catalogue import CATALOGUE, model_from_gguf
-from .client import Api, Outcome, check_inference, check_model_visibility, diagnose, probe
+from .client import (
+    Api,
+    Finding,
+    Outcome,
+    check_inference,
+    check_model_visibility,
+    check_streaming,
+    check_tool_calling,
+    diagnose,
+    probe,
+    stream_probe,
+)
 from .constants import MODEL_ALIAS
 from .detect import detect
+from .elevate import (
+    elevated_relaunch_command,
+    plan_service_install,
+    run_service_scripts,
+    summarise,
+)
 from .gguf import GgufError, read_gguf_file, read_gguf_url
 from .guide import client_guide, find_gguf, server_guide
 from .handoff import (
@@ -76,6 +93,8 @@ from .join import (
 from .keys import DeviceExistsError, DeviceNotFoundError, KeyStore
 from .serve import (
     MIN_LLAMA_BUILD,
+    SERVICE_SCRIPTS,
+    WATCHDOG_LOOP_FILENAME,
     build_is_recent_enough,
     preflight,
     probe_free_disk_gb,
@@ -83,6 +102,7 @@ from .serve import (
     probe_service_installed,
     render_nssm_script,
     render_powercfg_script,
+    render_watchdog_install_script,
     render_watchdog_script,
 )
 from .speed import context_speed_curve
@@ -617,6 +637,13 @@ def cmd_check(args: argparse.Namespace) -> int:
                 f"{facts.context_per_slot:,} available per slot"
             )
 
+        # Free, and nobody else asks it: llama.cpp only advertises this key when
+        # jinja is on AND the model ships a tool-use template. Absence is
+        # ambiguous - see ServerFacts.tool_template - so only the good news is
+        # worth a line here. The tool-calling check below settles the rest.
+        if facts is not None and facts.tool_template:
+            print("  [ok  ] the model ships a dedicated tool-use template")
+
     if worst == 0:
         # Capacity is informational: a request beyond -np queues rather than
         # failing, so a busy server is not a broken one - but the resulting
@@ -644,6 +671,43 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"         {finding.detail}")
         if not finding:
             print(f"         -> {finding.fix}")
+            worst = 1
+
+    if worst == 0 and not args.no_inference and not args.no_agent_checks:
+        # Everything above proves the server is reachable and will talk. Neither
+        # proves a coding agent will work, because agents do not chat - they call
+        # tools, and they stream. Those two paths fail independently of plain
+        # generation and produce no error a user can act on: the agent connects,
+        # then either answers in prose where a function call was expected or
+        # appears to hang while a proxy holds the whole reply back.
+        def report(label: str, finding: Finding) -> bool:
+            mark = "ok  " if finding else "FAIL"
+            print(f"  [{mark}] {label}")
+            print(f"         {finding.detail}")
+            if not finding:
+                print(f"         -> {finding.fix}")
+            return bool(finding)
+
+        tools = probe(
+            f"{base}{api.completion_path}",
+            api_key=api_key,
+            json_body=api.tool_probe_body(model),
+            timeout=args.inference_timeout,
+        )
+        if not report("the model calls tools", check_tool_calling(tools, api=api)):
+            worst = 1
+
+        streamed, samples = stream_probe(
+            f"{base}{api.completion_path}",
+            api_key=api_key,
+            json_body=api.stream_probe_body(model),
+            timeout=args.inference_timeout,
+        )
+        transport = diagnose(streamed)
+        if not report(
+            "the reply streams as it is generated",
+            transport if not transport else check_streaming(samples),
+        ):
             worst = 1
 
     print("\nAll checks passed." if worst == 0 else "\nSee the suggested fix above.")
@@ -710,7 +774,11 @@ def cmd_up(args: argparse.Namespace) -> int:
             working_dir=str(out.resolve()),
             log_dir=str((out / "logs").resolve()),
         ),
-        "03-watchdog.ps1": render_watchdog_script(),
+        "03-install-watchdog.ps1": render_watchdog_install_script(
+            loop_script=str((out / WATCHDOG_LOOP_FILENAME).resolve()),
+            log_dir=str((out / "logs").resolve()),
+        ),
+        WATCHDOG_LOOP_FILENAME: render_watchdog_script(),
         "llama-server-flags.txt": flags + "\n",
         # The number each client must pin. Without this, `join` had no way to
         # know what was decided here and fell back to a default that was right
@@ -723,14 +791,43 @@ def cmd_up(args: argparse.Namespace) -> int:
     print(f"wrote {key_file}")
 
     print("\nRun these as Administrator, in order:")
-    for name in ("01-powercfg.ps1", "02-install-service.ps1", "03-watchdog.ps1"):
+    for name in SERVICE_SCRIPTS:
         print(f"  .\\{name}")
+    print("\nOr let it do that for you:")
+    print(f"  localllm service install --dir {out}")
     print(
         f"\nThen invite each laptop - one token carries this "
         f"{verdict.plan.context_per_slot:,}-token window, its key and the model id:"
     )
     print("  localllm invite <laptop-name> --url http://<this-machine>:8080")
     return 0
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    """Run the Administrator half of setup, or say precisely why it cannot."""
+    install = plan_service_install(Path(args.dir))
+
+    print(f"Service scripts in {install.directory}\n")
+    for name in SERVICE_SCRIPTS:
+        mark = "found  " if name in install.present else "MISSING"
+        print(f"  [{mark}] {name}")
+
+    if args.dry_run:
+        print("\nDry run: nothing was executed.")
+        return 0 if install.complete else 1
+
+    if not install.ready:
+        print(f"\nCannot run them: {install.blocker}")
+        if install.complete and install.elevated is False:
+            print("\nRe-run elevated with:\n")
+            print(f"  {elevated_relaunch_command(install.directory)}")
+        return 1
+
+    print()
+    results = run_service_scripts(install)
+    print()
+    print(summarise(results, total=len(install.present)))
+    return 0 if results and all(r.ok for r in results) else 1
 
 
 def _refresh_key_file(store: KeyStore, key_file: Path, service_name: str) -> list[str]:
@@ -771,7 +868,7 @@ def cmd_key(args: argparse.Namespace) -> int:
             return 1
         print(f"{entry.device}\t{entry.key}")
         print(f"\nStore: {store.path}")
-        print(f"Next: localllm join --client cline --device {entry.device} --url <server-url>")
+        print(f"Next: localllm join --client opencode --device {entry.device} --url <server-url>")
         return 0
 
     if args.key_command == "revoke":
@@ -951,7 +1048,7 @@ def cmd_invite(args: argparse.Namespace) -> int:
     print(f"This is a password. It contains {args.device}'s API key - send it over")
     print("something private, and revoke it with `localllm key revoke` if it leaks.\n")
     print(f"On {args.device}, run:")
-    print(f"  localllm join --invite {token} --client cline\n")
+    print(f"  localllm client {token}\n")
     print(
         f"That pins {plan.context_per_slot:,} tokens of context - the share this "
         f"server actually gives each of its {plan.n_slots} slot(s)."
@@ -1679,6 +1776,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the generation check (which occupies a slot briefly)",
     )
     check.add_argument(
+        "--no-agent-checks",
+        action="store_true",
+        help="skip the tool-calling and streaming checks - the two that decide "
+        "whether a coding agent works, rather than merely connects",
+    )
+    check.add_argument(
         "--inference-timeout",
         type=float,
         default=60.0,
@@ -1697,6 +1800,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="the device-key store whose keys are baked into the server's key file",
     )
     up.set_defaults(func=cmd_up)
+
+    service = sub.add_parser(
+        "service",
+        help="on the server: run the Administrator half of setup",
+    )
+    ssub = service.add_subparsers(dest="service_cmd", required=True)
+    s_ins = ssub.add_parser(
+        "install",
+        help="run the numbered scripts `up` wrote, in order (needs Administrator)",
+    )
+    s_ins.add_argument(
+        "--dir",
+        type=Path,
+        default=Path("deploy"),
+        help="where `localllm up` wrote them (default: ./deploy)",
+    )
+    s_ins.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report which scripts are present and whether this shell can run them",
+    )
+    service.set_defaults(func=cmd_service)
 
     key = sub.add_parser("key", help="issue, list and revoke per-device API keys")
     key.add_argument("--store", type=Path, default=DEFAULT_STORE)

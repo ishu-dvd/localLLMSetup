@@ -186,7 +186,8 @@ localllm up --llama-server C:\ai\llama-server.exe
 |---|---|
 | `01-powercfg.ps1` | never sleep on AC; **lid close = do nothing** |
 | `02-install-service.ps1` | NSSM service, boot-start, restart-on-failure, log rotation |
-| `03-watchdog.ps1` | alerts on page-file thrash via `\Memory\Pages Input/sec` |
+| `03-install-watchdog.ps1` | registers the watchdog loop as its own NSSM service |
+| `watchdog-loop.ps1` | the loop itself — **unnumbered, never run directly** (`while ($true)`) |
 | `llama-server-flags.txt` | the exact invocation from the solver |
 
 **Preflight gates the four silent failure modes:**

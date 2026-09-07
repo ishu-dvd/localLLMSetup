@@ -368,6 +368,180 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "return False",
         "reporting access-denied as missing sends the user to reinstall a running service",
     ),
+    # --- client.py: does the agent path actually work? ----------------------
+    (
+        "src/localllm/client.py",
+        'return bool(payload) and payload != "[DONE]"',
+        "return True",
+        "counting [DONE] and keep-alives as content makes an idle stream look healthy",
+    ),
+    (
+        "src/localllm/client.py",
+        "if len(frames) < MIN_FRAMES_TO_JUDGE_TIMING:",
+        "if len(frames) < 0:",
+        "judging two frames as buffered fails healthy servers with short replies",
+    ),
+    (
+        "src/localllm/client.py",
+        "spread = frames[-1].elapsed_s - frames[0].elapsed_s",
+        "spread = samples[-1].elapsed_s - samples[0].elapsed_s",
+        "timing the keep-alives instead of the content hides buffering entirely",
+    ),
+    (
+        "src/localllm/client.py",
+        "if spread < BUFFERED_SPREAD_S:",
+        "if spread < 0:",
+        "a buffering proxy would be reported as a healthy stream",
+    ),
+    (
+        "src/localllm/client.py",
+        "STREAM_PROBE_MAX_TOKENS = 48",
+        "STREAM_PROBE_MAX_TOKENS = 4",
+        "too few tokens to ever reach the judging threshold disables the check silently",
+    ),
+    (
+        "src/localllm/client.py",
+        "MIN_FRAMES_TO_JUDGE_TIMING = 8",
+        "MIN_FRAMES_TO_JUDGE_TIMING = 500",
+        "a threshold above the token budget makes buffering permanently unjudgeable",
+    ),
+    (
+        "src/localllm/client.py",
+        '"stream": True,',
+        '"stream": False,',
+        "a non-streaming request returns JSON, so no frame ever arrives",
+    ),
+    (
+        "src/localllm/client.py",
+        'return [c for c in content if isinstance(c, dict) and c.get("type") == "tool_use"]',
+        "return [c for c in content if isinstance(c, dict)]",
+        "counting Anthropic text blocks as tool calls passes a model that never called one",
+    ),
+    (
+        "src/localllm/client.py",
+        "if not isinstance(parsed, dict):",
+        "if False:",
+        "arguments that parse to a list would be handed to an agent expecting an object",
+    ),
+    (
+        "src/localllm/client.py",
+        "if not isinstance(raw, str):",
+        "if False:",
+        "pre-parsed arguments break every client that calls json.loads on them",
+    ),
+    (
+        "src/localllm/client.py",
+        "if api is Api.ANTHROPIC:\n        return None",
+        "if True:\n        return None",
+        "skipping argument validation on the OpenAI path is the whole check",
+    ),
+    (
+        "src/localllm/client.py",
+        "if on_line is not None:",
+        "if False:",
+        "falling back to read() makes buffering invisible - the point of the check",
+    ),
+    (
+        "src/localllm/client.py",
+        "return len(samples) < max_frames and elapsed < max_seconds",
+        "return True",
+        "never stopping lets a talkative model hang the check indefinitely",
+    ),
+    (
+        "src/localllm/client.py",
+        'return {"name": TOOL_PROBE_NAME, "description": description, "input_schema": schema}',
+        'return {"name": TOOL_PROBE_NAME, "description": description, "parameters": schema}',
+        "the Anthropic dialect puts the schema at input_schema, not parameters",
+    ),
+    (
+        "src/localllm/client.py",
+        "if not isinstance(result.body, dict):",
+        "if False:",
+        "an HTML proxy error page would be reported as the model answering in prose",
+    ),
+    # --- handoff.py: the free tool-template signal ---------------------------
+    (
+        "src/localllm/handoff.py",
+        "tool_template=isinstance(template, str) and bool(template.strip()),",
+        "tool_template=template is not None,",
+        "an empty template string would be reported as a tool-capable model",
+    ),
+    # --- cli.py: the checks have to affect the exit code ---------------------
+    (
+        "src/localllm/cli.py",
+        'if not report("the model calls tools", check_tool_calling(tools, api=api)):\n'
+        "            worst = 1",
+        'report("the model calls tools", check_tool_calling(tools, api=api))',
+        "a failing tool check that still exits 0 is decorative",
+    ),
+    (
+        "src/localllm/cli.py",
+        "if worst == 0 and not args.no_inference and not args.no_agent_checks:",
+        "if worst == 0 and not args.no_inference:",
+        "--no-agent-checks would spend two requests it promised to skip",
+    ),
+    # --- elevate.py: the Administrator half ---------------------------------
+    (
+        "src/localllm/elevate.py",
+        'if sys.platform != "win32":\n        return None',
+        "if False:\n        return None",
+        "claiming elevation off Windows would run the scripts where they cannot work",
+    ),
+    (
+        "src/localllm/elevate.py",
+        "return self.complete and self.elevated is True",
+        "return self.complete",
+        "running unelevated leaves a half-registered service, which is why it refuses",
+    ),
+    (
+        "src/localllm/elevate.py",
+        "if code != 0:\n            break",
+        "if False:\n            break",
+        "carrying on past a failed 02 registers a watchdog for a service that is not there",
+    ),
+    (
+        "src/localllm/elevate.py",
+        "if self.missing:\n            return (",
+        "if False:\n            return (",
+        "telling someone to elevate when `up` was never run sends them to the wrong place",
+    ),
+    (
+        "src/localllm/elevate.py",
+        '("-NoProfile", "-ExecutionPolicy", "Bypass", "-File")',
+        '("-NoProfile", "-File")',
+        "a stock Windows refuses to run an unsigned .ps1 without Bypass",
+    ),
+    (
+        "src/localllm/elevate.py",
+        "inner = f'localllm service install --dir \"{directory}\"'",
+        "inner = f\"localllm service install --dir '{directory}'\"",
+        "reusing the enclosing quote mangles -ArgumentList into three broken arguments",
+    ),
+    (
+        "src/localllm/elevate.py",
+        "sys.stdout.flush()\n    sys.stderr.flush()",
+        "pass",
+        "without the flush a script's output appears above the line announcing it",
+    ),
+    # --- serve.py: a numbered script is one you run --------------------------
+    (
+        "src/localllm/serve.py",
+        'WATCHDOG_LOOP_FILENAME = "watchdog-loop.ps1"',
+        'WATCHDOG_LOOP_FILENAME = "03-watchdog.ps1"',
+        "numbering the loop puts a script that never exits back in the run sequence",
+    ),
+    (
+        "src/localllm/serve.py",
+        '    "03-install-watchdog.ps1",\n)',
+        '    "03-install-watchdog.ps1",\n    WATCHDOG_LOOP_FILENAME,\n)',
+        "the loop in the run sequence is the original defect: a terminal that never returns",
+    ),
+    (
+        "src/localllm/serve.py",
+        '+ \' "powershell.exe" "-NoProfile -ExecutionPolicy Bypass -File \'',
+        '+ \' "cmd.exe" "-NoProfile -ExecutionPolicy Bypass -File \'',
+        "NSSM runs executables, not scripts - the loop needs a shell that can host a .ps1",
+    ),
 ]
 
 

@@ -27,6 +27,11 @@
 .PARAMETER DryRun
   Show the plan and the download size, then stop. Nothing is written.
 
+.PARAMETER NoService
+  Skip the Administrator step at the end. The server will not start on boot,
+  and the laptop will still sleep - use this only if you intend to run
+  `localllm service install` yourself later.
+
 .EXAMPLE
   .\setup.ps1 -Devices 2 -DryRun
   .\setup.ps1 -Devices 2
@@ -38,7 +43,8 @@ param(
     [string] $Model   = '',
     [int]    $Context = 32768,
     [string] $Url     = '',
-    [switch] $DryRun
+    [switch] $DryRun,
+    [switch] $NoService
 )
 
 $ErrorActionPreference = 'Stop'
@@ -114,5 +120,48 @@ if ($code -ne 0) {
     Write-Host ''
     Warn "Setup stopped with exit code $code. Nothing above this line was undone -"
     Warn 're-running this script picks up where it left off.'
+    exit $code
 }
-exit $code
+
+if ($DryRun -or $NoService) { exit 0 }
+
+# The half that actually makes the machine serve: power settings, the service,
+# and the watchdog. It needs Administrator, so this either runs it directly
+# (already elevated) or asks for consent through UAC once. Declining leaves a
+# working install that simply does not start on boot - and says so.
+Say 'Installing the service (needs Administrator)'
+$deploy = Join-Path $Dir 'deploy'
+$identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+$elevated = $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if ($elevated) {
+    & $pythonCmd @($pythonArgs + @('-m', 'localllm', 'service', 'install', '--dir', $deploy))
+    $svc = $LASTEXITCODE
+} else {
+    Write-Host '    A UAC prompt is about to ask for Administrator. Decline it and'
+    Write-Host '    nothing is changed - the rest of the setup is already done.'
+    $inner = "-m localllm service install --dir `"$deploy`""
+    try {
+        $p = Start-Process -FilePath $pythonCmd `
+            -ArgumentList (@($pythonArgs) + @($inner)) `
+            -Verb RunAs -Wait -PassThru -ErrorAction Stop
+        $svc = $p.ExitCode
+    } catch {
+        Warn 'Administrator was declined, so the service was not installed.'
+        Write-Host ''
+        Write-Host '  Everything else is done. To finish later, run this in an'
+        Write-Host '  Administrator PowerShell:'
+        Write-Host ''
+        Write-Host "    localllm service install --dir `"$deploy`""
+        exit 0
+    }
+}
+
+if ($svc -ne 0) {
+    Write-Host ''
+    Warn 'The service scripts did not all succeed. The output above says which.'
+    Warn "Re-run just that part with:  localllm service install --dir `"$deploy`""
+    exit $svc
+}
+
+exit 0

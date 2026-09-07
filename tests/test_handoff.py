@@ -308,3 +308,38 @@ def test_a_non_positive_context_is_refused_even_with_nothing_else_known():
     choice = resolve_context(requested=0)
     assert not choice
     assert choice.context == FALLBACK_CONTEXT
+
+
+class TestTheToolTemplateSignalIsFree:
+    """llama.cpp only advertises `chat_template_tool_use` when jinja is on AND
+    the loaded model ships a tool-use template. That single key answers "can
+    this model drive a coding agent" without spending a token, and we were
+    already fetching /props and throwing it away.
+    """
+
+    BASE = {"default_generation_settings": {"n_ctx": 8192}, "total_slots": 3}
+
+    def test_a_present_template_is_reported(self) -> None:
+        facts = read_props({**self.BASE, "chat_template_tool_use": "{% for m in messages %}"})
+        assert facts is not None
+        assert facts.tool_template is True
+
+    def test_an_absent_key_is_not_an_error(self) -> None:
+        """Absence collapses two causes - --no-jinja, or a model with no
+        dedicated tool template - so it must not be treated as a verdict."""
+        facts = read_props(self.BASE)
+        assert facts is not None
+        assert facts.tool_template is False
+        assert facts.context_per_slot == 8192
+
+    def test_an_empty_template_does_not_count(self) -> None:
+        for empty in ("", "   "):
+            facts = read_props({**self.BASE, "chat_template_tool_use": empty})
+            assert facts is not None
+            assert facts.tool_template is False
+
+    def test_a_non_string_template_does_not_count(self) -> None:
+        for junk in (True, 1, {"a": 1}, []):
+            facts = read_props({**self.BASE, "chat_template_tool_use": junk})
+            assert facts is not None
+            assert facts.tool_template is False

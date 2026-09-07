@@ -654,7 +654,7 @@ llama.cpp + llama-swap + gguf-parser. Not a new inference stack, not a new hardw
 
 | # | Item | Why it must be measured |
 |---|---|---|
-| 1 | **Does low-bit quantisation destroy KAT-Coder's tool-call reliability?** | **The single most decision-relevant unknown.** No measurement of KAT-Coder at *any* quant exists anywhere. Determines whether the coding specialist is usable at all |
+| 1 | **Does low-bit quantisation destroy KAT-Coder's tool-call reliability?** | **The single most decision-relevant unknown.** No measurement of KAT-Coder at *any* quant exists anywhere. Determines whether the coding specialist is usable at all. ✅ **Now instrumented:** `localllm check` sends a real tool and grades the answer — see §10. The measurement still needs the MSI; the *instrument* no longer does |
 | 3 | `--kv-unified` vs `--no-kv-unified` (3 clients only) | ⚠️ `llama.h` contains **two adjacent comments that conflict** → benchmark, don't guess. Moot at `-np 1` |
 | 5 | Vulkan async-load caps | Affects load-time RAM peak (~256 MB vs largest single tensor) |
 | 6 | Octofriend autofix models CPU-only on a client laptop | Inferred from model size, not verified |
@@ -670,3 +670,160 @@ llama.cpp + llama-swap + gguf-parser. Not a new inference stack, not a new hardw
 | Is anything missed by only using Hugging Face? | **No** — HF is the de-facto registry; ModelScope/NGC are the only partial exceptions |
 
 **Nothing in the open table is a guess in the plan — each is an experiment.** See `PLAN.md`.
+
+---
+
+## 10. "Connects" is not "works" — **DECIDED: `check` grades the agent path**
+
+A connectivity check establishes that the server is reachable, that the key is accepted, that
+the model is listed, and that a request returns a completion. **None of that is what a coding
+agent needs.** Agents call tools, and they stream. Both paths fail independently of plain
+generation, and both fail without an error anyone can act on.
+
+| Failure | What the user sees | What `check` now says |
+|---|---|---|
+| Model answers in prose instead of calling the tool | The agent "doesn't do anything" | `the model answered in prose instead of calling the tool it was given` |
+| Tool call arrives with unparseable `arguments` | The agent crashes mid-task | `the model called a tool but the call is unusable` |
+| A proxy buffers the response | The agent appears to hang, then dumps everything at once | `all N frames arrived less than 1 ms apart` |
+| `--no-jinja` on the server | 500 on the first tool request | already diagnosed by `diagnose` — **not given a second name** |
+
+### Why `tool_choice` is left at `auto`
+
+Forcing the call would test a path real clients do not use, and would hide the one failure
+most worth catching: a model that *can* emit tool calls but never decides to. Agents rely on
+`auto`, so `auto` is the honest fidelity.
+
+### Why streaming is judged on arrival times, not content
+
+A buffering proxy returns **valid SSE**. The frames are well-formed, the content is correct,
+and `read()` returns exactly the same bytes it would from a healthy stream. The only thing
+that differs is *when* they arrive — so `check` reads the response line by line and records a
+timestamp per frame. Eight frames spread over 20 ms is seven intervals — 350 tok/s;
+this hardware is budgeted at 10–40 tok/s, so no genuine stream can land there and a buffered
+one always does. Below 8 frames it declines to judge rather than fail a healthy server.
+
+This is also the only thing that proves the generated Caddyfile's buffering directive is
+actually in force on the deployed proxy.
+
+### The free signal we were discarding
+
+`/props` sets `chat_template_tool_use` only when jinja is on **and** the model ships a
+tool-use template. We already fetch `/props` for the per-slot context. Its absence is
+ambiguous — `--no-jinja`, or simply a model without a dedicated template — so it is reported
+only when present, and the live tool call settles the rest.
+
+### 🚨 Running it found three defects that 966 passing tests did not
+
+1. **Two fix messages named commands that do not exist** — `localllm caddyfile` and
+   `localllm recommend`. Both are plain prose inside a string literal, so nothing was
+   checking them. A doctor that ends with an invalid command is worse than one that says
+   nothing: the user runs it, argparse rejects it, and the diagnosis loses its credibility
+   too. The real names are `localllm key caddyfile` and `localllm plan`.
+   → `TestEveryCommandWeTellUsersToRunExists` now walks every `` `localllm …` `` in the
+   source and asks argparse whether it is real. It found 11 across 7 files.
+
+2. **The product's own next step steered every user to Cline** — the one client that
+   §6 documents as impossible to configure from a file. `key add`, the invite, and the setup
+   guide each ended with `--client cline`. Being right in the table and wrong in the
+   instruction is worse than being consistently wrong, because the table is what a reviewer
+   reads and the instruction is what a user runs.
+   → `TestWeNeverTellUsersToPickTheClientWeCannotConfigure` cross-checks every `--client X`
+   instruction against `CLIENTS[X].writes_config`.
+
+3. **The invite still hand-rolled a `join`** after `localllm client <token>` had replaced it
+   — the longer path, ending at the worst client. Nothing tested the invite's closing
+   instruction, which is how it survived the entire feature that superseded it.
+
+---
+
+## 11. The Administrator half — **DECIDED: run it, do not describe it**
+
+`setup` ended with *"Still to do on THIS machine, as Administrator: run these three
+scripts"*. That is the half that makes the machine actually serve — power settings, the
+service, the watchdog — so a setup stopping there has downloaded 12 GB and started nothing.
+The stated requirement was that running one script makes everything work.
+
+`localllm service install` now runs them, and `setup.ps1` calls it, asking for Administrator
+once through UAC. Declining leaves a complete install that simply does not start on boot,
+and says so with the command to finish later.
+
+### Why it refuses rather than trying
+
+Running these unelevated does not fail cleanly. `powercfg` reports success and changes
+nothing; `nssm install` fails partway through and leaves a half-registered service. Refusing
+up front, naming which of the two problems it is — *scripts missing* (run `up` first) or
+*not elevated* — is the only outcome that cannot leave the machine in a state nobody asked
+for. `is_elevated()` returns `None` off Windows rather than `False`, because `False` means
+"re-run elevated and it will work", which is not true on a platform without the concept.
+
+### 🚨 `03-watchdog.ps1` could never be run, and nothing ever installed it
+
+The watchdog is `while ($true)`. Its own header said *"Run under NSSM alongside the
+server"* — and **nothing did**. Meanwhile three separate places in the source told the user
+to run `01-powercfg.ps1, 02-install-service.ps1, 03-watchdog.ps1 as Administrator`.
+Following that instruction gives a terminal that never returns, which reads as a hung
+setup. So the thrash alerting this project advertises was generated on every `up` and
+started on none.
+
+Fixed by a naming rule the deploy directory now follows: **a numbered script is one you
+run, in that order.** The loop became `watchdog-loop.ps1` — unnumbered — and
+`03-install-watchdog.ps1` registers it under NSSM, auto-start, restart-on-failure, invoked
+as `powershell.exe -ExecutionPolicy Bypass -File` because NSSM runs executables, not
+scripts. `TestANumberedScriptIsOneYouRun` asserts no script in the run sequence contains
+`while ($true)`, that every name in the sequence is rendered by something, and that the
+loop stays unnumbered.
+
+The sequence itself was a literal in three files with nothing keeping them in agreement.
+It is now `serve.SERVICE_SCRIPTS`, stated once.
+
+### 🚨 The relaunch command parsed, and did the wrong thing
+
+The first draft quoted the path with the same character enclosing the argument:
+
+```powershell
+... -ArgumentList '-NoProfile','-NoExit','-Command','localllm service install --dir 'C:\ai\deploy''
+```
+
+It **parses** — which is why it survives a glance — but PowerShell concatenates adjacent
+tokens in argument mode. Checked against the real parser with a spaced path, that produces
+three mangled arguments:
+
+```
+arg[0] = [-Command localllm service install --dir ]
+arg[1] = [C:\Program]
+arg[2] = [Files\deploy]
+```
+
+`-Command` glued onto the command text, the path split on its spaces. Double-quoting the
+path inside the single-quoted argument yields the correct two arguments. A fix message
+naming a command that does not *work* is the same defect as one naming a command that does
+not *exist*, and considerably harder to spot.
+
+### Also fixed while running it
+
+Script output appeared **before** the line saying which script was running: Python
+block-buffers stdout when it is a pipe, while a subprocess writes to the console directly.
+`_run` now flushes before spawning, so the transcript reads in the order things happened.
+
+### What the mutation sweep found here
+
+83 mutations, two survivors, and they were different kinds of problem — worth separating,
+because only one of them was a gap in the tests:
+
+1. **A real gap.** Deleting the `sys.platform` guard from `is_elevated` survived the whole
+   suite. `ctypes.windll` does not exist off Windows and the function already catches
+   `AttributeError`, so without the guard it *still* returns `None` on Linux — by accident,
+   through a handler meant for something else. That matters because CI runs on Linux: any
+   future change to that handler would silently change what a non-Windows host reports.
+   Closed by a test that makes `ctypes` raise an uncaught error and asserts it is never
+   reached.
+
+2. **A bad mutation.** The one meant to point NSSM at `cmd.exe` applied `.replace()` to an
+   f-string fragment that never contained `powershell.exe`, so it changed nothing and
+   "survived" a test that would have caught the real thing immediately. Corrected to target
+   the actual string, it is caught by
+   `test_the_installer_runs_the_loop_through_powershell`.
+
+A survivor is a question, not a verdict. Assuming the first kind when it is the second adds
+tests for behaviour already covered; assuming the second when it is the first leaves the
+gap open.
