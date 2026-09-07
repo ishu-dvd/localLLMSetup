@@ -6,6 +6,8 @@ degrade silently. Each test pins one silent failure mode.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from localllm.budget import Fit, Hardware, Plan, solve
@@ -439,6 +441,29 @@ class TestANumberedScriptIsOneYouRun:
         for name in SERVICE_SCRIPTS:
             assert name in rendered, f"{name} is in the run sequence but nothing renders it"
 
+    def test_every_numbered_script_we_render_is_in_the_sequence(self) -> None:
+        """The mirror, and the direction that was missing. Checking only that
+        the sequence is rendered leaves the original defect wide open: a script
+        can be generated on every `up` and run by nothing, which is exactly what
+        happened to the watchdog. Removing 04-firewall.ps1 from the sequence
+        survived the whole suite until this existed.
+
+        Scanned out of `up` itself rather than compared against this file's
+        fixture, because the fixture is not what writes the deploy directory -
+        a mirror that only pins the fixture would agree with itself forever.
+        """
+        import re
+
+        source = (Path(__file__).resolve().parents[1] / "src" / "localllm" / "cli.py").read_text(
+            encoding="utf-8"
+        )
+        written = set(re.findall(r'"(\d\d-[a-z-]+\.ps1)"\s*:', source))
+        assert written, "the scan found no generated scripts at all"
+        assert written == set(SERVICE_SCRIPTS), (
+            f"generated but never run: {sorted(written - set(SERVICE_SCRIPTS))}; "
+            f"run but never generated: {sorted(set(SERVICE_SCRIPTS) - written)}"
+        )
+
     def test_the_watchdog_is_actually_installed_rather_than_only_generated(self) -> None:
         s = render_watchdog_install_script(loop_script="C:\\d\\watchdog-loop.ps1", log_dir="C:\\d")
         assert "nssm install" in s
@@ -470,10 +495,28 @@ class TestTheOtherLaptopsCanActuallyReachIt:
 
     def test_both_documented_transports_are_allowed(self) -> None:
         """DECISIONS names Tailscale, with same-WiFi LAN as the fallback. A rule
-        covering only one of them silently breaks the other."""
+        covering only one of them silently breaks the other.
+
+        The literal is spelled out rather than compared against the constant:
+        asserting `TAILNET_CIDR in script` reads the same value the code reads,
+        so widening the constant to 0.0.0.0/0 would keep passing. Verified
+        against Tailscale's own documentation.
+        """
         s = render_firewall_script()
-        assert TAILNET_CIDR in s
+        assert "100.64.0.0/10" in s
         assert "LocalSubnet" in s
+
+    def test_the_tailnet_range_is_not_a_range_that_admits_everything(self) -> None:
+        """The whole security argument for -Profile Any is that the address is
+        the limit. A wildcard there turns the safest rule into the most open one."""
+        import ipaddress
+
+        net = ipaddress.ip_network(TAILNET_CIDR)
+        assert net.prefixlen >= 10, "wider than CGNAT is not the tailnet"
+        assert not net.is_global, "a globally routable range would admit the internet"
+        assert ipaddress.ip_address("100.101.102.103") in net
+        assert ipaddress.ip_address("192.168.1.10") not in net
+        assert ipaddress.ip_address("8.8.8.8") not in net
 
     def test_the_lan_rule_never_applies_on_a_public_network(self) -> None:
         """LocalSubnet on a hotel or cafe network means every other guest is on
@@ -488,12 +531,17 @@ class TestTheOtherLaptopsCanActuallyReachIt:
         """Restricting to Tailscale's CGNAT range is what makes -Profile Any
         acceptable: the address is the limit, not the network category. Tailscale
         does not reliably land in the Private profile, so requiring it would
-        break the primary transport."""
+        break the primary transport.
+
+        The rule must *use* `$TAILNET`, not merely coexist with its assignment -
+        a rule changed to `-RemoteAddress Any` leaves the variable defined at the
+        top of the script and unused, which reads as fine.
+        """
         lines = render_firewall_script().splitlines()
         start = next(i for i, ln in enumerate(lines) if "(tailnet)'" in ln and "New-Net" in ln)
         rule = " ".join(lines[start : start + 3])
         assert "-Profile Any" in rule
-        assert TAILNET_CIDR in render_firewall_script()
+        assert "-RemoteAddress $TAILNET" in rule, "the rule stopped using the range"
 
     def test_it_opens_only_the_port_it_was_given(self) -> None:
         s = render_firewall_script(port=9999)
@@ -536,6 +584,15 @@ class TestReadingBackWhetherThePortIsOpen:
     def test_a_failed_query_is_unknown_rather_than_absent(self) -> None:
         assert parse_firewall_count("", 1) is None
         assert parse_firewall_count("Get-NetFirewallRule : denied", 1) is None
+
+    def test_a_failed_query_is_unknown_even_when_it_printed_a_number(self) -> None:
+        """The distinguishing case, and the only one that tests the exit code
+        rather than the parse. PowerShell can print a stale or partial count and
+        still exit non-zero; trusting that number reports a firewall state
+        nobody measured.
+        """
+        assert parse_firewall_count("2\n", 1) is None
+        assert parse_firewall_count("0\n", 1) is None
 
     def test_empty_output_is_unknown(self) -> None:
         assert parse_firewall_count("", 0) is None

@@ -871,3 +871,17 @@ sends someone to re-open a port that was already open.
 
 Reading firewall rules does not need Administrator, which is what makes it usable from
 `status` — the diagnosis is available before anyone thinks to elevate.
+
+### The mutation sweep found four gaps in these very tests
+
+All four were in the new code, and each is a different way to write a test that cannot fail:
+
+| Mutation that survived | Why the test missed it |
+|---|---|
+| `TAILNET_CIDR` widened to `0.0.0.0/0` | The test asserted `TAILNET_CIDR in script` — **reading the same constant the code reads**. Now the literal `100.64.0.0/10` is spelled out, plus a property check: the range must not be globally routable, must contain a tailnet address and must not contain a LAN or public one. |
+| The rule stops using `$TAILNET` | `$TAILNET` is still *assigned* at the top of the script, so the CIDR was still present. The test now asserts the rule **uses** it. |
+| `parse_firewall_count` ignores the exit code | Both failing cases had output that failed to parse anyway, so neither reached the exit-code branch. The distinguishing case is a **failed query that printed a number**: trusting it reports a firewall state nobody measured. |
+| `04-firewall.ps1` dropped from the run sequence | The guard iterated `SERVICE_SCRIPTS` and checked each was rendered — so removing an entry simply removed a check. The mirror was missing, and it is the direction that matters: **a script generated on every `up` and run by nothing** is precisely the watchdog defect. It is now scanned out of `up` itself rather than compared against the test's own fixture, which would have agreed with itself forever. |
+
+The last one is worth dwelling on: the guard written one PR earlier for exactly this defect
+covered only one direction, and the same bug walked straight past it in the other.
