@@ -178,18 +178,25 @@ predicting absolute speed.
 **See what your hardware can run** (auto-detects; refuses to invent numbers):
 
 ```powershell
-python -m localllm.cli doctor
-python -m localllm.cli plan --slots 1 --context 32768
+python -m localllm doctor
+python -m localllm plan --slots 1 --context 32768
 ```
 ```
 Usable   : 7.00 GB VRAM, 10.50 GB RAM (after driver/display and OS idle)
 
-model                  quant      wts     KV   VRAM    RAM   free  verdict
-KAT-Coder-V2.5-Dev     Q2_K_L   13.11   0.33   7.00   8.34  +2.16  OK
-KAT-Coder-V2.5-Dev     IQ3_XXS  14.87   0.33   7.00  10.10  +0.40  TIGHT
-gpt-oss-20b            MXFP4    12.11   0.39   7.00   7.40  +3.10  OK
-Qwen3-Coder-30B-A3B    Q3_K_M   14.71   1.57   0.00  11.18  -0.68  NO
+model                  quant       wts     KV   VRAM    RAM   free  verdict
+gpt-oss-20b            MXFP4     12.11   0.43   7.00   9.02  +1.48  OK
+Qwen2.5-Coder-14B      Q4_K_M     8.99   3.42   7.00   8.89  +1.61  OK
+KAT-Coder-V2.5-Dev     Q2_K_L    13.11   1.43   0.00  11.02  -0.52  NO
+Qwen3.6-35B-A3B        UD-IQ3_XXS 13.21  1.43   0.00  11.12  -0.62  NO
+Qwen3-Coder-30B-A3B    Q3_K_M    14.71   1.71   0.00  12.90  -2.40  NO
 ```
+
+Those `NO`s used to be `OK` and `TIGHT`. Checking every catalogue entry against its
+**published GGUF header** found that three models' KV cache was understated **four-fold**:
+the catalogue assumed a 1-in-4 sliding-window pattern, and the files report
+`attention.sliding_window = 0` — no sliding-window attention at all, so *every* layer is
+global. A plan that fit on paper would have OOM'd on the machine.
 
 Add `--slots 3` and it recomputes for three laptops — and warns that 32K each needs
 `-c 98304`, not `-c 32768`. An impossible plan exits non-zero rather than recommending

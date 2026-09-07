@@ -213,13 +213,18 @@ KAT_CODER_Q2_K_L = Model(
     hf_repo="bartowski/Kwaipilot_KAT-Coder-V2.5-Dev-GGUF",
     hf_file="Kwaipilot_KAT-Coder-V2.5-Dev-Q2_K_L.gguf",
     weights_gb=13.11,
-    kb_per_token_q8=10.0,
+    kb_per_token_q8=40.0,
     n_layers=40,
-    dense_gb=1.6,
+    dense_gb=1.99,
     is_moe=True,
     n_kv_heads=2,
     head_dim=256,
-    full_attn_layers=10,
+    # 40, not 10. The published GGUF reports attention.sliding_window = 0, so
+    # there is no sliding-window attention and every layer is global. The
+    # earlier 10 assumed a 1-in-4 pattern that this architecture does not have,
+    # and understated the KV cache four-fold - in the direction that OOMs.
+    full_attn_layers=40,
+    max_context=262144,
     active_params_b=3.0,
     coding_specialist=True,
     swe_bench_verified=69.40,
@@ -232,13 +237,14 @@ KAT_CODER_IQ3_XXS = Model(
     hf_repo="bartowski/Kwaipilot_KAT-Coder-V2.5-Dev-GGUF",
     hf_file="Kwaipilot_KAT-Coder-V2.5-Dev-IQ3_XXS.gguf",
     weights_gb=14.87,
-    kb_per_token_q8=10.0,
+    kb_per_token_q8=40.0,
     n_layers=40,
-    dense_gb=1.8,
+    dense_gb=1.56,
     is_moe=True,
     n_kv_heads=2,
     head_dim=256,
-    full_attn_layers=10,
+    full_attn_layers=40,  # sliding_window = 0 in the file: no sliding layers
+    max_context=262144,
     active_params_b=3.0,
     coding_specialist=True,
     swe_bench_verified=69.40,
@@ -251,14 +257,15 @@ QWEN36_35B_A3B_IQ3_XXS = Model(
     # UD-* are Unsloth's own calibration, so there is no alternative upstream.
     hf_repo="unsloth/Qwen3.6-35B-A3B-GGUF",
     hf_file="Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf",
-    weights_gb=12.30,
-    kb_per_token_q8=10.0,
+    weights_gb=13.21,
+    kb_per_token_q8=40.0,
     n_layers=40,
-    dense_gb=1.5,
+    dense_gb=2.09,
     is_moe=True,
     n_kv_heads=2,
     head_dim=256,
-    full_attn_layers=10,
+    full_attn_layers=40,  # sliding_window = 0 in the file: no sliding layers
+    max_context=262144,
     active_params_b=3.0,
     swe_bench_verified=64.40,
     notes="The base model KAT-Coder was fine-tuned from.",
@@ -271,16 +278,25 @@ GEMMA4_26B_A4B_Q3 = Model(
     # because HF redirects repo paths case-insensitively, unlike file paths.
     hf_repo="unsloth/gemma-4-26B-A4B-it-GGUF",
     hf_file="gemma-4-26B-A4B-it-UD-Q3_K_XL.gguf",
-    weights_gb=12.02,
-    kb_per_token_q8=12.5,
+    weights_gb=12.91,
+    kb_per_token_q8=10.0,
     n_layers=30,
-    dense_gb=1.5,
+    dense_gb=2.58,
     is_moe=True,
-    n_kv_heads=4,
-    head_dim=256,
+    # Read from the published GGUF, which reports these per layer:
+    #   head_count_kv            = [8,8,8,8,8,2, ...]  (2 on global layers)
+    #   key_length               = 512   (global)
+    #   key_length_swa           = 256   (sliding)
+    #   sliding_window_pattern   = [T,T,T,T,T,F, ...]  (F marks global)
+    # So a global layer is 2 heads x 512, not 4 x 256. The product is the same
+    # - which is why this went unnoticed - but the factors were both wrong, and
+    # anything reading either one alone was wrong with them.
+    n_kv_heads=2,
+    head_dim=512,
     full_attn_layers=5,
     sliding_layers=25,
     sliding_window=1024,
+    max_context=262144,
     active_params_b=4.0,
     swe_bench_verified=57.40,
 )
@@ -304,6 +320,7 @@ QWEN25_CODER_14B = Model(
     n_kv_heads=8,
     head_dim=128,
     full_attn_layers=48,
+    max_context=131072,
     coding_specialist=True,
     notes="48/48 full-attention layers - the worst KV cost in the field.",
 )
@@ -321,6 +338,7 @@ QWEN25_CODER_7B = Model(
     n_kv_heads=4,
     head_dim=128,
     full_attn_layers=28,
+    max_context=131072,
     coding_specialist=True,
     notes="Fits in VRAM, but its 32B sibling scores 8.0% on Aider diff.",
 )
@@ -333,11 +351,12 @@ QWEN3_CODER_30B_A3B = Model(
     weights_gb=14.71,
     kb_per_token_q8=48.0,
     n_layers=48,
-    dense_gb=2.0,
+    dense_gb=0.89,
     is_moe=True,
     n_kv_heads=4,
     head_dim=128,
     full_attn_layers=48,
+    max_context=262144,
     active_params_b=3.3,
     coding_specialist=True,
 )

@@ -517,7 +517,34 @@ def test_unknown_architecture_with_a_window_stays_conservative():
 
 def test_source_is_reported_so_a_heuristic_is_never_mistaken_for_fact():
     assert parse_gguf_header(HYBRID).full_attn_layers_source == "per-layer KV head array"
-    assert "conservative" in parse_gguf_header(DENSE).full_attn_layers_source
+
+
+def test_no_sliding_window_is_reported_as_fact_not_as_a_guess():
+    """A model with no sliding window really does have every layer global -
+    calling that "conservative" implies the number might be an over-reservation
+    that could safely be reduced, and it cannot be.
+
+    The distinction matters because it is how a reader tells a genuine
+    catalogue error from the parser declining to guess. Three real models were
+    checked against their published GGUFs on the strength of it.
+    """
+    source = parse_gguf_header(DENSE).full_attn_layers_source
+    assert "conservative" not in source
+    assert "no sliding window" in source
+
+
+def test_a_window_with_no_known_pattern_is_still_conservative():
+    """The other side of that line: a window IS present, the pattern is not
+    known, so all-global is an over-reservation and must say so."""
+    raw = build_gguf(
+        "mysteryarch",
+        {
+            "mysteryarch.block_count": 32,
+            "mysteryarch.attention.head_count_kv": 8,
+            "mysteryarch.attention.sliding_window": 512,
+        },
+    )
+    assert "conservative" in parse_gguf_header(raw).full_attn_layers_source
 
 
 # --- Remote reading helpers -------------------------------------------------
@@ -700,3 +727,161 @@ class TestEmbeddingLength:
 
     def test_absent_when_not_stated(self) -> None:
         assert parse_gguf_header(build_gguf("gpt-oss", {})).n_embd is None
+
+
+def test_a_per_layer_array_with_no_zeros_does_not_claim_to_mark_sliding_layers():
+    """Gemma-4 publishes head_count_kv as [8,8,8,8,8,2, ...] - every entry
+    non-zero, varying head COUNT rather than presence.
+
+    Counting non-zero entries returned "all 30 layers are global", six times
+    the truth, and labelled itself the most reliable source there is. A zero
+    entry is what marks a layer with no KV cache, so the array is only
+    meaningful for this when at least one entry is zero.
+    """
+    raw = build_gguf(
+        "gemma4",
+        {
+            "gemma4.block_count": 30,
+            "gemma4.attention.head_count_kv": [8, 8, 8, 8, 8, 2] * 5,
+            "gemma4.attention.key_length": 512,
+            "gemma4.attention.sliding_window": 1024,
+        },
+    )
+    md = parse_gguf_header(raw)
+    assert md.full_attn_layers_source != "per-layer KV head array"
+    # Falls through to the architecture table, which the array's own 6-cycle
+    # corroborates: 30 layers / 6 = 5 global.
+    assert md.full_attn_layers == 5
+
+
+def test_a_per_layer_array_with_zeros_is_still_used():
+    """The original meaning must survive: a zero entry marks a layer holding
+    no KV, and counting the rest is exactly right."""
+    raw = build_gguf(
+        "somearch",
+        {
+            "somearch.block_count": 4,
+            "somearch.attention.head_count_kv": [8, 0, 8, 0],
+            "somearch.attention.key_length": 128,
+        },
+    )
+    md = parse_gguf_header(raw)
+    assert md.full_attn_layers == 2
+    assert md.full_attn_layers_source == "per-layer KV head array"
+
+
+class TestAPerLayerSlidingWindowPattern:
+    """Gemma-4 publishes `attention.sliding_window_pattern` as a per-layer
+    BOOLEAN LIST, not a scalar stride.
+
+    `int(pattern)` on a list raises TypeError, so `localllm plan --gguf` -
+    the flag whose whole purpose is to read facts from a real file rather than
+    trust the catalogue - crashed on a real published model. It was found by
+    pointing the reader at every GGUF the catalogue names.
+    """
+
+    def _gemma4(self, layers=30):
+        cycle = [True, True, True, True, True, False]
+        return build_gguf(
+            "gemma4",
+            {
+                "gemma4.block_count": layers,
+                "gemma4.attention.head_count_kv": [8, 8, 8, 8, 8, 2] * (layers // 6),
+                "gemma4.attention.key_length": 512,
+                "gemma4.attention.sliding_window": 1024,
+                "gemma4.attention.sliding_window_pattern": cycle * (layers // 6),
+            },
+        )
+
+    def test_a_list_pattern_does_not_raise(self):
+        parse_gguf_header(self._gemma4())
+
+    def test_false_entries_are_the_global_layers(self):
+        """True marks a SLIDING layer. Counting the Trues instead would invert
+        the split and overstate KV five-fold."""
+        md = parse_gguf_header(self._gemma4())
+        assert md.full_attn_layers == 5
+
+    def test_the_source_names_the_per_layer_form(self):
+        """A reader comparing this against a catalogue needs to know the number
+        came from the file, not from the architecture table."""
+        md = parse_gguf_header(self._gemma4())
+        assert md.full_attn_layers_source == "per-layer sliding_window_pattern"
+
+    def test_a_scalar_pattern_still_means_a_stride(self):
+        """The original form must keep working: a scalar N means every Nth
+        layer is global."""
+        raw = build_gguf(
+            "somearch",
+            {
+                "somearch.block_count": 24,
+                "somearch.attention.head_count_kv": 8,
+                "somearch.attention.key_length": 128,
+                "somearch.attention.sliding_window": 128,
+                "somearch.attention.sliding_window_pattern": 2,
+            },
+        )
+        md = parse_gguf_header(raw)
+        assert md.full_attn_layers == 12
+        assert md.full_attn_layers_source == "sliding_window_pattern"
+
+
+class TestKvHeadsComeFromTheLayersThatGrow:
+    """Two per-layer shapes exist and they need opposite handling.
+
+    Hybrid models mark a no-KV layer with 0, so the answer is the max of the
+    non-zero entries. Gemma-4 instead varies the COUNT - [8,8,8,8,8,2, ...] -
+    and pairs it with a sliding_window_pattern where False marks a global
+    layer. There the SMALLER count sits on the global layers, and those are the
+    ones multiplied by full_attn_layers. Taking the maximum sizes the
+    context-growing cache from the sliding layers and overstates it four-fold.
+    """
+
+    def test_a_sliding_pattern_selects_the_global_layers_heads(self):
+        raw = build_gguf(
+            "gemma4",
+            {
+                "gemma4.block_count": 12,
+                "gemma4.attention.head_count_kv": [8, 8, 8, 8, 8, 2] * 2,
+                "gemma4.attention.key_length": 512,
+                "gemma4.attention.sliding_window": 1024,
+                "gemma4.attention.sliding_window_pattern": [
+                    True,
+                    True,
+                    True,
+                    True,
+                    True,
+                    False,
+                ]
+                * 2,
+            },
+        )
+        assert parse_gguf_header(raw).n_kv_heads == 2
+
+    def test_zero_marking_still_takes_the_maximum(self):
+        """The hybrid rule must survive: a 0 means no KV at all, and the
+        remaining layers are what matters."""
+        raw = build_gguf(
+            "somearch",
+            {
+                "somearch.block_count": 4,
+                "somearch.attention.head_count_kv": [8, 0, 8, 0],
+                "somearch.attention.key_length": 128,
+            },
+        )
+        assert parse_gguf_header(raw).n_kv_heads == 8
+
+    def test_a_mismatched_pattern_length_falls_back(self):
+        """A pattern that does not line up with the array cannot be used to
+        select entries, and guessing would be worse than the old rule."""
+        raw = build_gguf(
+            "somearch",
+            {
+                "somearch.block_count": 4,
+                "somearch.attention.head_count_kv": [8, 8, 8, 2],
+                "somearch.attention.key_length": 128,
+                "somearch.attention.sliding_window": 512,
+                "somearch.attention.sliding_window_pattern": [True, False],
+            },
+        )
+        assert parse_gguf_header(raw).n_kv_heads == 8

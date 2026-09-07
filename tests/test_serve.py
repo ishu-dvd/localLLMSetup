@@ -28,10 +28,15 @@ from localllm.serve import (
 
 MSI = Hardware(vram_total_gb=8.0, ram_total_gb=16.0, os="windows")
 GOOD = solve(MSI, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
-# KAT_CODER_IQ3_XXS used to sit here, but it now REFUSES: re-anchoring the
-# compute buffer on a measured Vulkan log took 1.5 GB out of the VRAM available
-# for weights. Q2_K_L is the one that is genuinely TIGHT now.
-TIGHT = solve(MSI, KAT_CODER_Q2_K_L, Plan(32_768, 1, cram_mib=1024))
+# This fixture has moved twice, both times because a measurement corrected the
+# budget rather than because the test wanted a different model:
+#   KAT_CODER_IQ3_XXS -> Q2_K_L, when a measured Vulkan log took 1.5 GB out of
+#     the VRAM available for weights;
+#   Q2_K_L @ 32K -> @ 8K, when the published GGUF showed all 40 layers use
+#     global attention, quadrupling its KV cache.
+# It is pinned at a context where the model is genuinely TIGHT rather than
+# forced, so the preflight severity being tested is the real one.
+TIGHT = solve(MSI, KAT_CODER_Q2_K_L, Plan(8_192, 1, cram_mib=1024))
 DOOMED = solve(MSI, QWEN25_CODER_14B, Plan(32_768, 3))
 
 

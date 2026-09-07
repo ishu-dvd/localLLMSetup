@@ -15,11 +15,11 @@ import pytest
 
 from localllm.budget import Fit, Hardware, Plan, solve
 from localllm.catalogue import (
+    CATALOGUE,
     GPT_OSS_20B,
     KAT_CODER_IQ3_XXS,
     KAT_CODER_Q2_K_L,
     QWEN3_CODER_30B_A3B,
-    QWEN25_CODER_7B,
     QWEN25_CODER_14B,
     Model,
 )
@@ -76,10 +76,17 @@ def test_kv_matches_researched_figures():
 
 def test_derivation_reproduces_the_researched_kib_constants():
     """Proof the architecture data is right: 2 x full_attn x kv_heads x head_dim,
-    expressed in KiB, must equal the hand-entered reference values."""
-    for model in (GPT_OSS_20B, QWEN25_CODER_14B, QWEN25_CODER_7B, KAT_CODER_Q2_K_L):
+    expressed in KiB, must equal the hand-entered reference values.
+
+    Covers the WHOLE catalogue on purpose. It previously named four models, and
+    the four it named were consistent - while three it did not were derived
+    from the same wrong assumption about sliding-window layers and disagreed
+    with their own published GGUFs by 4x. A cross-check that skips entries only
+    proves the entries it visits.
+    """
+    for key, model in CATALOGUE.items():
         raw = 2 * model.full_attn_layers * model.n_kv_heads * model.head_dim
-        assert raw / 1024 == pytest.approx(model.kb_per_token_q8, abs=0.01), model.id
+        assert raw / 1024 == pytest.approx(model.kb_per_token_q8, abs=0.01), key
 
 
 def test_q8_kv_includes_block_scale_overhead():
@@ -218,10 +225,30 @@ def test_kat_coder_iq3_is_refused_at_one_slot():
     assert not r
 
 
-def test_kat_coder_q2_is_tight_at_one_slot():
-    """Also demoted by the corrected compute buffer: FITS -> TIGHT."""
+def test_kat_coder_q2_no_longer_fits_once_its_kv_is_read_from_the_file():
+    """It was TIGHT on a 4x understated KV cache.
+
+    The catalogue claimed 10 of its 40 layers used global attention, implying a
+    1-in-4 sliding-window pattern. The published GGUF reports
+    `attention.sliding_window = 0` - there is no sliding-window attention at
+    all, so every layer is global and the KV cache is four times what was
+    budgeted.
+
+    A model that was previously offered as a viable choice does not fit. That
+    is the correction working: the old answer would have been discovered by an
+    OOM on the real machine.
+    """
     r = solve(MSI_ALPHA, KAT_CODER_Q2_K_L, Plan(32_768, 1, cram_mib=1024))
-    assert r.status is Fit.TIGHT
+    assert r.status is Fit.REFUSE
+    assert not r
+
+
+def test_kat_coder_q2_still_fits_at_a_context_its_real_kv_allows():
+    """The refusal must be about the budget, not the model being rejected
+    outright - otherwise the correction has just deleted an option rather than
+    sized it honestly."""
+    r = solve(MSI_ALPHA, KAT_CODER_Q2_K_L, Plan(4_096, 1, cram_mib=1024))
+    assert r.status in (Fit.FITS, Fit.TIGHT), r.explain()
 
 
 def test_the_headline_recommendation_survives_the_correction():
