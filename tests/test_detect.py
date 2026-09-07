@@ -10,6 +10,8 @@ from __future__ import annotations
 import pytest
 
 from localllm.detect import (
+    Detection,
+    GpuInfo,
     adapter_ram_is_trustworthy,
     build_detection,
     is_virtual_gpu,
@@ -238,3 +240,48 @@ def test_available_ram_is_never_greater_than_total_in_practice():
     assert det.ram_available_gb is not None
     assert det.ram_gb is not None
     assert det.ram_available_gb < det.ram_gb
+
+
+class TestAVirtualAdapterIsNeverThePrimaryGpu:
+    """This project was developed on a Hyper-V VM whose only display adapter is
+    virtual, so the case is not hypothetical - it is the default here.
+
+    `primary_gpu` filters virtual adapters out before choosing. Mutation
+    testing found that filter was untested: removing `not g.is_virtual`
+    changed nothing the suite noticed, and the result would be a plan sized
+    for VRAM that does not exist.
+    """
+
+    def _det(self, *gpus, ram=16.0):
+        return Detection(gpus=list(gpus), ram_gb=ram, os="windows")
+
+    def test_a_real_card_wins_over_a_virtual_one_listed_first(self):
+        virtual = GpuInfo(
+            name="Microsoft Hyper-V Video", vram_gb=8.0, source="test", is_virtual=True
+        )
+        real = GpuInfo(name="AMD Radeon RX 6600M", vram_gb=8.0, source="test", is_virtual=False)
+        assert self._det(virtual, real).primary_gpu is real
+
+    def test_a_bigger_virtual_adapter_still_loses(self):
+        """Size must not rescue it. A virtual adapter reporting more VRAM than
+        the real card is exactly how this goes wrong quietly."""
+        virtual = GpuInfo(
+            name="Microsoft Hyper-V Video", vram_gb=64.0, source="test", is_virtual=True
+        )
+        real = GpuInfo(name="AMD Radeon RX 6600M", vram_gb=8.0, source="test", is_virtual=False)
+        assert self._det(virtual, real).primary_gpu is real
+
+    def test_the_hardware_built_from_it_uses_the_real_cards_vram(self):
+        """The number that actually reaches the solver."""
+        virtual = GpuInfo(
+            name="Microsoft Hyper-V Video", vram_gb=64.0, source="test", is_virtual=True
+        )
+        real = GpuInfo(name="AMD Radeon RX 6600M", vram_gb=8.0, source="test", is_virtual=False)
+        hw = self._det(virtual, real).to_hardware()
+        assert hw is not None
+        assert hw.vram_total_gb == 8.0
+
+    def test_the_largest_real_card_is_chosen_among_several(self):
+        small = GpuInfo(name="Intel UHD", vram_gb=2.0, source="test", is_virtual=False)
+        big = GpuInfo(name="AMD Radeon RX 6600M", vram_gb=8.0, source="test", is_virtual=False)
+        assert self._det(small, big).primary_gpu is big

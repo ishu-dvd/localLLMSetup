@@ -131,18 +131,58 @@ in ~28% of tasks. The 14B and 7B are worse. **Speed cannot rescue an editor that
 
 ### Candidates that actually fit
 
-All Apache-2.0, all verified via the Hugging Face API on 2026-09-06.
+All Apache-2.0, all verified via the Hugging Face API on 2026-09-06. **The KV and
+on-disk columns were re-derived on 2026-09-07 from each model's published GGUF
+header** (`python check_catalogue.py`), which corrected several of them
+substantially — see *"What reading the real files changed"* below.
 
 | Model | Total/Active | Coding specialist? | Quant | On-disk | KV/slot @32K | HF downloads |
 |---|---|---|---|---|---|---|
-| **KAT-Coder-V2.5-Dev** | 35B / **3B** | ✅ **agentic coding** | Q2_K_L | 13.11 GB | 0.33 GB | 45 K |
-| ″ | ″ | ″ | IQ3_XXS | 14.87 GB | 0.33 GB | ″ |
-| **Qwen3.6-35B-A3B** | 36B / **3B** | ❌ general (strong agentic) | UD-IQ3_XXS | 12.30 GB | 0.31 GB | **4.4 M** |
-| **Gemma-4-26B-A4B-it** | 26B / **4B** | ❌ general | UD-Q3_K_XL | 12.02 GB | 0.41 GB | **8.3 M** |
-| **gpt-oss-20b** | 21B / 3.6B | ❌ general | **MXFP4 native** | 12.11 GB | 0.39 GB | 151 K |
-| **gemma-4-12B-it** | 12B dense | ❌ general | official QAT q4_0 | **6.50 GB** | ~0.30 GB | 761 K |
-| ❌ Qwen3-Coder-30B-A3B | 30B / 3.3B | ✅ | Q3_K_M | 14.71 GB | **1.57 GB** | — |
-| ❌ Qwen2.5-Coder-14B | 14B **dense** | ✅ (2024 era) | Q4_K_M | 8.99 GB | **3.15 GB** | — |
+| **gpt-oss-20b** | 21B / 3.6B | ❌ general | **MXFP4 native** | 12.11 GB | 0.43 GB | 151 K |
+| **Gemma-4-26B-A4B-it** | 26B / **4B** | ❌ general | UD-Q3_K_XL | 12.91 GB | 0.70 GB | **8.3 M** |
+| **KAT-Coder-V2.5-Dev** | 35B / **3B** | ✅ **agentic coding** | Q2_K_L | 13.11 GB | **1.43 GB** | 45 K |
+| ❌ ″ | ″ | ″ | IQ3_XXS | 14.87 GB | **1.43 GB** | ″ |
+| **Qwen3.6-35B-A3B** | 36B / **3B** | ❌ general (strong agentic) | UD-IQ3_XXS | 13.21 GB | **1.43 GB** | **4.4 M** |
+| ❌ Qwen3-Coder-30B-A3B | 30B / 3.3B | ✅ | Q3_K_M | 14.71 GB | **1.71 GB** | — |
+| ❌ Qwen2.5-Coder-14B | 14B **dense** | ✅ (2024 era) | Q4_K_M | 8.99 GB | **3.42 GB** | — |
+
+### What reading the real files changed
+
+Three of these models had their KV cache understated **four-fold**. The catalogue
+recorded 10 of 40 layers as globally-attending — a 1-in-4 sliding-window pattern.
+Their GGUFs report `attention.sliding_window = 0`: there is no sliding-window
+attention at all, so *every* layer is global.
+
+The consequence is not cosmetic. **What each model can actually serve, on 8 GB
+VRAM + 16 GB RAM.** Row labels are the exact catalogue keys, because
+`tests/test_decisions_match_code.py` parses this table and re-derives every
+number from the solver — a table of derived figures in prose is the thing on
+this page that has already drifted twice.
+
+| Model | 1 client | 2 clients | 3 clients |
+|---|---|---|---|
+| `gpt-oss-20b:MXFP4` | **131072** | **65536** | **32768** |
+| `Gemma-4-26B-A4B-it:UD-Q3_K_XL` | 65536 | 32768 | 24576 |
+| `Qwen2.5-Coder-7B:Q4_K_M` | 131072 | 65536 | 49152 |
+| `Qwen2.5-Coder-14B:Q4_K_M` | 32768 | 20480 | 12288 |
+| `KAT-Coder-V2.5-Dev:Q2_K_L` | 20480 | 8192 | **4096** |
+| `Qwen3.6-35B-A3B:UD-IQ3_XXS` | 16384 | 8192 | 4096 |
+| `KAT-Coder-V2.5-Dev:IQ3_XXS` | none | none | none |
+| `Qwen3-Coder-30B-A3B:Q3_K_M` | none | none | none |
+
+Two decisions move:
+
+- **KAT-Coder IQ3_XXS is out entirely.** It no longer fits at *any* context. The
+  3-bit fallback that existed to avoid 2-bit quantisation risk does not exist.
+- **KAT-Coder Q2_K_L is only viable single-client.** At 3 clients it gets 4 K
+  each, which is not an agentic coding window. Previously it looked like a
+  32 K-per-client option.
+- **Gemma-4 is the surprise.** Its sliding-window attention keeps KV under 1 GB
+  even at 65 K, so it degrades far more gracefully across clients than the
+  35B models do. It is now the strongest non-gpt-oss option.
+
+None of this changes the headline: **gpt-oss-20b MXFP4 still wins**, and by a
+wider margin than before.
 
 **The structural fact that simplifies the choice** — verified from the HF API:
 
@@ -174,16 +214,23 @@ cleanest available comparison, worth ~5 points.
 **Honest gap:** ~69 vs ~89 SWE-bench against Claude Opus. Real — but this is a genuinely
 capable coding model, free, on hardware you already own.
 
-### 🚨 The one material risk
+### 🚨 The one material risk — now largely moot
 
-To serve **3 concurrent clients**, KAT-Coder must run at **2-bit**, and **nobody has
-benchmarked it at 2-bit**. A 3B-active MoE has little redundancy to absorb quantisation
-damage, and low-bit damage degrades **structured output first** — potentially destroying the
-exact tool-call reliability that justifies choosing it (its card documents malformed tool
-labels dropping 9.34% → 0.28%).
+The original risk was that serving **3 concurrent clients** forced KAT-Coder to
+**2-bit**, and **nobody has benchmarked it at 2-bit**. A 3B-active MoE has little
+redundancy to absorb quantisation damage, and low-bit damage degrades **structured
+output first** — potentially destroying the exact tool-call reliability that justifies
+choosing it (its card documents malformed tool labels dropping 9.34% → 0.28%).
 
-**This risk largely disappears with one client** (§5) — which is why single-client is the
-recommended default posture.
+**Reading the real GGUF removed the choice rather than resolving it.** With KV corrected
+four-fold, KAT-Coder Q2_K_L gets **4 K of context per client at 3 clients** and IQ3_XXS
+does not fit at all. Neither is an agentic coding configuration, so the 2-bit question is
+no longer the thing standing between this project and a coding specialist — the memory
+budget is.
+
+KAT-Coder remains viable **single-client at 20 K**, which is where the unmeasured 2-bit
+risk still applies. Phase 2.1 is therefore still worth running, but only to decide
+whether a single-client KAT-Coder beats gpt-oss-20b — not whether the fleet can use it.
 
 ---
 
@@ -271,8 +318,13 @@ The freed budget was supposed to buy an escape from 2-bit damage. The better ans
 | Quantisation loss | 3.06 bpw, **unbenchmarked** | **≈ none — MXFP4 is its native format** |
 | RAM | ~10.1 GB — **at the edge** | **~7.3 GB — comfortable** |
 | Margin | **~0.4 GB** | **~3 GB** |
-| Max context | 32K (64K very tight) | **128K fits** |
+| Max context | **does not fit at any context** | **128K fits** |
 | Known-good on Vulkan | unknown | ✅ in Phoronix's llama.cpp Vulkan set |
+
+> **Updated 2026-09-07.** The "Max context" row read *"32K (64K very tight)"* until the
+> published GGUF was read: KAT-Coder has no sliding-window attention, so all 40 layers are
+> global and its KV cache is four times what this table assumed. IQ3_XXS now fits at no
+> context at all. The comparison was already decisive; it is now not a comparison.
 
 **0.4 GB of margin on a 16 GB machine is not real margin** — one Windows update service waking
 up eats it.
@@ -355,9 +407,69 @@ Diff formatting is hard for almost everyone except Anthropic models — from the
 
 | If the server runs… | Use | Why |
 |---|---|---|
-| **KAT-Coder-V2.5-Dev** | **Cline** | Pin `contextWindow: 32768` to the real per-slot budget; targeted search/replace via **tool calls** (~250 output tokens); explicit function-calling toggle to exercise the path KAT was trained for |
-| **gpt-oss-20b** | **Aider** | Weaker tool calling and no RL-hardened tool training → Aider's no-tool-schema, 1,024-token repo map and manual `/add`·`/drop`·`/clear` control reassert |
-| **Either / one client for both** | **Octofriend** ⭐ | The only client that **refuses the bet** — ships two open-weight repair models, [`fix-json`](https://huggingface.co/syntheticlab/fix-json) and [`diff-apply`](https://huggingface.co/syntheticlab/diff-apply), that auto-repair malformed tool calls *and* near-miss edits, and can switch models mid-conversation. Its one weakness — nowhere to run the repair models — **disappears because your client laptops are unconstrained.** Cost: 1,007★, real bus-factor risk |
+| **KAT-Coder-V2.5-Dev** | **opencode** | Pin the context to the real per-slot budget — **20 K single-client, 8 K at two clients, 4 K at three** (§3); targeted search/replace via **tool calls** (~250 output tokens), which is the path KAT was trained for |
+| **gpt-oss-20b** | **opencode** | `limit.context` is how opencode knows how much of the slot is left and when to compact. For a self-hosted model there is no models.dev entry to fall back on, so omitting it means it never compacts |
+| **Qwen2.5-Coder** | **Aider** | Weaker tool calling and no RL-hardened tool training → Aider's no-tool-schema, 1,024-token repo map and manual `/add`·`/drop`·`/clear` control reassert |
+| **Either / one client for both** | **Octofriend** ⭐ | The only client that **refuses the bet** — ships two open-weight repair models, [`fix-json`](https://huggingface.co/syntheticlab/fix-json) and [`diff-apply`](https://huggingface.co/syntheticlab/diff-apply), that auto-repair malformed tool calls *and* near-miss edits. Its one weakness — nowhere to run the repair models — **disappears because your client laptops are unconstrained.** Cost: 1,007★, real bus-factor risk |
+| **You want VS Code** | **Continue** | The only VS Code extension here with a config file this tool can write. Splits chat from autocomplete, so the every-keystroke FIM requests stay at 1,024 tokens while chat gets the whole slot |
+
+### 🚨 Cline was recommended here, and cannot be configured from a file
+
+The row above used to read **Cline** for KAT-Coder, and `localllm join --client cline` wrote a
+`cline-settings.json` telling the user to place it at `~/.cline/settings.json`.
+
+**There is no such file.** Reading Cline's source
+(`apps/vscode/src/core/storage/state-migrations.ts`) shows settings go to VS Code's own
+`context.globalState` — a SQLite database VS Code holds open and caches in memory — and the API
+key to `context.secrets`, which is OS-encrypted (DPAPI on Windows). Neither can be written from
+outside VS Code.
+
+The field names were wrong too. Cline now scopes them per mode
+(`apps/vscode/src/shared/storage/state-keys.ts`): `planModeOpenAiModelId` /
+`actModeOpenAiModelId`, and the same for `ApiProvider` and `OpenAiModelInfo`. Only
+`openAiBaseUrl` is still flat. The names we wrote survive **only in the migration list**.
+
+So the config was inert, and `check` parsed it back and reported the laptop as configured with
+values the extension had never seen. `--client cline` now emits the values to enter by hand,
+and the recommendation moved to a client that can actually be written. **Roo Code and Kilo Code
+are forks of Cline and inherit the same storage model** — Roo's marketplace id is
+`RooVeterinaryInc.roo-cline`.
+
+**Qwen Code** is supported and carries a warning rather than a context pin: no field for it
+could be verified in its documentation, and inventing a name would look like the limit had been
+applied while the client kept overrunning it.
+
+### Qwen in VS Code
+
+There is no Qwen extension that can be pointed at a self-hosted endpoint — the Alibaba cloud
+extensions talk to Alibaba. The route that does work is the official
+**`qwenlm.qwen-code-vscode-ide-companion`** ("Qwen Code Companion", publisher `qwenlm`, free):
+it is a companion to the *CLI*, giving it your open workspace and a diff view, while the CLI
+is the thing pointed at this server. `localllm client --client qwen` prints the install line.
+
+For a self-contained VS Code experience against this server, **Continue** remains the answer.
+
+### ❌ Crush — considered, and rejected on two verified grounds
+
+[`charmbracelet/crush`](https://github.com/charmbracelet/crush) is otherwise the strongest
+candidate here. It has a **first-class `llamacpp` provider type** with model auto-discovery,
+and `--context-window` / `--default-max-tokens` give both halves of the budget explicitly —
+better ergonomics than anything else in the table.
+
+1. **It is not open source.** `LICENSE.md` on `main` is **FSL-1.1-MIT** — the Functional
+   Source License, source-available, converting to MIT after two years. Fine to use here, but
+   this stack is meant to be free *and* open, and the distinction should not be blurred.
+2. **Its config is executable code.** `crushrc` — now the primary format, with JSON deprecated
+   — is a Bash dialect that runs in a full shell, and `$(...)` inside `crush.json` is
+   evaluated at load time. Generating it means writing an executable file containing an API
+   key. Every other client here takes inert JSON or YAML.
+
+The second reason is the disqualifying one, and it is specific to this tool: a human writing
+their own `crushrc` is doing something ordinary. A config *generator* emitting shell is not.
+
+> Do not copy a context from this table by hand. `localllm invite` carries the number the
+> solver actually chose, and `localllm join` refuses anything larger than the slot holds —
+> the row above said `contextWindow: 32768` for a configuration that would now OOM.
 
 **On prompt caching (a concession worth knowing):** once warm, a heavy harness's system prompt
 costs almost nothing — a documented local llama.cpp case shows **512 ms for 212 tokens** on a

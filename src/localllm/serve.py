@@ -23,6 +23,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -373,6 +374,34 @@ def probe_llama_build(exe_path: str) -> int | None:
     except (OSError, subprocess.SubprocessError):
         return None
     return parse_llama_build((r.stdout or "") + (r.stderr or ""))
+
+
+def parse_service_query(text: str, returncode: int) -> bool | None:
+    """Did `sc query <name>` find the service? None means it could not tell.
+
+    The tri-state is the point. `sc` exits non-zero both for "no such service"
+    (error 1060) and for "access denied" (error 5), and treating the second as
+    the first tells a user with a running service to install it again.
+    """
+    lowered = text.lower()
+    if returncode == 0 and "service_name" in lowered:
+        return True
+    if "1060" in lowered or "does not exist" in lowered:
+        return False
+    return None
+
+
+def probe_service_installed(name: str) -> bool | None:
+    """Whether a Windows service by this name is registered."""
+    if sys.platform != "win32":
+        return None
+    try:
+        r = subprocess.run(
+            ["sc.exe", "query", name], capture_output=True, text=True, timeout=15, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_service_query((r.stdout or "") + (r.stderr or ""), r.returncode)
 
 
 def probe_free_disk_gb(path: str | Path) -> float | None:

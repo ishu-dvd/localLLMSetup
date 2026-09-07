@@ -303,10 +303,7 @@ class TestTheKeyFileDriftsFromTheStore:
         """
         store = KeyStore(tmp_path / "keys.json")
         path = tmp_path / "hand-edited.txt"
-        path.write_text(
-            "# a real comment\nsk-one\n\n  # indented, so NOT a comment\nsk-two \n",
-            encoding="utf-8",
-        )
+        path.write_bytes(b"# a real comment\nsk-one\n\n  # indented, so NOT a comment\nsk-two \n")
         keys = store.keys_in_file(path)
         assert keys == ["sk-one", "  # indented, so NOT a comment", "sk-two "]
 
@@ -317,5 +314,57 @@ class TestTheKeyFileDriftsFromTheStore:
         a = store.add("laptop-1")
         b = store.add("laptop-2")
         path = tmp_path / "reordered.txt"
-        path.write_text(f"{b.key}\n{a.key}\n", encoding="utf-8")
+        # write_bytes, not write_text: on Windows the latter emits CRLF, so the
+        # fixture would contain carriage returns this test never intended -
+        # which is exactly the lie that hid the read-side bug.
+        path.write_bytes(f"{b.key}\n{a.key}\n".encode())
+        assert store.file_is_current(path) is True
+
+
+class TestACrlfKeyFileIsSeenAsBroken:
+    """The one corruption `write_api_key_file` exists to prevent, from the
+    reading side.
+
+    llama.cpp reads the file with std::getline and does NOT strip `\r`, so a
+    CRLF keys.txt makes every parsed key end in a carriage return and match no
+    Authorization header any client sends. Every request 401s and nothing in
+    any log says why.
+
+    The detector used `Path.read_text`, which opens in universal-newline mode
+    and removes the `\r` before the split ever sees it - so it reported a
+    completely broken file as "matches the store". It was blind in precisely
+    the direction it exists to cover.
+    """
+
+    def _crlf_file(self, tmp_path, keys):
+        """Written with write_bytes on purpose: write_text would translate on
+        Windows and the fixture would not contain what it claims to."""
+        path = tmp_path / "crlf.txt"
+        body = "# generated\r\n" + "".join(f"{k}\r\n" for k in keys)
+        path.write_bytes(body.encode("utf-8"))
+        return path
+
+    def test_the_carriage_return_is_visible_in_the_parsed_keys(self, tmp_path):
+        store = KeyStore(tmp_path / "keys.json")
+        entry = store.add("laptop-1")
+        path = self._crlf_file(tmp_path, [entry.key])
+
+        keys = store.keys_in_file(path)
+        assert keys == [entry.key + "\r"]
+
+    def test_a_crlf_file_does_not_count_as_matching_the_store(self, tmp_path):
+        """This is the assertion that matters: `status` must say OUT OF DATE
+        for a file the server cannot use."""
+        store = KeyStore(tmp_path / "keys.json")
+        entry = store.add("laptop-1")
+        path = self._crlf_file(tmp_path, [entry.key])
+
+        assert store.file_is_current(path) is False
+
+    def test_the_file_this_project_writes_is_still_current(self, tmp_path):
+        """Guards against over-correcting: our own LF output must not now be
+        reported as broken."""
+        store = KeyStore(tmp_path / "keys.json")
+        store.add("laptop-1")
+        path = store.write_api_key_file(tmp_path / "lf.txt")
         assert store.file_is_current(path) is True

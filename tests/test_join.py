@@ -7,6 +7,7 @@ import json
 import pytest
 
 from localllm.join import (
+    SIDECAR,
     SUPPORTED,
     build_client_config,
     normalise_base_url,
@@ -61,13 +62,55 @@ def test_every_client_points_at_the_server(client):
     assert "msi-alpha.tail1234.ts.net:8080" in (c.content + json.dumps(c.env))
 
 
-@pytest.mark.parametrize("client", SUPPORTED)
+CANNOT_PIN_CONTEXT = {"qwen"}
+"""Clients with no verified way to be told the per-slot limit.
+
+Listed rather than skipped. A `pytest.skip` here would silently absorb a
+client that *could* be pinned and simply was not, so membership is asserted
+against the client's own notes below: if a way is found later, adding it makes
+the second test fail until this set is corrected.
+"""
+
+
+@pytest.mark.parametrize("client", sorted(set(SUPPORTED) - CANNOT_PIN_CONTEXT))
 def test_every_client_is_told_the_real_context(client):
     """Whichever file carries it, the client must know the per-slot limit -
-    otherwise it oversends and the server truncates silently."""
+    otherwise it oversends and the server truncates silently.
+
+    The sidecar is excluded deliberately. It always contains the context, so
+    including it made this assertion true for every client no matter what the
+    client's own config said - and it is the client's config that the client
+    loads. That is not hypothetical: with the sidecar counted, Octofriend's
+    context could be hard-coded to 999 and the entire suite stayed green.
+    """
     c = cfg(client)
-    everywhere = c.content + "".join(c.extra_files.values())
+    client_owned = {k: v for k, v in c.extra_files.items() if k != SIDECAR}
+    everywhere = c.content + "".join(client_owned.values())
     assert str(CTX) in everywhere
+
+
+@pytest.mark.parametrize("client", sorted(CANNOT_PIN_CONTEXT))
+def test_a_client_that_cannot_be_pinned_says_so_out_loud(client):
+    """The exclusion above is only defensible if the user is told. Silently
+    omitting the limit looks identical to applying it."""
+    notes = " ".join(cfg(client).notes).lower()
+    assert "context" in notes
+    assert "warning" in notes or "no verified" in notes
+
+
+def test_octofriend_pins_the_context_in_its_own_config():
+    """Cline and Aider each have a dedicated context test; Octofriend had none,
+    which is why the gap above went unnoticed."""
+    assert f"context: {CTX}," in cfg("octofriend").content
+
+
+def test_the_sidecar_alone_does_not_satisfy_the_context_check():
+    """Guards the guard. If SIDECAR stopped being excluded above, this fails
+    rather than the coverage silently evaporating again.
+    """
+    c = cfg("octofriend")
+    assert SIDECAR in c.extra_files
+    assert str(CTX) in c.extra_files[SIDECAR]
 
 
 @pytest.mark.parametrize("client", SUPPORTED)
@@ -90,30 +133,158 @@ def test_write_creates_missing_directories(client, tmp_path):
 
 
 # --- Cline ------------------------------------------------------------------
+#
+# Cline keeps its settings in VS Code's globalState (SQLite) and its key in the
+# OS keychain. Nothing outside VS Code can write either, so what `join` produces
+# is a set of values to type - and these tests exist to stop it drifting back
+# into pretending otherwise.
 
 
-def test_cline_config_is_valid_json():
-    json.loads(cfg("cline").content)
+def test_cline_output_is_instructions_not_a_config_file():
+    config = cfg("cline")
+    assert config.filename.endswith(".md")
+    assert "cannot write" in config.content or "Nothing outside VS Code" in config.content
 
 
-def test_cline_pins_context_window_to_the_slot_budget():
-    """If Cline assumes more context than the slot has, the server truncates."""
-    assert json.loads(cfg("cline").content)["openAiModelInfo"]["contextWindow"] == CTX
+def test_cline_says_where_the_settings_actually_live():
+    """The old note pointed at ~/.cline/settings.json, which does not exist.
+    A user following it would edit nothing and see no error."""
+    content = cfg("cline").content
+    assert "globalState" in content or "VS Code's own storage" in content
+    assert "~/.cline" not in content
 
 
-def test_cline_context_follows_the_plan():
-    assert json.loads(cfg("cline", ctx=65536).content)["openAiModelInfo"]["contextWindow"] == 65536
+def test_cline_still_carries_every_value_that_has_to_be_typed():
+    content = cfg("cline", ctx=65536).content
+    assert BASE.rstrip("/") + "/v1" in content
+    assert KEY in content
+    assert MODEL in content
+    assert "65536" in content or "65,536" in content
 
 
-def test_cline_enables_native_tool_calling():
-    """The path a tool-call-trained model was trained for."""
-    assert json.loads(cfg("cline").content)["openAiModelInfo"]["supportsComputerUse"] is True
+def test_cline_names_both_modes():
+    """Cline stores the context window separately for Plan and Act
+    (planModeOpenAiModelInfo / actModeOpenAiModelInfo). Setting one leaves the
+    other guessing, and the guess is always larger than the slot."""
+    content = cfg("cline").content
+    assert "Plan" in content and "Act" in content
 
 
-def test_cline_uses_openai_compatible_provider():
-    data = json.loads(cfg("cline").content)
-    assert data["apiProvider"] == "openai-compatible"
-    assert data["openAiBaseUrl"].endswith("/v1")
+def test_cline_is_not_reported_as_configured_from_a_file(tmp_path):
+    """It writes a markdown file. If a reader ever claimed to parse that back,
+    `check` would be verifying our own instructions rather than the client."""
+    from localllm.join import _read_cline
+
+    path = tmp_path / "cline-setup.md"
+    path.write_text(cfg("cline").content, encoding="utf-8")
+    assert _read_cline(path) is None
+
+
+# --- opencode ---------------------------------------------------------------
+
+
+def test_opencode_config_is_valid_json():
+    json.loads(cfg("opencode").content)
+
+
+def test_opencode_pins_both_halves_of_the_budget():
+    """`limit.context` is how opencode knows when to compact. Without it there
+    is no models.dev entry to fall back on for a self-hosted model."""
+    data = json.loads(cfg("opencode", ctx=65536).content)
+    limit = data["provider"]["llama.cpp"]["models"][MODEL]["limit"]
+    assert limit["context"] == 65536
+    assert limit["output"] == 4096
+
+
+def test_opencode_uses_the_openai_compatible_adapter():
+    """`@ai-sdk/openai` targets /v1/responses, which llama-server does not serve."""
+    provider = json.loads(cfg("opencode").content)["provider"]["llama.cpp"]
+    assert provider["npm"] == "@ai-sdk/openai-compatible"
+
+
+def test_opencode_wants_the_v1_suffix():
+    provider = json.loads(cfg("opencode").content)["provider"]["llama.cpp"]
+    assert provider["options"]["baseURL"].endswith("/v1")
+
+
+def test_opencode_keeps_the_key_out_of_the_file():
+    data = json.loads(cfg("opencode").content)
+    assert KEY not in cfg("opencode").content
+    assert data["provider"]["llama.cpp"]["options"]["apiKey"] == "{env:LOCAL_LLM_KEY}"
+    assert cfg("opencode").env["LOCAL_LLM_KEY"] == KEY
+
+
+def test_opencode_selects_the_model_so_it_does_not_have_to_be_picked():
+    assert json.loads(cfg("opencode").content)["model"] == f"llama.cpp/{MODEL}"
+
+
+# --- Continue ---------------------------------------------------------------
+
+
+def test_continue_declares_tool_use_explicitly():
+    """Continue detects tool support from the model NAME. A self-hosted model
+    is in no such table, so without this Agent mode silently does nothing.
+
+    Asserted as a YAML list item, not as a substring: `# tool_use` contains
+    `tool_use` and configures nothing, and a mutation to exactly that survived
+    the substring version of this test.
+    """
+    lines = [line.rstrip() for line in cfg("continue").content.splitlines()]
+    assert "      - tool_use" in lines
+    assert "    capabilities:" in lines
+
+
+def test_continue_pins_the_chat_context_to_the_slot():
+    assert "contextLength: 65536" in cfg("continue", ctx=65536).content
+
+
+def test_continue_declares_the_autocomplete_role():
+    """`autocomplete` is not in Continue's default role list, so a model that
+    does not name it is never asked for completions at all."""
+    assert "roles: [autocomplete]" in cfg("continue").content
+
+
+def test_continue_keeps_autocomplete_prompts_small():
+    """Autocomplete fires per keystroke. Over a LAN, full-context FIM requests
+    are what make a local model feel unusable."""
+    assert "maxPromptTokens: 1024" in cfg("continue").content
+
+
+def test_continue_wants_the_v1_suffix():
+    assert f"apiBase: {BASE.rstrip('/')}/v1" in cfg("continue").content
+
+
+# --- Qwen Code --------------------------------------------------------------
+
+
+def test_qwen_config_is_valid_json():
+    json.loads(cfg("qwen").content)
+
+
+def test_qwen_does_not_stop_to_ask_which_provider_to_use():
+    """Without security.auth.selectedType the CLI opens /auth on first run,
+    which is exactly the manual step this command exists to remove."""
+    data = json.loads(cfg("qwen").content)
+    assert data["security"]["auth"]["selectedType"] == "openai"
+
+
+def test_qwen_selects_a_provider_id_that_exists():
+    """`model.name` must match one of the modelProviders ids."""
+    data = json.loads(cfg("qwen").content)
+    ids = [p["id"] for p in data["modelProviders"]["openai"]]
+    assert data["model"]["name"] in ids
+
+
+def test_qwen_admits_it_cannot_pin_the_context():
+    """No context field could be verified for Qwen Code. Inventing one would
+    look like the limit was applied while the client kept overrunning it."""
+    notes = " ".join(cfg("qwen").notes).lower()
+    assert "no verified way to pin the context" in notes
+
+
+def test_qwen_keeps_the_key_out_of_the_file():
+    assert KEY not in cfg("qwen").content
+    assert cfg("qwen").env["LOCAL_LLM_KEY"] == KEY
 
 
 # --- Aider ------------------------------------------------------------------
@@ -237,13 +408,14 @@ class TestReadingAConfigBack:
         build_client_config(**kwargs).write(tmp_path)
         return tmp_path
 
-    def test_a_cline_config_round_trips(self, tmp_path):
+    def test_an_opencode_config_round_trips(self, tmp_path, monkeypatch):
         from localllm.join import read_client_config
 
-        self._write(tmp_path, "cline")
+        monkeypatch.setenv("LOCAL_LLM_KEY", "sk-localllm-secret")
+        self._write(tmp_path, "opencode")
         found = read_client_config(tmp_path)
         assert found is not None
-        assert found.client == "cline"
+        assert found.client == "opencode"
         assert found.model == "claude-local-coder"
         assert found.api_key == "sk-localllm-secret"
         assert found.context == 8192
@@ -395,10 +567,11 @@ class TestTheSidecarMakesEveryClientReadable:
         assert found.api_key == "sk-from-env"
 
     def test_the_key_is_recovered_from_the_client_file_when_it_lives_there(self, tmp_path):
-        """Cline stores its own key, so no environment variable is involved."""
+        """Continue stores its own key in config.yaml, so no environment
+        variable is involved."""
         from localllm.join import read_client_config
 
-        self._join(tmp_path, "cline")
+        self._join(tmp_path, "continue")
         found = read_client_config(tmp_path)
         assert found is not None
         assert found.api_key == "sk-localllm-secret"
@@ -419,20 +592,197 @@ class TestTheSidecarMakesEveryClientReadable:
         assembled by hand."""
         from localllm.join import SIDECAR, read_client_config
 
-        self._join(tmp_path, "cline")
+        self._join(tmp_path, "continue")
         (tmp_path / SIDECAR).unlink()
         found = read_client_config(tmp_path)
         assert found is not None
+        assert found.client == "continue"
+
+    def test_a_client_with_no_readable_file_still_reads_from_the_sidecar(self, tmp_path):
+        """Cline's settings live in VS Code's SQLite storage, so there is no
+        config file to parse. Without the sidecar this laptop would be
+        undiagnosable."""
+        from localllm.join import read_client_config
+
+        self._join(tmp_path, "cline")
+        found = read_client_config(tmp_path)
+        assert found is not None
         assert found.client == "cline"
+        assert found.context == 8192
 
     def test_a_sidecar_from_a_future_version_falls_back_rather_than_misreading(self, tmp_path):
         from localllm.join import SIDECAR, read_client_config
 
-        self._join(tmp_path, "cline")
+        self._join(tmp_path, "continue")
         path = tmp_path / SIDECAR
         data = json.loads(path.read_text(encoding="utf-8"))
         data["version"] = 99
         path.write_text(json.dumps(data), encoding="utf-8")
         found = read_client_config(tmp_path)
         assert found is not None
-        assert found.path.name == "cline-settings.json"
+        assert found.path.name == "config.yaml"
+
+
+class TestTheClientsOwnFileWins:
+    """The sidecar records what `join` INTENDED; the client file is what the
+    client LOADS. Preferring the sidecar unconditionally meant a hand-edited
+    octofriend.json5 asking for 131,072 tokens was checked as though it asked
+    for 8,192 - so `check` reported "context agrees" for a client heading
+    straight into a 400 exceed_context_size_error.
+
+    Two copies of one fact, and nothing comparing them. `_read_octofriend`'s
+    own docstring invites the edit that breaks it.
+    """
+
+    def _joined(self, tmp_path, client="octofriend", ctx=8192):
+        build_client_config(
+            client=client,
+            base_url=BASE,
+            api_key=KEY,
+            model=MODEL,
+            context=ctx,
+        ).write(tmp_path)
+        return tmp_path
+
+    def test_an_edited_context_is_reported_not_the_recorded_one(self, tmp_path, monkeypatch):
+        from localllm.join import read_client_config
+
+        monkeypatch.setenv("LOCAL_LLM_KEY", KEY)
+        self._joined(tmp_path, ctx=8192)
+        path = tmp_path / "octofriend.json5"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("context: 8192", "context: 131072"),
+            encoding="utf-8",
+        )
+
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.context == 131072
+        assert "context" in found.drift
+
+    def test_an_edited_model_is_reported(self, tmp_path, monkeypatch):
+        from localllm.join import read_client_config
+
+        monkeypatch.setenv("LOCAL_LLM_KEY", KEY)
+        self._joined(tmp_path)
+        path = tmp_path / "octofriend.json5"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(MODEL, "something-else"),
+            encoding="utf-8",
+        )
+
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.model == "something-else"
+        assert "model" in found.drift
+
+    def test_an_untouched_config_reports_no_drift(self, tmp_path, monkeypatch):
+        """The check must be quiet in the normal case, or the warning stops
+        meaning anything."""
+        from localllm.join import read_client_config
+
+        monkeypatch.setenv("LOCAL_LLM_KEY", KEY)
+        self._joined(tmp_path)
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.drift == ()
+        assert found.context == 8192
+
+    def test_a_continue_edit_is_caught_too(self, tmp_path):
+        """Continue keeps everything in one file, so it has the same exposure."""
+        from localllm.join import read_client_config
+
+        self._joined(tmp_path, client="continue", ctx=8192)
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("contextLength: 8192", "contextLength: 99999"),
+            encoding="utf-8",
+        )
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.context == 99999
+        assert "context" in found.drift
+
+    def test_an_opencode_edit_is_caught_too(self, tmp_path, monkeypatch):
+        from localllm.join import read_client_config
+
+        monkeypatch.setenv("LOCAL_LLM_KEY", KEY)
+        self._joined(tmp_path, client="opencode", ctx=8192)
+        path = tmp_path / "opencode.json"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace('"context": 8192', '"context": 99999'),
+            encoding="utf-8",
+        )
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.context == 99999
+        assert "context" in found.drift
+
+    def test_a_field_the_client_file_does_not_carry_is_not_drift(self, tmp_path, monkeypatch):
+        """Aider keeps its limits in a separate metadata file. When that file
+        is missing, `own.context` is None - an absent value, not a
+        disagreement - and reporting it as an edit would cry wolf.
+
+        The deletion is the point. Mutation testing showed that without it this
+        test passed for the wrong reason: Aider normally carries both fields,
+        so the absence guard was never reached and removing it changed nothing.
+        """
+        from localllm.join import read_client_config
+
+        monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        self._joined(tmp_path, client="aider")
+        (tmp_path / ".aider.model.metadata.json").unlink()
+
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.drift == ()
+        # The sidecar supplies what the client file cannot.
+        assert found.context == 8192
+
+    def test_an_unset_environment_url_is_not_drift(self, tmp_path, monkeypatch):
+        """The other absence: Aider's base URL lives in a variable that is
+        simply unset in a fresh shell."""
+        from localllm.join import read_client_config
+
+        monkeypatch.delenv("OPENAI_API_BASE", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        self._joined(tmp_path, client="aider")
+        found = read_client_config(tmp_path)
+        assert found is not None
+        assert found.drift == ()
+        assert BASE.split("//")[1] in found.base_url
+
+
+class TestOptionalCompanionsAreOfferedButNotRequired:
+    """Answering "can I use Qwen in VS Code": not directly - the Alibaba cloud
+    extensions cannot be pointed at a self-hosted endpoint. The official
+    companion to the CLI can, because the CLI is the thing that is pointed."""
+
+    def test_qwen_offers_its_official_vscode_companion(self):
+        from localllm.join import CLIENTS
+
+        commands = [c for c, _ in CLIENTS["qwen"].also]
+        assert any("qwenlm.qwen-code-vscode-ide-companion" in c for c in commands)
+
+    def test_the_companion_is_not_a_prerequisite(self):
+        """It is a convenience. Requiring VS Code to use a terminal CLI would
+        refuse a laptop that is perfectly able to run it."""
+        from localllm.join import CLIENTS
+
+        assert "code" not in CLIENTS["qwen"].requires
+
+    def test_every_companion_says_what_it_gets_you(self):
+        """A bare install command in the middle of a setup is noise."""
+        from localllm.join import CLIENTS
+
+        for profile in CLIENTS.values():
+            for command, why in profile.also:
+                assert command.strip(), profile.name
+                assert len(why) > 20, profile.name
+
+    def test_no_client_lists_itself_as_its_own_companion(self):
+        from localllm.join import CLIENTS
+
+        for profile in CLIENTS.values():
+            assert profile.install not in [c for c, _ in profile.also], profile.name

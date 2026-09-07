@@ -15,11 +15,11 @@ import pytest
 
 from localllm.budget import Fit, Hardware, Plan, solve
 from localllm.catalogue import (
+    CATALOGUE,
     GPT_OSS_20B,
     KAT_CODER_IQ3_XXS,
     KAT_CODER_Q2_K_L,
     QWEN3_CODER_30B_A3B,
-    QWEN25_CODER_7B,
     QWEN25_CODER_14B,
     Model,
 )
@@ -76,10 +76,17 @@ def test_kv_matches_researched_figures():
 
 def test_derivation_reproduces_the_researched_kib_constants():
     """Proof the architecture data is right: 2 x full_attn x kv_heads x head_dim,
-    expressed in KiB, must equal the hand-entered reference values."""
-    for model in (GPT_OSS_20B, QWEN25_CODER_14B, QWEN25_CODER_7B, KAT_CODER_Q2_K_L):
+    expressed in KiB, must equal the hand-entered reference values.
+
+    Covers the WHOLE catalogue on purpose. It previously named four models, and
+    the four it named were consistent - while three it did not were derived
+    from the same wrong assumption about sliding-window layers and disagreed
+    with their own published GGUFs by 4x. A cross-check that skips entries only
+    proves the entries it visits.
+    """
+    for key, model in CATALOGUE.items():
         raw = 2 * model.full_attn_layers * model.n_kv_heads * model.head_dim
-        assert raw / 1024 == pytest.approx(model.kb_per_token_q8, abs=0.01), model.id
+        assert raw / 1024 == pytest.approx(model.kb_per_token_q8, abs=0.01), key
 
 
 def test_q8_kv_includes_block_scale_overhead():
@@ -218,10 +225,30 @@ def test_kat_coder_iq3_is_refused_at_one_slot():
     assert not r
 
 
-def test_kat_coder_q2_is_tight_at_one_slot():
-    """Also demoted by the corrected compute buffer: FITS -> TIGHT."""
+def test_kat_coder_q2_no_longer_fits_once_its_kv_is_read_from_the_file():
+    """It was TIGHT on a 4x understated KV cache.
+
+    The catalogue claimed 10 of its 40 layers used global attention, implying a
+    1-in-4 sliding-window pattern. The published GGUF reports
+    `attention.sliding_window = 0` - there is no sliding-window attention at
+    all, so every layer is global and the KV cache is four times what was
+    budgeted.
+
+    A model that was previously offered as a viable choice does not fit. That
+    is the correction working: the old answer would have been discovered by an
+    OOM on the real machine.
+    """
     r = solve(MSI_ALPHA, KAT_CODER_Q2_K_L, Plan(32_768, 1, cram_mib=1024))
-    assert r.status is Fit.TIGHT
+    assert r.status is Fit.REFUSE
+    assert not r
+
+
+def test_kat_coder_q2_still_fits_at_a_context_its_real_kv_allows():
+    """The refusal must be about the budget, not the model being rejected
+    outright - otherwise the correction has just deleted an option rather than
+    sized it honestly."""
+    r = solve(MSI_ALPHA, KAT_CODER_Q2_K_L, Plan(4_096, 1, cram_mib=1024))
+    assert r.status in (Fit.FITS, Fit.TIGHT), r.explain()
 
 
 def test_the_headline_recommendation_survives_the_correction():
@@ -630,3 +657,51 @@ class TestSpeculationBudget:
         error should stop someone re-adding it from a stale guide."""
         with pytest.raises(ValueError, match="27852"):
             _ = Plan(context_per_slot=16384, speculation="ngram-cache").effective_speculation
+
+
+class TestPathsWithSpacesSurviveTheServiceDefinition:
+    """`llama_server_flags` returns ONE space-separated string, and the NSSM
+    script interpolates it straight into AppParameters with no per-argument
+    quoting.
+
+    `C:\\Users\\First Last` is the common Windows profile shape. Unquoted, it
+    makes llama-server receive `--api-key-file C:\\Users\\First`, which it
+    cannot open - and per common/arg.cpp:3523 that throws and exits at startup.
+    It fails closed rather than open, but `up` reports success and the guide
+    marks the service step unobservable, so nothing surfaces it.
+    """
+
+    def _verdict(self):
+        return solve(Hardware(vram_total_gb=8, ram_total_gb=16), GPT_OSS_20B, Plan(8192))
+
+    def test_a_key_file_path_with_a_space_is_quoted(self) -> None:
+        flags = self._verdict().llama_server_flags(
+            api_key_file=r"C:\Users\First Last\deploy\keys.txt"
+        )
+        assert r'--api-key-file "C:\Users\First Last\deploy\keys.txt"' in flags
+
+    def test_a_path_without_a_space_is_left_alone(self) -> None:
+        """Quoting everything would be harmless for llama-server but noisy in
+        the flags file a human reads and copies."""
+        flags = self._verdict().llama_server_flags(api_key_file=r"C:\ai\keys.txt")
+        assert r"--api-key-file C:\ai\keys.txt" in flags
+        assert '"C:\\ai\\keys.txt"' not in flags
+
+    def test_the_model_path_is_quoted_on_the_same_rule(self) -> None:
+        """Same root cause, and it predates the key file - `-m` has always been
+        interpolated into the same string."""
+        from dataclasses import replace
+
+        model = replace(GPT_OSS_20B, source_path=r"C:\My Models\gpt-oss.gguf")
+        flags = solve(
+            Hardware(vram_total_gb=8, ram_total_gb=16), model, Plan(8192)
+        ).llama_server_flags()
+        assert r'-m "C:\My Models\gpt-oss.gguf"' in flags
+
+    def test_the_flag_count_is_unchanged_by_quoting(self) -> None:
+        """A quote that swallowed a following flag would be worse than the bug
+        it fixes."""
+        plain = self._verdict().llama_server_flags(api_key_file=r"C:\ai\keys.txt")
+        spaced = self._verdict().llama_server_flags(api_key_file=r"C:\a b\keys.txt")
+        assert plain.count("--") == spaced.count("--")
+        assert "--device Vulkan0" in spaced

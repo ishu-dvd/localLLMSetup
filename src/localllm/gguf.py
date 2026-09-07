@@ -45,6 +45,12 @@ SLIDING_WINDOW_PATTERN_BY_ARCH = {
     "gpt-oss": 2,  # alternating: 12 of 24 layers are global
     "gemma3": 6,  # 5 sliding layers per global one
     "gemma3n": 6,
+    # Verified against the real Gemma-4 GGUF: it publishes
+    # attention.sliding_window=1024, no pattern key, and a per-layer KV-head
+    # array of [8,8,8,8,8,2, 8,8,8,8,8,2, ...] - a 6-layer cycle, matching
+    # gemma3. Without this entry the parser assumed all 30 layers were global
+    # and overstated KV six-fold.
+    "gemma4": 6,
 }
 
 PERMISSIVE_LICENSES = frozenset(
@@ -201,17 +207,34 @@ class GgufMetadata:
 
     @property
     def n_kv_heads(self) -> int | None:
-        """KV heads on the *attention* layers.
+        """KV heads on the layers whose cache grows with context.
 
-        Newer hybrid models publish this as a per-layer array where `0` marks a
-        linear-attention layer that keeps no KV cache at all. Those zeros are the
-        reason such models have cheap KV, so take the maximum rather than the
-        first entry.
+        Two per-layer shapes exist and they need opposite handling:
+
+        * Hybrid models publish `0` for a linear-attention layer that keeps no
+          KV at all. Those zeros are why such models have cheap KV, so the
+          answer is the maximum of the non-zero entries.
+        * Gemma-4 publishes `[8,8,8,8,8,2, ...]` alongside a
+          `sliding_window_pattern` of `[T,T,T,T,T,F, ...]`, where `F` marks a
+          global layer. Here the *smaller* count sits on the global layers, and
+          those are the ones multiplied by `full_attn_layers`. Taking the
+          maximum would size the context-growing cache from the sliding layers
+          and overstate it four-fold.
+
+        So when a per-layer sliding pattern is present, it decides which
+        entries matter; otherwise the zero-marking rule applies.
         """
         v = self.head_count_kv
         if v is None:
             return None
         if isinstance(v, list):
+            pattern = self._arch("attention.sliding_window_pattern")
+            if isinstance(pattern, list) and len(pattern) == len(v):
+                on_global = [
+                    int(x) for x, sliding in zip(v, pattern, strict=True) if not sliding and x
+                ]
+                if on_global:
+                    return max(on_global)
             nonzero = [int(x) for x in v if x]
             return max(nonzero) if nonzero else 0
         return int(v)
@@ -229,7 +252,13 @@ class GgufMetadata:
              That is the safe direction: it reserves too much, not too little.
         """
         v = self.head_count_kv
-        if isinstance(v, list):
+        if isinstance(v, list) and any(x == 0 for x in v):
+            # A zero entry is how a per-layer array marks a layer with no KV
+            # cache, so counting non-zero entries is only meaningful when at
+            # least one is zero. Gemma-4 publishes [8,8,8,8,8,2, ...] - every
+            # entry non-zero, varying head COUNT rather than presence - and
+            # counting them returned "all 30 layers are global", six times the
+            # truth, while labelling itself the most reliable source there is.
             return sum(1 for x in v if x)
 
         layers = self.n_layers
@@ -237,6 +266,13 @@ class GgufMetadata:
             return None
 
         pattern = self._arch("attention.sliding_window_pattern")
+        if isinstance(pattern, list):
+            # Gemma-4 publishes this as a per-layer boolean list where True
+            # marks a SLIDING layer, e.g. [T,T,T,T,T,F, ...] - 5 global of 30.
+            # Treating it as a scalar stride raised TypeError out of int(),
+            # crashing `localllm plan --gguf` on a real published model.
+            globals_ = sum(1 for x in pattern if not x)
+            return max(1, globals_) if pattern else layers
         if pattern and int(pattern) > 1:
             return max(1, layers // int(pattern))
 
@@ -252,12 +288,19 @@ class GgufMetadata:
     def full_attn_layers_source(self) -> str:
         """How full_attn_layers was determined - so a heuristic is never mistaken
         for something the file actually said."""
-        if isinstance(self.head_count_kv, list):
+        v = self.head_count_kv
+        if isinstance(v, list) and any(x == 0 for x in v):
             return "per-layer KV head array"
-        if self._arch("attention.sliding_window_pattern"):
+        pattern = self._arch("attention.sliding_window_pattern")
+        if isinstance(pattern, list):
+            return "per-layer sliding_window_pattern"
+        if pattern:
             return "sliding_window_pattern"
         if self.sliding_window and SLIDING_WINDOW_PATTERN_BY_ARCH.get(self.architecture):
             return f"architecture default for {self.architecture!r} (not in file)"
+        if not self.sliding_window:
+            # Not a guess: no sliding window means every layer is global.
+            return "no sliding window in the file, so every layer is global"
         return "assumed all-global (conservative)"
 
     @property

@@ -124,7 +124,13 @@ class KeyStore:
         if not p.exists():
             return None
         try:
-            raw = p.read_text(encoding="utf-8")
+            # read_bytes, NOT read_text: universal-newline translation strips
+            # `\r` before the split ever sees it, which would hide the one
+            # corruption `write_api_key_file` exists to prevent. llama.cpp uses
+            # std::getline and keeps the carriage return, so a CRLF file makes
+            # every key end in `\r` and match no header any client sends. A
+            # reader that silently repairs the file cannot report it as broken.
+            raw = p.read_bytes().decode("utf-8", errors="replace")
         except OSError:
             return None
         return [line for line in raw.split("\n") if line and line[0] != "#"]

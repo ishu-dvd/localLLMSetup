@@ -58,22 +58,36 @@ class Invite:
     context_per_slot: int
     n_slots: int = 1
 
+    model_id: str = ""
+    """The catalogue id, as distinct from `model`, which is the alias.
+
+    These look redundant and are not. `model` is always the fixed value in
+    `constants.MODEL_ALIAS` - a constant, because Claude-compatible clients
+    filter the model list on the substring `claude`. So it identifies the
+    *protocol*, never the model, and anything on the client that tried to
+    reason from it was reasoning from a constant. Choosing a coding agent
+    depends on whether the model was trained to emit tool calls, which only
+    the real id can answer.
+
+    Optional: a token minted before this field existed still decodes, and the
+    client falls back to a harness that works either way.
+    """
+
     def encode(self) -> str:
-        payload = json.dumps(
-            {
-                "u": self.url,
-                "k": self.api_key,
-                "d": self.device,
-                "m": self.model,
-                "c": self.context_per_slot,
-                "n": self.n_slots,
-            },
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
+        payload = {
+            "u": self.url,
+            "k": self.api_key,
+            "d": self.device,
+            "m": self.model,
+            "c": self.context_per_slot,
+            "n": self.n_slots,
+        }
+        if self.model_id:
+            payload["i"] = self.model_id
+        body_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
         # Strip padding: `=` is what gets mangled when a token is pasted into a
         # URL bar or a shell, and it carries no information we cannot restore.
-        body = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+        body = base64.urlsafe_b64encode(body_bytes).decode("ascii").rstrip("=")
         return f"{PREFIX}{body}{SEPARATOR}{_checksum(body)}"
 
     def redacted(self) -> str:
@@ -144,4 +158,5 @@ def decode(token: str) -> Invite:
         model=str(data["m"]),
         context_per_slot=context,
         n_slots=slots,
+        model_id=str(data.get("i", "")),
     )

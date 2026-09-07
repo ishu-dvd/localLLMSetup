@@ -3,7 +3,24 @@
 Turn one laptop into an always-on **coding-model server** that your other laptops use from
 their own CLI — a free, self-hosted replacement for a paid Claude subscription.
 
-> **Status: research complete, build not started.**
+```powershell
+# on the laptop that will serve the model
+.\setup.ps1 -Devices 2 -DryRun     # what it will do, and how many GB
+.\setup.ps1 -Devices 2             # do it
+
+# on each other laptop, with the invite the line above printed
+.\client.ps1 llmi1_eyJj...._1a2b3c4d
+```
+
+That picks the llama.cpp build for the GPU it finds, downloads it and a model that fits,
+issues a key per laptop, writes the Windows service, and prints one paste-able invite each.
+The client script installs a coding agent, points it at the server with its own key, and
+pins the context to the number of tokens the slot *actually* has.
+
+Both are safe to re-run: the plan is recomputed from what is already on disk, so an
+interrupted 12 GB download resumes rather than restarting.
+
+> **Status: server code complete and tested; unrun on real hardware.**
 > Read [`docs/DECISIONS.md`](docs/DECISIONS.md) first, then [`docs/PLAN.md`](docs/PLAN.md).
 
 ---
@@ -41,7 +58,7 @@ capable coding model, free, on hardware you already own.
 
 ---
 
-## Two findings that would have silently broken this
+## Findings that would have silently broken this
 
 **1. `-c` is the *total* KV pool, divided across slots.**
 
@@ -79,6 +96,24 @@ Related: llama-server parses that file **once, at startup**. A key issued later 
 until the service restarts, and the resulting `401` looks like a bad token rather than a
 server that was never told about it — so `localllm invite` rewrites the file and says so.
 
+**6. `/releases/latest` for llama.cpp contains no llama.cpp.** It resolves to a semver
+pointer release whose entire asset list is one file, `nightly-tag.txt`, naming the build
+tag where the binaries actually live:
+
+```
+/releases/latest  →  v0.4.0  →  nightly-tag.txt  →  b10809  →  the zips
+```
+
+Looking for `llama-*-bin-win-vulkan-x64.zip` in `latest` finds nothing, and building the
+name from `v0.4.0` 404s. Worse, the build it pointed at was **older than the b10816 this
+project requires** — so resolving through `latest` would refuse every setup, permanently.
+Builds that satisfy the minimum are all *prereleases*, which `latest` excludes by
+definition. This repo resolves through the releases **atom feed**, which lists them and is
+not rate-limited — the API returned `403 rate limit exceeded` on the first real run.
+
+**7. AMD's llama.cpp build was renamed** from `hip-radeon` to `rocm`. Matching only the old
+name falls through to the CPU build — silently, because the CPU build runs everywhere.
+
 ---
 
 ## Does this repo need to exist?
@@ -115,9 +150,60 @@ llama.cpp, llama-swap and gguf-parser. Not a new inference stack.
 git clone https://github.com/ishu-dvd/localLLMSetup
 cd localLLMSetup
 $env:PYTHONPATH="src"
-python -m pytest tests          # 698 tests
-python -m localllm next         # says what to do first
+python -m pytest tests               # 900+ tests
+python -m localllm setup --dry-run   # the whole plan, nothing written
 ```
+
+`setup --dry-run` needs no GPU and no model. It probes the machine, picks the llama.cpp
+build for the card it finds, chooses a model that fits, and prints every step with the
+download size — then stops.
+
+### Which coding agent, and why it is not Cline
+
+| Agent | Where | Configurable from a file |
+|---|---|---|
+| **opencode** | terminal | ✅ pins `limit.context`, so it compacts before it overruns the slot |
+| **Continue** | VS Code | ✅ splits chat from autocomplete, so per-keystroke requests stay small |
+| **Aider** | terminal | ✅ no tool schemas at all |
+| **Octofriend** | terminal | ✅ local repair models for malformed tool calls |
+| **Qwen Code** | terminal | ⚠️ yes, but it has **no verified way to pin the context** |
+| **Cline** | VS Code | ❌ settings live in VS Code's SQLite storage and the OS keychain |
+
+All six are free. `localllm client` picks one from the model in the invite, checks that Node
+or VS Code is actually present, and prints the install command.
+
+Cline was the recommendation, and `join --client cline` wrote a `cline-settings.json` for a
+path that does not exist. Cline keeps its settings in `context.globalState` and its key in
+`context.secrets` — neither writable from outside VS Code — and had renamed the fields to be
+per-mode besides. The file was inert, and `check` read it back and reported the laptop as
+configured. `--client cline` now prints the values to type in.
+
+**Wanted Qwen in VS Code?** No Qwen extension can be pointed at a self-hosted endpoint — the
+Alibaba ones talk to Alibaba. The official `qwenlm.qwen-code-vscode-ide-companion` works,
+because it is a companion to the *CLI*, and the CLI is what points here;
+`--client qwen` prints that install line too. For a self-contained VS Code setup, use
+Continue.
+
+**Crush was rejected**, despite having the best ergonomics of any candidate (a native
+`llamacpp` provider and an explicit `--context-window`): its `LICENSE.md` is **FSL-1.1-MIT**,
+source-available rather than open source, and its config format is now a **Bash dialect that
+runs in a full shell** — generating it would mean writing an executable file containing an API
+key. See [`docs/DECISIONS.md`](docs/DECISIONS.md) §6.
+
+A green suite is not the same as a suite that would notice. `python mutate.py`
+deliberately breaks 55 safety-critical behaviours one at a time — the context
+refusal, the invite checksum, the per-slot `n_ctx` read, the auth gate, the CRLF
+detector, `-ngl 99` without `-ncmoe`, the zip-traversal guard, the truncated-download
+guard, `limit.context` — and requires the tests to catch each one. It currently
+catches 55/55.
+
+That check earns its place, and it earned it again here. A code review found a test
+that passed no matter what the code did; this harness then found a second one, and —
+once pointed at the places I was *least* sure of rather than the ones I expected to
+pass — two more. Pointed at the code in this change it found two further tests that
+could not fail: one asserted `"tool_use" in content`, which `# tool_use` satisfies
+while configuring nothing, and one checked a branch that every fixture in the file
+happened to reach by a different route.
 
 **Point it at a real model file** and it reads the facts from the file rather than
 trusting a hand-maintained catalogue:
@@ -165,18 +251,25 @@ predicting absolute speed.
 **See what your hardware can run** (auto-detects; refuses to invent numbers):
 
 ```powershell
-python -m localllm.cli doctor
-python -m localllm.cli plan --slots 1 --context 32768
+python -m localllm doctor
+python -m localllm plan --slots 1 --context 32768
 ```
 ```
 Usable   : 7.00 GB VRAM, 10.50 GB RAM (after driver/display and OS idle)
 
-model                  quant      wts     KV   VRAM    RAM   free  verdict
-KAT-Coder-V2.5-Dev     Q2_K_L   13.11   0.33   7.00   8.34  +2.16  OK
-KAT-Coder-V2.5-Dev     IQ3_XXS  14.87   0.33   7.00  10.10  +0.40  TIGHT
-gpt-oss-20b            MXFP4    12.11   0.39   7.00   7.40  +3.10  OK
-Qwen3-Coder-30B-A3B    Q3_K_M   14.71   1.57   0.00  11.18  -0.68  NO
+model                  quant       wts     KV   VRAM    RAM   free  verdict
+gpt-oss-20b            MXFP4     12.11   0.43   7.00   9.02  +1.48  OK
+Qwen2.5-Coder-14B      Q4_K_M     8.99   3.42   7.00   8.89  +1.61  OK
+KAT-Coder-V2.5-Dev     Q2_K_L    13.11   1.43   0.00  11.02  -0.52  NO
+Qwen3.6-35B-A3B        UD-IQ3_XXS 13.21  1.43   0.00  11.12  -0.62  NO
+Qwen3-Coder-30B-A3B    Q3_K_M    14.71   1.71   0.00  12.90  -2.40  NO
 ```
+
+Those `NO`s used to be `OK` and `TIGHT`. Checking every catalogue entry against its
+**published GGUF header** found that three models' KV cache was understated **four-fold**:
+the catalogue assumed a 1-in-4 sliding-window pattern, and the files report
+`attention.sliding_window = 0` — no sliding-window attention at all, so *every* layer is
+global. A plan that fit on paper would have OOM'd on the machine.
 
 Add `--slots 3` and it recomputes for three laptops — and warns that 32K each needs
 `-c 98304`, not `-c 32768`. An impossible plan exits non-zero rather than recommending
@@ -345,7 +438,8 @@ On success it writes `01-powercfg.ps1` (never sleep, lid-close = do nothing),
 | 5 — client onboarding | ✅ done — plan handoff, invite tokens, guided setup |
 | 6 — prove under load | ⏳ needs the MSI |
 
-**698 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13.
+**736 tests**, lint and format clean, CI on Ubuntu + Windows across Python 3.11–3.13,
+and 34/34 mutations caught.
 
 ---
 

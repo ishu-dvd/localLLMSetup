@@ -28,10 +28,15 @@ from localllm.serve import (
 
 MSI = Hardware(vram_total_gb=8.0, ram_total_gb=16.0, os="windows")
 GOOD = solve(MSI, GPT_OSS_20B, Plan(32_768, 1, cram_mib=1024))
-# KAT_CODER_IQ3_XXS used to sit here, but it now REFUSES: re-anchoring the
-# compute buffer on a measured Vulkan log took 1.5 GB out of the VRAM available
-# for weights. Q2_K_L is the one that is genuinely TIGHT now.
-TIGHT = solve(MSI, KAT_CODER_Q2_K_L, Plan(32_768, 1, cram_mib=1024))
+# This fixture has moved twice, both times because a measurement corrected the
+# budget rather than because the test wanted a different model:
+#   KAT_CODER_IQ3_XXS -> Q2_K_L, when a measured Vulkan log took 1.5 GB out of
+#     the VRAM available for weights;
+#   Q2_K_L @ 32K -> @ 8K, when the published GGUF showed all 40 layers use
+#     global attention, quadrupling its KV cache.
+# It is pinned at a context where the model is genuinely TIGHT rather than
+# forced, so the preflight severity being tested is the real one.
+TIGHT = solve(MSI, KAT_CODER_Q2_K_L, Plan(8_192, 1, cram_mib=1024))
 DOOMED = solve(MSI, QWEN25_CODER_14B, Plan(32_768, 3))
 
 
@@ -337,3 +342,41 @@ class TestResidencySeverity:
         for pf in (run(), run(TIGHT)):
             text = " ".join(c.detail + c.remedy for c in pf.checks)
             assert "mlock" not in text and "secpol" not in text
+
+
+class TestWhetherTheServiceExistsIsATriState:
+    """`sc query` exits non-zero for "no such service" (1060) AND for "access
+    denied" (5). Folding the second into the first tells a user whose service
+    is running perfectly well to install it again."""
+
+    def test_a_registered_service_is_found(self):
+        from localllm.serve import parse_service_query
+
+        out = "SERVICE_NAME: localllm\n        TYPE  : 10  WIN32_OWN_PROCESS\n"
+        assert parse_service_query(out, 0) is True
+
+    def test_a_missing_service_is_reported_as_missing(self):
+        from localllm.serve import parse_service_query
+
+        out = (
+            "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\n\n"
+            "The specified service does not exist as an installed service.\n"
+        )
+        assert parse_service_query(out, 1060) is False
+
+    def test_access_denied_is_reported_as_unknown_not_as_missing(self):
+        from localllm.serve import parse_service_query
+
+        out = "[SC] OpenService FAILED 5:\n\nAccess is denied.\n"
+        assert parse_service_query(out, 5) is None
+
+    def test_an_empty_response_is_unknown(self):
+        from localllm.serve import parse_service_query
+
+        assert parse_service_query("", 1) is None
+
+    def test_a_zero_exit_with_no_service_named_is_not_taken_as_present(self):
+        """Exit code alone is not enough - some shims return 0 for anything."""
+        from localllm.serve import parse_service_query
+
+        assert parse_service_query("done\n", 0) is None

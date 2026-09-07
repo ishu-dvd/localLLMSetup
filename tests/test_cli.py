@@ -469,7 +469,7 @@ class TestJoinPinsTheContextTheServerActuallyGives:
         argv = [
             "join",
             "--client",
-            "cline",
+            "opencode",
             "--device",
             "laptop-a",
             "--url",
@@ -485,12 +485,23 @@ class TestJoinPinsTheContextTheServerActuallyGives:
         captured = capsys.readouterr()
         return code, captured.out + captured.err
 
+    def _written(self, tmp_path):
+        """What the client's OWN file says - not the sidecar.
+
+        The sidecar records what `join` intended; this is what opencode loads.
+        Asserting the sidecar here would pass no matter what the client config
+        contained, which is how a context test went vacuous once before.
+        """
+        data = json.loads((tmp_path / "client" / "opencode.json").read_text())
+        provider = data["provider"]["llama.cpp"]
+        model = next(iter(provider["models"]))
+        return {"model": model, "context": provider["models"][model]["limit"]["context"]}
+
     def test_the_plan_file_sets_the_client_context(self, tmp_path, capsys) -> None:
         plan = self._plan_file(tmp_path, context=8192)
         code, out = self._join(tmp_path, capsys, "--plan", str(plan))
         assert code == 0
-        written = json.loads((tmp_path / "client" / "cline-settings.json").read_text())
-        assert written["openAiModelInfo"]["contextWindow"] == 8192
+        assert self._written(tmp_path)["context"] == 8192
 
     def test_asking_for_more_than_the_plan_allows_is_refused(self, tmp_path, capsys) -> None:
         """The whole point. This must fail the command, not warn."""
@@ -498,14 +509,13 @@ class TestJoinPinsTheContextTheServerActuallyGives:
         code, out = self._join(tmp_path, capsys, "--plan", str(plan), "--context", "32768")
         assert code == 1
         assert "exceed_context_size_error" in out
-        assert not (tmp_path / "client" / "cline-settings.json").exists()
+        assert not (tmp_path / "client" / "opencode.json").exists()
 
     def test_asking_for_less_than_the_plan_allows_is_accepted(self, tmp_path, capsys) -> None:
         plan = self._plan_file(tmp_path, context=8192)
         code, _ = self._join(tmp_path, capsys, "--plan", str(plan), "--context", "4096")
         assert code == 0
-        written = json.loads((tmp_path / "client" / "cline-settings.json").read_text())
-        assert written["openAiModelInfo"]["contextWindow"] == 4096
+        assert self._written(tmp_path)["context"] == 4096
 
     def test_a_named_plan_that_does_not_exist_is_an_error(self, tmp_path, capsys) -> None:
         """Silently ignoring a typo'd path would write exactly the unpinned
@@ -543,8 +553,7 @@ class TestJoinPinsTheContextTheServerActuallyGives:
         ).write(tmp_path / "deploy")
         code, _ = self._join(tmp_path, capsys, "--plan", str(plan))
         assert code == 0
-        written = json.loads((tmp_path / "client" / "cline-settings.json").read_text())
-        assert written["openAiModelId"] == "claude-something-else"
+        assert self._written(tmp_path)["model"] == "claude-something-else"
 
     def test_the_running_server_overrides_a_stale_plan(self, tmp_path, capsys) -> None:
         """A plan promising more than the server gives is the dangerous case."""
@@ -571,7 +580,7 @@ class TestJoinPinsTheContextTheServerActuallyGives:
             argv = [
                 "join",
                 "--client",
-                "cline",
+                "opencode",
                 "--device",
                 "laptop-a",
                 "--url",
@@ -591,8 +600,7 @@ class TestJoinPinsTheContextTheServerActuallyGives:
 
         assert code == 0
         assert "less than planned" in out
-        written = json.loads((tmp_path / "client" / "cline-settings.json").read_text())
-        assert written["openAiModelInfo"]["contextWindow"] == 8192
+        assert self._written(tmp_path)["context"] == 8192
 
 
 class TestUpHandsThePlanToTheClients:
@@ -883,8 +891,9 @@ class TestInviteKeepsTheServerKeyFileCurrent:
 
     def _plan(self, tmp_path):
         from localllm.handoff import ServerPlan
+        from localllm.keys import KeyStore
 
-        return ServerPlan(
+        plan = ServerPlan(
             context_per_slot=8192,
             n_slots=2,
             model_alias=MODEL_ALIAS,
@@ -892,6 +901,10 @@ class TestInviteKeepsTheServerKeyFileCurrent:
             kv_quant="q8_0",
             ctx_size_flag=16384,
         ).write(tmp_path / "deploy")
+        # `up` writes this; `invite` refreshes it but must never create it,
+        # because its absence is how we know this is not the server machine.
+        KeyStore(tmp_path / "keys.json").write_api_key_file(tmp_path / "deploy" / "keys.txt")
+        return plan
 
     def test_inviting_a_device_rewrites_the_servers_key_file(self, tmp_path, capsys) -> None:
         plan = self._plan(tmp_path)
@@ -1135,8 +1148,9 @@ class TestRotatingALeakedToken:
 
     def _plan(self, tmp_path):
         from localllm.handoff import ServerPlan
+        from localllm.keys import KeyStore
 
-        return ServerPlan(
+        plan = ServerPlan(
             context_per_slot=8192,
             n_slots=1,
             model_alias=MODEL_ALIAS,
@@ -1144,6 +1158,8 @@ class TestRotatingALeakedToken:
             kv_quant="q8_0",
             ctx_size_flag=8192,
         ).write(tmp_path / "deploy")
+        KeyStore(tmp_path / "keys.json").write_api_key_file(tmp_path / "deploy" / "keys.txt")
+        return plan
 
     def _invite(self, tmp_path, plan, capsys, *extra):
         return run(
@@ -1221,3 +1237,164 @@ class TestRotatingALeakedToken:
         after = KeyStore(tmp_path / "keys.json").for_device("laptop-1")
         assert before is not None and after is not None
         assert before.key == after.key
+
+
+class TestInviteDoesNotScatterKeysOutsideTheServer:
+    """`invite` derived the key file from wherever --plan pointed and wrote it
+    unconditionally.
+
+    So `invite --plan Downloads/server-plan.json` wrote every active key into
+    Downloads in plain text - a directory that is not in .gitignore and was
+    never meant to hold secrets - AND told the user that restarting the service
+    would pick it up. The file the server actually parses had never been
+    touched, so the invited laptop got a permanent 401 that looks like a bad
+    token: exactly the failure this command exists to remove.
+    """
+
+    def _plan_only(self, tmp_path, where="elsewhere"):
+        from localllm.handoff import ServerPlan
+
+        return ServerPlan(
+            context_per_slot=8192,
+            n_slots=1,
+            model_alias=MODEL_ALIAS,
+            model_id="m",
+            kv_quant="q8_0",
+            ctx_size_flag=8192,
+        ).write(tmp_path / where)
+
+    def _invite(self, tmp_path, plan, capsys, *extra):
+        return run(
+            [
+                "invite",
+                "laptop-1",
+                "--url",
+                "http://msi:8080",
+                "--plan",
+                str(plan),
+                "--store",
+                str(tmp_path / "keys.json"),
+                *extra,
+            ],
+            capsys,
+        )
+
+    def test_no_key_file_is_created_next_to_a_stray_plan(self, tmp_path, capsys) -> None:
+        plan = self._plan_only(tmp_path, "Downloads")
+        code, out = self._invite(tmp_path, plan, capsys)
+        assert code == 0, out
+        assert not (tmp_path / "Downloads" / "keys.txt").exists()
+
+    def test_it_does_not_claim_a_restart_will_fix_it(self, tmp_path, capsys) -> None:
+        """The dangerous half. Nothing the server reads changed, so telling the
+        user to restart sends them to do something that cannot work and then
+        blame the token."""
+        plan = self._plan_only(tmp_path, "Downloads")
+        _, out = self._invite(tmp_path, plan, capsys)
+        assert "NOT on the server" in out
+        assert "Restart-Service" not in out
+
+    def test_pointing_key_file_at_the_real_one_updates_it(self, tmp_path, capsys) -> None:
+        """The escape hatch: the plan can live anywhere as long as the key file
+        is named explicitly."""
+        from localllm.keys import KeyStore
+
+        plan = self._plan_only(tmp_path, "Downloads")
+        real = KeyStore(tmp_path / "keys.json").write_api_key_file(tmp_path / "deploy" / "keys.txt")
+        code, out = self._invite(tmp_path, plan, capsys, "--key-file", str(real))
+        assert code == 0, out
+        assert "Restart-Service" in out
+        entry = KeyStore(tmp_path / "keys.json").for_device("laptop-1")
+        assert entry is not None
+        assert entry.key in real.read_text(encoding="utf-8")
+
+
+class TestARejectedKeyDuringJoinIsFatal:
+    """A 401 means the server IS reachable and DID reject the key - a definite
+    failure, not an inconclusive one.
+
+    It used to collapse into "not reachable for confirmation", and `join` wrote
+    the config and exited 0. The comment above the call claimed the probe
+    "doubles as proof it works"; it did not. The most likely cause is this
+    project's own documented hazard - a key issued but not yet picked up by a
+    restart - so it is a reachable path, not a corner case.
+
+    Mutation testing found this fix untested: turning the UNAUTHORISED branch
+    off changed nothing the suite noticed.
+    """
+
+    TOKEN = (
+        "llmi1_eyJjIjo4MTkyLCJkIjoibGFwdG9wLWEiLCJrIjoic2stbG9jYWxsbG0tYlhNejVEYmVqT1JS"
+        "bkxKakhSMUROX0tzTTRzbm9CMUoiLCJtIjoiY2xhdWRlLWxvY2FsLWNvZGVyIiwibiI6MiwidSI6Im"
+        "h0dHA6Ly9tc2k6ODA4MCJ9_ec1535a7"
+    )
+
+    def _with_status(self, monkeypatch, status, body=None):
+        from localllm.client import Probe
+
+        def fake_probe(url, api_key=None, timeout=None, json_body=None):
+            return Probe(url=url, status=status, body=body)
+
+        monkeypatch.setattr("localllm.cli.probe", fake_probe)
+
+    def _join(self, tmp_path, capsys, *extra):
+        """Captures stderr too: the refusal is written there, and asserting on
+        stdout alone would pass whatever the message said."""
+        code = main(
+            [
+                "join",
+                "--invite",
+                self.TOKEN,
+                "--client",
+                "opencode",
+                "--out",
+                str(tmp_path / "client"),
+                *extra,
+            ]
+        )
+        captured = capsys.readouterr()
+        return code, captured.out + captured.err
+
+    def test_a_401_fails_the_command(self, tmp_path, capsys, monkeypatch) -> None:
+        self._with_status(monkeypatch, 401, {"error": {"message": "Invalid API Key"}})
+        code, _ = self._join(tmp_path, capsys)
+        assert code == 1
+
+    def test_no_config_is_written_for_a_key_the_server_rejects(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        """Writing it anyway is what made the old behaviour expensive: the user
+        walks away believing the laptop is set up."""
+        self._with_status(monkeypatch, 401, {"error": {"message": "Invalid API Key"}})
+        self._join(tmp_path, capsys)
+        assert not (tmp_path / "client" / "opencode.json").exists()
+
+    def test_the_message_names_the_likely_cause(self, tmp_path, capsys, monkeypatch) -> None:
+        """A bare "unauthorised" sends the user to re-issue a key that is fine.
+        The usual cause is that the server has not re-read the key file."""
+        self._with_status(monkeypatch, 401, {"error": {"message": "Invalid API Key"}})
+        _, out = self._join(tmp_path, capsys)
+        assert "Restart-Service" in out or "restart" in out.lower()
+        assert "--rotate" in out
+
+    def test_an_unreachable_server_still_degrades_to_the_invite(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        """The asymmetry is the point: unreachable is inconclusive, so it falls
+        back. Only a rejection is definite."""
+        from localllm.client import Probe, ProbeError
+
+        def fake_probe(url, api_key=None, timeout=None, json_body=None):
+            return Probe(url=url, error=ProbeError.REFUSED)
+
+        monkeypatch.setattr("localllm.cli.probe", fake_probe)
+        code, out = self._join(tmp_path, capsys)
+        assert code == 0, out
+        assert (tmp_path / "client" / "opencode.json").exists()
+
+    def test_no_probe_skips_the_check_entirely(self, tmp_path, capsys, monkeypatch) -> None:
+        """The documented escape hatch must not be broken by making 401 fatal."""
+        self._with_status(monkeypatch, 401, {"error": {"message": "Invalid API Key"}})
+        code, _ = self._join(tmp_path, capsys, "--no-probe")
+        assert code == 0
+        assert (tmp_path / "client" / "opencode.json").exists()
