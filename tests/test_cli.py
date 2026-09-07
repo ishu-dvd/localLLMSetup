@@ -1299,3 +1299,94 @@ class TestInviteDoesNotScatterKeysOutsideTheServer:
         entry = KeyStore(tmp_path / "keys.json").for_device("laptop-1")
         assert entry is not None
         assert entry.key in real.read_text(encoding="utf-8")
+
+
+class TestARejectedKeyDuringJoinIsFatal:
+    """A 401 means the server IS reachable and DID reject the key - a definite
+    failure, not an inconclusive one.
+
+    It used to collapse into "not reachable for confirmation", and `join` wrote
+    the config and exited 0. The comment above the call claimed the probe
+    "doubles as proof it works"; it did not. The most likely cause is this
+    project's own documented hazard - a key issued but not yet picked up by a
+    restart - so it is a reachable path, not a corner case.
+
+    Mutation testing found this fix untested: turning the UNAUTHORISED branch
+    off changed nothing the suite noticed.
+    """
+
+    TOKEN = (
+        "llmi1_eyJjIjo4MTkyLCJkIjoibGFwdG9wLWEiLCJrIjoic2stbG9jYWxsbG0tYlhNejVEYmVqT1JS"
+        "bkxKakhSMUROX0tzTTRzbm9CMUoiLCJtIjoiY2xhdWRlLWxvY2FsLWNvZGVyIiwibiI6MiwidSI6Im"
+        "h0dHA6Ly9tc2k6ODA4MCJ9_ec1535a7"
+    )
+
+    def _with_status(self, monkeypatch, status, body=None):
+        from localllm.client import Probe
+
+        def fake_probe(url, api_key=None, timeout=None, json_body=None):
+            return Probe(url=url, status=status, body=body)
+
+        monkeypatch.setattr("localllm.cli.probe", fake_probe)
+
+    def _join(self, tmp_path, capsys, *extra):
+        """Captures stderr too: the refusal is written there, and asserting on
+        stdout alone would pass whatever the message said."""
+        code = main(
+            [
+                "join",
+                "--invite",
+                self.TOKEN,
+                "--client",
+                "cline",
+                "--out",
+                str(tmp_path / "client"),
+                *extra,
+            ]
+        )
+        captured = capsys.readouterr()
+        return code, captured.out + captured.err
+
+    def test_a_401_fails_the_command(self, tmp_path, capsys, monkeypatch) -> None:
+        self._with_status(monkeypatch, 401, {"error": {"message": "Invalid API Key"}})
+        code, _ = self._join(tmp_path, capsys)
+        assert code == 1
+
+    def test_no_config_is_written_for_a_key_the_server_rejects(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        """Writing it anyway is what made the old behaviour expensive: the user
+        walks away believing the laptop is set up."""
+        self._with_status(monkeypatch, 401, {"error": {"message": "Invalid API Key"}})
+        self._join(tmp_path, capsys)
+        assert not (tmp_path / "client" / "cline-settings.json").exists()
+
+    def test_the_message_names_the_likely_cause(self, tmp_path, capsys, monkeypatch) -> None:
+        """A bare "unauthorised" sends the user to re-issue a key that is fine.
+        The usual cause is that the server has not re-read the key file."""
+        self._with_status(monkeypatch, 401, {"error": {"message": "Invalid API Key"}})
+        _, out = self._join(tmp_path, capsys)
+        assert "Restart-Service" in out or "restart" in out.lower()
+        assert "--rotate" in out
+
+    def test_an_unreachable_server_still_degrades_to_the_invite(
+        self, tmp_path, capsys, monkeypatch
+    ) -> None:
+        """The asymmetry is the point: unreachable is inconclusive, so it falls
+        back. Only a rejection is definite."""
+        from localllm.client import Probe, ProbeError
+
+        def fake_probe(url, api_key=None, timeout=None, json_body=None):
+            return Probe(url=url, error=ProbeError.REFUSED)
+
+        monkeypatch.setattr("localllm.cli.probe", fake_probe)
+        code, out = self._join(tmp_path, capsys)
+        assert code == 0, out
+        assert (tmp_path / "client" / "cline-settings.json").exists()
+
+    def test_no_probe_skips_the_check_entirely(self, tmp_path, capsys, monkeypatch) -> None:
+        """The documented escape hatch must not be broken by making 401 fatal."""
+        self._with_status(monkeypatch, 401, {"error": {"message": "Invalid API Key"}})
+        code, _ = self._join(tmp_path, capsys, "--no-probe")
+        assert code == 0
+        assert (tmp_path / "client" / "cline-settings.json").exists()

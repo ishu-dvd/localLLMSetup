@@ -130,6 +130,112 @@ MUTATIONS: list[tuple[str, str, str, str]] = [
         "if False:",
         "removing the auth gate lets `up` publish an unauthenticated server",
     ),
+    # --- the pre-existing core, written before this discipline ---------------
+    (
+        "src/localllm/budget.py",
+        "return self.status is not Fit.REFUSE",
+        "return True",
+        "a truthy REFUSE lets `if verdict:` silently proceed on an impossible plan",
+    ),
+    (
+        "src/localllm/budget.py",
+        "return self.context_per_slot * self.n_slots",
+        "return self.context_per_slot",
+        "THE TRAP: -c is a pool divided across slots, not a per-slot value",
+    ),
+    (
+        "src/localllm/budget.py",
+        'return f"-ngl 99 -ncmoe {self.n_cpu_moe}"',
+        'return "-ngl 99"',
+        "-ngl 99 with spilled weights and no -ncmoe is a guaranteed OOM",
+    ),
+    (
+        "src/localllm/budget.py",
+        '"-fit off",',
+        '"-t 8",',
+        "-fit defaults ON and silently rewrites the context down to 4096",
+    ),
+    (
+        "src/localllm/serve.py",
+        "return not self.failed",
+        "return True",
+        "a truthy failed preflight installs a server that cannot work",
+    ),
+    (
+        "src/localllm/client.py",
+        "return self.outcome is Outcome.OK",
+        "return True",
+        "a truthy failed Finding makes every check silently pass",
+    ),
+    (
+        "src/localllm/client.py",
+        "if api.requires_claude_alias and CLAUDE_ALIAS_SUBSTRING not in checked.lower():",
+        "if CLAUDE_ALIAS_SUBSTRING not in checked.lower():",
+        "applying the claude rule unconditionally fails valid OpenAI setups",
+    ),
+    (
+        "src/localllm/keys.py",
+        'with p.open("w", encoding="utf-8", newline="\\n") as fh:',
+        'with p.open("w", encoding="utf-8") as fh:',
+        "CRLF in the key file makes every request 401 on a non-Windows server",
+    ),
+    (
+        "src/localllm/keys.py",
+        "for entry in self.active():",
+        "for entry in self.all():",
+        "writing revoked keys into the allow-list un-revokes them",
+    ),
+    # --- deliberately adversarial: areas I am NOT confident are covered ------
+    (
+        "src/localllm/verify.py",
+        "UNDER_PREDICT_FAIL_RATIO = 1.5",
+        "UNDER_PREDICT_FAIL_RATIO = 1000.0",
+        "the ratio exists because a 2x-wrong small quantity slips past the "
+        "absolute threshold - the sliding-window bug this project already shipped",
+    ),
+    (
+        "src/localllm/verify.py",
+        "UNDER_PREDICT_FAIL_GB = 0.5",
+        "UNDER_PREDICT_FAIL_GB = 1000.0",
+        "under-prediction is the direction that ends in OOM or paging",
+    ),
+    (
+        "src/localllm/verify.py",
+        "OVER_PREDICT_WARN_GB = 1.0",
+        "OVER_PREDICT_WARN_GB = 1000.0",
+        "over-prediction wastes usable memory and should still be reported",
+    ),
+    (
+        "src/localllm/detect.py",
+        "real = [g for g in self.gpus if not g.is_virtual and g.vram_gb]",
+        "real = [g for g in self.gpus if g.vram_gb]",
+        "treating a Hyper-V display adapter as a real GPU plans for VRAM that does not exist",
+    ),
+    (
+        "src/localllm/gguf.py",
+        "if self.sliding_window and SLIDING_WINDOW_PATTERN_BY_ARCH.get(self.architecture):",
+        "if self.sliding_window:",
+        "a model publishing sliding_window with no known pattern had its KV "
+        "overstated 2x - the exact bug a real GGUF caught",
+    ),
+    (
+        "src/localllm/handoff.py",
+        "if plan is not None and plan.n_slots != server.n_slots:",
+        "if False:",
+        "a plan sized for a different slot count is a real mismatch to report",
+    ),
+    (
+        "src/localllm/cli.py",
+        "if not key_file.exists():",
+        "if False:",
+        "creating a missing key file scatters secrets into an arbitrary directory",
+    ),
+    (
+        "src/localllm/cli.py",
+        "if finding.outcome is Outcome.UNAUTHORISED:",
+        "if False:",
+        "swallowing a 401 writes a client config that cannot authenticate",
+    ),
 ]
 
 
