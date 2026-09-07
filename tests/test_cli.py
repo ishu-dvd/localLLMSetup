@@ -1039,3 +1039,185 @@ class TestStatusShowsTheFleet:
         ).write(tmp_path / "deploy")
         _, out = self._status(tmp_path, plan, capsys)
         assert "localllm key add" in out
+
+
+class TestRevocationReachesTheServer:
+    """Revocation that does not change the server's allow-list is not
+    revocation.
+
+    The store is only a record; the file is what llama-server parsed. Until it
+    is both rewritten AND re-read, the revoked laptop keeps full access - and
+    the old advice here was a prose instruction to "rewrite the api-key file",
+    which is precisely the step a person forgets.
+    """
+
+    def _setup(self, tmp_path, devices=("laptop-1", "laptop-2")):
+        from localllm.keys import KeyStore
+
+        store = KeyStore(tmp_path / "keys.json")
+        for d in devices:
+            store.add(d)
+        key_file = store.write_api_key_file(tmp_path / "deploy" / "keys.txt")
+        return store, key_file
+
+    def _keys_in(self, path):
+        return [
+            ln
+            for ln in path.read_text(encoding="utf-8").split("\n")
+            if ln and not ln.startswith("#")
+        ]
+
+    def test_revoking_removes_the_key_from_the_servers_allow_list(self, tmp_path, capsys) -> None:
+        store, key_file = self._setup(tmp_path)
+        revoked = store.for_device("laptop-2")
+        assert revoked is not None
+
+        code, out = run(
+            [
+                "key",
+                "revoke",
+                "laptop-2",
+                "--store",
+                str(tmp_path / "keys.json"),
+                "--key-file",
+                str(key_file),
+            ],
+            capsys,
+        )
+        assert code == 0, out
+        assert revoked.key not in self._keys_in(key_file)
+
+    def test_revoking_says_the_service_must_restart(self, tmp_path, capsys) -> None:
+        """Rewriting the file is not enough - it is read only at startup."""
+        _, key_file = self._setup(tmp_path)
+        _, out = run(
+            [
+                "key",
+                "revoke",
+                "laptop-2",
+                "--store",
+                str(tmp_path / "keys.json"),
+                "--key-file",
+                str(key_file),
+            ],
+            capsys,
+        )
+        assert "Restart-Service" in out
+
+    def test_a_missing_key_file_is_not_created(self, tmp_path, capsys) -> None:
+        """Its absence means this is not the server machine. Writing a stray
+        keys.txt into whatever directory the user is standing in would scatter
+        secrets rather than protect them."""
+        self._setup(tmp_path)
+        absent = tmp_path / "somewhere" / "keys.txt"
+        _, out = run(
+            [
+                "key",
+                "revoke",
+                "laptop-2",
+                "--store",
+                str(tmp_path / "keys.json"),
+                "--key-file",
+                str(absent),
+            ],
+            capsys,
+        )
+        assert not absent.exists()
+        assert "no key file" in out
+
+
+class TestRotatingALeakedToken:
+    """An invite carries a live API key, so a token pasted somewhere public is
+    a credential leak. Fixing it used to be revoke-then-invite: two commands,
+    with a window in between where the user has a replacement and believes they
+    are done while the leaked key still works.
+    """
+
+    def _plan(self, tmp_path):
+        from localllm.handoff import ServerPlan
+
+        return ServerPlan(
+            context_per_slot=8192,
+            n_slots=1,
+            model_alias=MODEL_ALIAS,
+            model_id="m",
+            kv_quant="q8_0",
+            ctx_size_flag=8192,
+        ).write(tmp_path / "deploy")
+
+    def _invite(self, tmp_path, plan, capsys, *extra):
+        return run(
+            [
+                "invite",
+                "laptop-1",
+                "--url",
+                "http://msi:8080",
+                "--plan",
+                str(plan),
+                "--store",
+                str(tmp_path / "keys.json"),
+                *extra,
+            ],
+            capsys,
+        )
+
+    def test_rotating_revokes_the_previous_key(self, tmp_path, capsys) -> None:
+        from localllm.keys import KeyStore
+
+        plan = self._plan(tmp_path)
+        self._invite(tmp_path, plan, capsys)
+        before = KeyStore(tmp_path / "keys.json").for_device("laptop-1")
+        assert before is not None
+
+        code, out = self._invite(tmp_path, plan, capsys, "--rotate")
+        assert code == 0, out
+        after = KeyStore(tmp_path / "keys.json").for_device("laptop-1")
+        assert after is not None
+        assert after.key != before.key
+
+        store = KeyStore(tmp_path / "keys.json")
+        assert before.key not in [k.key for k in store.active()]
+
+    def test_the_old_key_leaves_the_servers_allow_list(self, tmp_path, capsys) -> None:
+        from localllm.keys import KeyStore
+
+        plan = self._plan(tmp_path)
+        self._invite(tmp_path, plan, capsys)
+        before = KeyStore(tmp_path / "keys.json").for_device("laptop-1")
+        assert before is not None
+
+        self._invite(tmp_path, plan, capsys, "--rotate")
+        key_file = (tmp_path / "deploy" / "keys.txt").read_text(encoding="utf-8")
+        assert before.key not in key_file
+
+    def test_rotating_is_honest_that_the_leak_survives_until_a_restart(
+        self, tmp_path, capsys
+    ) -> None:
+        """The one thing a user must not assume is that rotating alone closed
+        the hole. The file changed; the running process has not re-read it."""
+        plan = self._plan(tmp_path)
+        self._invite(tmp_path, plan, capsys)
+        _, out = self._invite(tmp_path, plan, capsys, "--rotate")
+        assert "leaked key still works" in out
+        assert "Restart-Service" in out
+
+    def test_rotating_a_device_that_has_no_key_just_issues_one(self, tmp_path, capsys) -> None:
+        """--rotate should not require a prior key to exist; refusing would make
+        it unsafe to use reflexively, which is exactly when it is reached for."""
+        plan = self._plan(tmp_path)
+        code, out = self._invite(tmp_path, plan, capsys, "--rotate")
+        assert code == 0, out
+        assert "issued a new key" in out
+
+    def test_without_rotate_the_existing_key_is_reused(self, tmp_path, capsys) -> None:
+        """Re-issuing a token for a lost paste must not invalidate the laptop
+        that is already working."""
+        from localllm.keys import KeyStore
+
+        plan = self._plan(tmp_path)
+        self._invite(tmp_path, plan, capsys)
+        before = KeyStore(tmp_path / "keys.json").for_device("laptop-1")
+        self._invite(tmp_path, plan, capsys)
+        after = KeyStore(tmp_path / "keys.json").for_device("laptop-1")
+        assert before is not None and after is not None
+        assert before.key == after.key

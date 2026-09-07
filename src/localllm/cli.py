@@ -690,6 +690,33 @@ def cmd_up(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refresh_key_file(store: KeyStore, key_file: Path, service_name: str) -> list[str]:
+    """Rewrite the server's allow-list, and say what is still outstanding.
+
+    Revocation that does not reach the server is not revocation. The store is
+    only a record; the file is what llama-server parsed, and until it is both
+    rewritten *and* re-read the revoked laptop keeps full access. Rewriting it
+    here removes the step most likely to be forgotten and leaves exactly one -
+    the restart, which cannot be done from here.
+
+    A missing file is not created: its absence means this machine is not the
+    one running the server, and writing a stray keys.txt into whatever
+    directory the user happens to be in would scatter secrets rather than
+    protect them.
+    """
+    if not key_file.exists():
+        return [
+            f"note: no key file at {key_file}, so nothing was updated on the server.",
+            "      Run this on the server machine, or pass --key-file.",
+        ]
+    store.write_api_key_file(key_file)
+    return [
+        f"rewrote {key_file} ({len(store.active())} active key(s))",
+        "The server has NOT picked this up yet - it reads the file only at startup:",
+        f"  Restart-Service {service_name}",
+    ]
+
+
 def cmd_key(args: argparse.Namespace) -> int:
     store = KeyStore(args.store)
 
@@ -711,7 +738,8 @@ def cmd_key(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         print(f"revoked {entry.device} at {entry.revoked_at}")
-        print("Rewrite the api-key file and `caddy reload` - in-flight streams are undisturbed.")
+        for line in _refresh_key_file(store, args.key_file, args.service_name):
+            print(line)
         return 0
 
     if args.key_command == "export":
@@ -812,10 +840,24 @@ def cmd_invite(args: argparse.Namespace) -> int:
 
     store = KeyStore(args.store)
     entry = store.for_device(args.device)
+    rotated = False
+    if args.rotate and entry is not None:
+        # A leaked token is only fixed when the old key stops working. Doing
+        # this as revoke-then-issue in one step closes the window in which a
+        # user has issued a replacement and believes they are done, while the
+        # leaked key is still in the file.
+        store.revoke(args.device)
+        entry = None
+        rotated = True
+
     issued = entry is None
     if entry is None:
         entry = store.add(args.device)
-        print(f"issued a new key for {args.device}")
+        print(
+            f"rotated {args.device}'s key - the previous one is revoked"
+            if rotated
+            else f"issued a new key for {args.device}"
+        )
     else:
         print(f"reusing the existing key for {args.device}")
 
@@ -853,6 +895,8 @@ def cmd_invite(args: argparse.Namespace) -> int:
             f"{args.device} tries to connect:"
         )
         print(f"  Restart-Service {args.service_name}")
+        if rotated:
+            print("  Until that restart, the leaked key still works.")
     return 0
 
 
@@ -1116,10 +1160,19 @@ def build_parser() -> argparse.ArgumentParser:
     k_rev = ksub.add_parser("revoke", help="revoke a device's key")
     k_rev.add_argument("device")
     k_exp = ksub.add_parser("export", help="write llama-server --api-key-file")
-    k_exp.add_argument("--out", type=Path, default=Path("keys.txt"))
+    k_exp.add_argument("--out", type=Path, default=Path(KEY_FILENAME))
     k_cad = ksub.add_parser("caddyfile", help="print a Caddyfile with per-device attribution")
     k_cad.add_argument("hostname")
     k_cad.add_argument("--upstream", default="127.0.0.1:8080")
+    # Revocation is only real once the server's allow-list changes, so `revoke`
+    # needs to know where that file is and which service reads it.
+    k_rev.add_argument(
+        "--key-file",
+        type=Path,
+        default=DEFAULT_DEPLOY_DIR / KEY_FILENAME,
+        help=f"the server's --api-key-file (default: {DEFAULT_DEPLOY_DIR / KEY_FILENAME})",
+    )
+    k_rev.add_argument("--service-name", default="localllm")
     # argparse binds a parent flag only *before* the subcommand, so
     # `key add laptop-1 --store X` was a usage error - which is the order every
     # example, including this tool's own guidance, naturally writes. Repeating
@@ -1181,6 +1234,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"the {PLAN_FILENAME} written by `localllm up` (default: {DEFAULT_PLAN_PATH})",
     )
     invite.add_argument("--store", type=Path, default=DEFAULT_STORE)
+    invite.add_argument(
+        "--rotate",
+        action="store_true",
+        help="revoke this device's current key and issue a replacement - use when "
+        "a token has leaked",
+    )
     invite.add_argument(
         "--service-name",
         default="localllm",
