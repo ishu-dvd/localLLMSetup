@@ -745,6 +745,7 @@ def cmd_up(args: argparse.Namespace) -> int:
         free_disk_gb=probe_free_disk_gb(args.out),
         gpu_detected=gpu_ok,
         active_keys=len(store.active()),
+        allow_low_disk=getattr(args, "allow_low_disk", False),
     )
 
     print(f"Model    : {verdict.model.id}\n")
@@ -764,6 +765,10 @@ def cmd_up(args: argparse.Namespace) -> int:
     key_file = out / KEY_FILENAME
     store.write_api_key_file(key_file)
     flags = verdict.llama_server_flags(api_key_file=str(key_file.resolve()))
+    # Fleet mode remains the default, but a single-laptop install should be
+    # able to bind only to loopback and avoid exposing the endpoint on LAN.
+    host = getattr(args, "host", "0.0.0.0")
+    flags = flags.replace("--host 0.0.0.0", f"--host {host}", 1)
 
     written = {
         "01-powercfg.ps1": render_powercfg_script(),
@@ -1644,6 +1649,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="which llama.cpp build to install (default: from the detected GPU)",
     )
     setup.add_argument("--url", default="", help="the URL the other laptops will use")
+    setup.add_argument("--host", default="0.0.0.0", help="interface for llama-server (use 127.0.0.1 for local-only)")
     setup.add_argument(
         "--model",
         default="",
@@ -1652,6 +1658,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     setup.add_argument("--store", type=Path, default=DEFAULT_STORE)
     setup.add_argument("--service-name", default="localllm")
+    setup.add_argument(
+        "--allow-low-disk",
+        action="store_true",
+        help="allow setup below the recommended 5 GB free-disk reserve (use only if intentional)",
+    )
     setup.add_argument(
         "--dry-run", action="store_true", help="show the plan and the download size, then stop"
     )
@@ -1792,6 +1803,7 @@ def build_parser() -> argparse.ArgumentParser:
     up = sub.add_parser("up", help="preflight, then generate the 24/7 service definition")
     _add_plan_args(up)
     up.add_argument("--service-name", default="localllm")
+    up.add_argument("--host", default="0.0.0.0", help="interface for llama-server (use 127.0.0.1 for local-only)")
     up.add_argument("--out", type=Path, default=DEFAULT_DEPLOY_DIR)
     up.add_argument(
         "--store",

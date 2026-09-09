@@ -112,7 +112,7 @@ def parse_llama_build(text: str) -> int | None:
 
     The line looks like: `version: 10819 (c7bda030)`
     """
-    m = re.search(r"version:\s*(\d+)", text)
+    m = re.search(r"build\s+(\d+)", text) or re.search(r"version:\s*(\d+)", text)
     return int(m.group(1)) if m else None
 
 
@@ -159,6 +159,7 @@ def preflight(
     free_disk_gb: float | None,
     gpu_detected: bool,
     active_keys: int | None = None,
+    allow_low_disk: bool = False,
 ) -> Preflight:
     """Everything that must be true before an unattended server is allowed to start.
 
@@ -271,10 +272,10 @@ def preflight(
         needed = verdict.model.weights_gb + MIN_FREE_DISK_GB
         checks.append(
             Check("disk", Level.PASS, f"{free_disk_gb:.1f} GB free")
-            if free_disk_gb >= needed
+            if free_disk_gb >= needed or allow_low_disk
             else Check(
                 "disk",
-                Level.FAIL,
+                Level.WARN if allow_low_disk else Level.FAIL,
                 f"{free_disk_gb:.1f} GB free, need ~{needed:.1f} GB",
                 "free space or pick a smaller quant",
             )

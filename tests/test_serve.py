@@ -63,6 +63,10 @@ def test_parse_llama_build():
     assert parse_llama_build("version: 10819 (c7bda030)\nbuilt with MSVC\n") == 10819
 
 
+def test_parse_llama_build_modern_dev_format():
+    assert parse_llama_build("version: 0.4.0-dev (build 10874, commit e2d2c0d6a)") == 10874
+
+
 def test_parse_llama_build_missing():
     assert parse_llama_build("no version here") is None
 
